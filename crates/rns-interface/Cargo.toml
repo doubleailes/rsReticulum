@@ -1,0 +1,77 @@
+[package]
+name = "rns-interface"
+description = "Network interface trait and implementations for Reticulum"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+default = []
+serial = ["dep:serialport"]
+ble = ["dep:btleplug", "dep:futures", "dep:uuid"]
+ble_peer = ["ble"]
+# See rns-transport's mobile-throttle. When enabled, auto-interface beacons
+# and reverse-peering probes slow down in the background; BLE peer scan
+# cadence adjusts to `is_foreground`. Disabled on desktop builds.
+mobile-throttle = ["rns-transport/mobile-throttle"]
+
+[dependencies]
+rns-crypto = { workspace = true, features = ["std"] }
+rns-wire = { workspace = true, features = ["std"] }
+rns-transport = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+bytes = { workspace = true }
+tracing = { workspace = true }
+socket2 = { workspace = true }
+if-addrs = { workspace = true }
+serialport = { workspace = true, optional = true }
+btleplug = { workspace = true, optional = true }
+futures = { version = "0.3", optional = true }
+uuid = { version = "1", optional = true }
+rand = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+hex = { workspace = true }
+
+# Apple BLE Peripheral (CoreBluetooth GATT server, iOS + macOS).
+# Version pinned to match btleplug's internal objc2 version so the shared
+# runtime types stay binary-compatible. objc2-core-bluetooth gives us
+# linked-symbol access to NSString constants (CBCentralManagerScanOption*,
+# CB*RestoreIdentifierKey, etc.) instead of re-declaring their literal
+# values, which Apple is free to change.
+[target.'cfg(any(target_os = "ios", target_os = "macos"))'.dependencies]
+objc2 = "0.5"
+objc2-foundation = "0.2"
+objc2-core-bluetooth = "0.2"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = "0.2"
+
+# Android JNI (BLE Peripheral, USB Serial)
+[target.'cfg(target_os = "android")'.dependencies]
+jni = "0.19"
+
+# Linux BLE Peripheral via BlueZ D-Bus (real GATT server, B7).
+# Linux-only target dep so non-Linux builds don't pull in BlueZ. The
+# linux_peripheral module is gated by both `ble` feature and target_os.
+[target.'cfg(target_os = "linux")'.dependencies]
+bluer = { version = "0.17", features = ["bluetoothd"] }
+
+# Windows BLE Peripheral via WinRT GattServiceProvider (MSIX-packaged apps).
+# Windows-only target dep so cross-platform builds don't pull in WinRT
+# shims. The windows_peripheral module is gated by `ble` feature and
+# target_os. GattServiceProvider.CreateAsync returns AccessDenied for
+# unpackaged Win32 binaries; we surface that as a clear peripheral-
+# unavailable event so embedding UIs can direct users to an MSIX build for
+# discoverability.
+[target.'cfg(target_os = "windows")'.dependencies]
+windows = { version = "0.58", features = [
+    "Devices_Bluetooth",
+    "Devices_Bluetooth_Advertisement",
+    "Devices_Bluetooth_GenericAttributeProfile",
+    "Devices_Radios",
+    "Foundation",
+    "Foundation_Collections",
+    "Storage_Streams",
+] }

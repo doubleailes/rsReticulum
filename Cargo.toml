@@ -1,0 +1,89 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/rns-crypto",
+    "crates/rns-wire",
+    "crates/rns-identity",
+    "crates/rns-transport",
+    "crates/rns-link",
+    "crates/rns-protocol",
+    "crates/rns-interface",
+    "crates/rns-runtime",
+    "crates/rns-tools",
+    "crates/rns-ratkey",
+]
+
+[workspace.package]
+version = "0.9.0"
+edition = "2024"
+license = "AGPL-3.0-or-later"
+rust-version = "1.85"
+
+[workspace.dependencies]
+# Crypto
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+ed25519-dalek = { version = "2", features = ["hazmat", "rand_core"] }
+aes = "0.8"
+cbc = { version = "0.1", features = ["alloc"] }
+hkdf = "0.12"
+hmac = "0.12"
+sha2 = "0.10"
+subtle = "2"
+zeroize = { version = "1", features = ["derive"] }
+rand = "0.8"
+rand_core = { version = "0.6", features = ["getrandom"] }
+
+# Encoding
+base64 = "0.22"
+
+# Serialization
+rmp-serde = "1"
+rmpv = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Async
+tokio = { version = "1", features = ["full"] }
+
+# Compression
+bzip2 = "0.5"
+
+# Serial
+serialport = "4"
+
+# BLE
+btleplug = "0.11"
+
+# Networking
+if-addrs = "0.13"
+socket2 = { version = "0.5", features = ["all"] }
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = "0.3"
+
+# Error handling
+thiserror = "2"
+
+# Misc
+hex = "0.4"
+byteorder = "1"
+bytes = "1"
+nix = { version = "0.29", features = ["term", "fs"] }
+
+# Testing
+proptest = "1"
+
+# Workspace crates
+rns-crypto = { path = "crates/rns-crypto", default-features = false }
+rns-wire = { path = "crates/rns-wire", default-features = false }
+rns-identity = { path = "crates/rns-identity" }
+rns-transport = { path = "crates/rns-transport" }
+rns-link = { path = "crates/rns-link" }
+rns-protocol = { path = "crates/rns-protocol" }
+rns-interface = { path = "crates/rns-interface" }
+rns-runtime = { path = "crates/rns-runtime" }
+rns-ratkey = { path = "crates/rns-ratkey" }

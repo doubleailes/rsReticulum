@@ -1,0 +1,65 @@
+[package]
+name = "rns-tools"
+description = "Rust CLI utilities for Reticulum (rnsd-rs, rnstatus-rs, etc.)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+autobins = false
+
+[features]
+default = []
+hardware = ["dep:rns-ratkey"]
+
+[dependencies]
+rns-runtime = { workspace = true, features = ["serial"] }
+rns-interface = { workspace = true }
+rns-identity = { workspace = true }
+rns-transport = { workspace = true }
+rns-crypto = { workspace = true, features = ["std"] }
+rns-wire = { workspace = true, features = ["std"] }
+rns-ratkey = { workspace = true, optional = true, features = ["hardware"] }
+clap = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+hex = { workspace = true }
+rmp-serde = { workspace = true }
+rmpv = { workspace = true, features = ["with-serde"] }
+base64 = { workspace = true }
+serialport = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+nix = { workspace = true }
+bytes = { workspace = true }
+
+[[bin]]
+name = "rnsd-rs"
+path = "src/bin/rnsd-rs.rs"
+
+[[bin]]
+name = "rnstatus-rs"
+path = "src/bin/rnstatus-rs.rs"
+
+[[bin]]
+name = "rnpath-rs"
+path = "src/bin/rnpath-rs.rs"
+
+[[bin]]
+name = "rnid-rs"
+path = "src/bin/rnid-rs.rs"
+
+[[bin]]
+name = "rnprobe-rs"
+path = "src/bin/rnprobe-rs.rs"
+
+[[bin]]
+name = "rncp-rs"
+path = "src/bin/rncp-rs.rs"
+
+[[bin]]
+name = "rnodeconf-rs"
+path = "src/bin/rnodeconf-rs.rs"
+
+[[bin]]
+name = "rnsh-rs"
+path = "src/bin/rnsh-rs.rs"

@@ -1,0 +1,9 @@
+/target/
+*.swp
+.DS_Store
+__pycache__/
+*.pyc
+/interop_artifacts/
+/rust_artifacts/
+proptest-regressions/
+/tools/

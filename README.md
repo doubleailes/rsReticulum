@@ -1,0 +1,245 @@
+<div align="center">
+
+# rsReticulum
+
+**A Rust implementation of Reticulum.**
+
+
+[![License: AGPL-3.0-or-later](https://img.shields.io/badge/license-AGPL--3.0--or--later-blue.svg)](LICENSE)
+[![Rust 1.85+](https://img.shields.io/badge/rust-1.85%2B-orange.svg)](https://www.rust-lang.org)
+[![Reticulum 1.2.2](https://img.shields.io/badge/target-Reticulum%201.2.2-success.svg)](https://reticulum.network/)
+[![Status](https://img.shields.io/badge/status-experimental-yellow.svg)](#feature-status)
+
+[Reticulum Manual](https://reticulum.network/manual/) |
+[Ratspeak](https://github.com/ratspeak/Ratspeak) |
+[rsLXMF](https://github.com/ratspeak/rsLXMF) |
+[Reticulum](https://github.com/markqvist/Reticulum)
+
+</div>
+
+---
+
+rsReticulum is a Rust implementation of Reticulum. This is not a fork of
+Reticulum; it is Reticulum written in a different language, focused on staying
+interoperable. It is not the source-of-truth implementation, do not treat it as one.
+
+Commands are intentionally namespaced for Rust with `*-rs` command names, so
+rsReticulum can live beside other Reticulum tools on `PATH` without worry.
+
+## Contents
+
+- [Build It](#build-it)
+- [Tool Usage](#tool-usage)
+- [Configuration](#configuration)
+- [Interface Support](#interface-support)
+- [Compatibility Notes](#compatibility-notes)
+- [Contributing](#contributing)
+- [License](#license)
+
+## Build It
+
+### macOS
+
+Install Rust with `rustup`, then install Apple's command-line build tools:
+
+```bash
+xcode-select --install
+```
+
+Build the tools:
+
+```bash
+cd rsReticulum
+cargo build --release
+```
+
+### Linux, Raspberry Pi, and VPS Hosts
+
+##### Install Rust with `rustup`, then install the needed packages:
+
+Debian, Ubuntu, and Raspberry Pi OS:
+
+```bash
+sudo apt update
+sudo apt install -y build-essential pkg-config libudev-dev
+```
+
+Fedora:
+
+```bash
+sudo dnf install gcc make pkgconf-pkg-config systemd-devel
+```
+
+Arch:
+
+```bash
+sudo pacman -S --needed base-devel pkgconf systemd
+```
+
+##### Build the tools:
+
+```bash
+cd rsReticulum
+cargo build --release
+```
+
+### Windows
+
+Install Rust with the MSVC toolchain. If Rust or Cargo asks for Visual Studio
+Build Tools, install the "Desktop development with C++" workload.
+
+Build from PowerShell:
+
+```powershell
+cd rsReticulum
+cargo build --release
+```
+
+After the build, use the commands below with `./target/release/<tool>` on
+macOS/Linux or `.\target\release\<tool>.exe` on Windows.
+
+## Tool Usage
+
+The `rns-tools` crate builds Rust-namespaced Reticulum utilities:
+
+| Binary | Purpose |
+| --- | --- |
+| rnsd-rs | Shared Reticulum daemon. Owns interfaces and local control sockets. |
+| rnstatus-rs | Interface, announce, path, link, and aggregate status. |
+| rnpath-rs | Path lookup, path table inspection, rates, drops, and blackhole actions. |
+| rnid-rs | Identity generation, inspection, signing, verification, encryption, decryption, and export. |
+| rnprobe-rs | Destination probe utility with loss and round-trip reporting. |
+| rncp-rs | File transfer utility with send, listen, and authenticated fetch modes. |
+| rnodeconf-rs | RNode inspection, safe configuration, EEPROM backup, and trust utility. |
+| rnsh-rs | Reticulum shell listener/client. |
+
+#### Commands:
+
+```text
+rnsd-rs     [-c CONFIG_DIR] [-v|-q]... [--service] [--exampleconfig] [--version]
+rnstatus-rs [--all] [--sort rate|traffic|rx|tx|rxs|txs|announces|arx|atx|held]
+         [--reverse] [--announce-stats] [--link-stats] [--totals] [--json]
+         [--discovered|-D] [-m [-I SECONDS]] [FILTER]
+         [-R <transport_hash> -i <identity_file>]
+rnpath-rs   [--table|--rates] [destination_hash] [--max HOPS]
+rnpath-rs   <destination_hash>
+rnprobe-rs  [-s SIZE] [-n COUNT] [-t TIMEOUT] [-w WAIT] [--json] <destination_hash>
+rnid-rs     generate|show|sign|verify|encrypt|decrypt|export ...
+rncp-rs     <file> <destination_hash>
+rncp-rs     -l [-b SECONDS] [-s DEST_DIR] [-a <allowed_hash>]...
+rncp-rs     -l -F [-j <jail_dir>] [-a <allowed_hash>|-n]...
+rncp-rs     -f <destination_hash> <remote_path> [-s DEST_DIR]
+```
+
+Add the release `bin/` directory or `target/release` to `PATH` if
+you want to call them without a path prefix.
+
+`rncp-rs` follows the established listener authentication model: without `-n`,
+incoming senders must match `-a <hash>` or an `allowed_identities` file.
+`rncp-rs -F` can serve fetch requests to authenticated clients; use
+`-j <jail>` to bound file access unless unrestricted fetch paths are
+intentional.
+
+`rnodeconf-rs` in the current build only covers safe inspection/device setting paths, EEPROM
+dump/backup, and trusted-key storage.
+
+## Configuration
+
+`rnsd-rs` reads Reticulum INI config from `<config-dir>/config`. If no config
+directory is supplied, the default is:
+
+| Platform | Default config file |
+| --- | --- |
+| Linux/macOS | `/etc/rsReticulum/config`, then `~/.config/rsReticulum/config`, then `~/.rsReticulum/config` |
+| Windows | `%APPDATA%\rsReticulum\config` |
+
+Generate the annotated starter file:
+
+```bash
+rnsd-rs --exampleconfig
+```
+
+Minimal TCP client example:
+
+```ini
+[reticulum]
+share_instance = yes
+instance_control_socket = yes
+enable_transport = no
+
+[interfaces]
+
+  [[Default TCP]]
+    type = TCPClientInterface
+    enabled = yes
+    target_host = rns.ratspeak.org
+    target_port = 4242
+```
+
+Existing Python Reticulum configs should work if every requested interface
+is implemented here. Unknown or not-yet-wired interfaces should be removed or
+disabled until support lands.
+
+The default shared-instance data/control ports are `37428`/`37429`. Ratspeak
+uses app-private `37430`/`37431` ports. If you run two daemons at the same
+time, give one config a distinct port pair to avoid confliction, like:
+
+```ini
+[reticulum]
+shared_instance_port = 37432
+instance_control_port = 37433
+```
+
+## Interface Support
+
+###### Note: This is alpha, if something doesn't work, open an issue with enough context/information to help contribute to fixing it.
+
+| Interface | Current behavior |
+| --- | --- |
+| TCP client/server | Config-backed IPv4 and IPv6 paths. |
+| UDP | Config-backed unicast and multicast paths. |
+| Auto | Config-backed UDP discovery plus TCP fallback. |
+| Local shared instance | Config-backed TCP loopback or Unix socket depending on platform. |
+| I2P | Config-backed SAM v3.1 path. |
+| Pipe | Config-backed subprocess stdio pipe. |
+| Backbone | Config-backed high-latency WAN-style tunnel. |
+| Serial, KISS, RNode, RNode Multi, AX.25 KISS | Config-backed with the `serial` feature. |
+| BLE RNode | Config-backed with the `ble` feature. |
+| Bluetooth Peer | Runtime API used by Ratspeak. |
+| Android USB-OTG | Runtime API for Android app embeddings. |
+| Weave | Not implemented. |
+| Bluetooth Classic RFCOMM | Not implemented. |
+
+## Compatibility Notes
+
+Most daemon and utility flows are implemented for the public `*-rs` tools:
+`rnsd-rs`, `rnstatus-rs`, `rnpath-rs`, `rnid-rs`, `rnprobe-rs`, `rncp-rs`,
+`rnsh-rs`, and `rnodeconf-rs`.
+
+Known gaps and intentional limits:
+
+- `rnx`, `rnir`, `rnpkg`, `rngit`, and `git-remote-rns` are not implemented. There is on-going work in progress for supporting these.
+- `rnodeconf-rs` is partial; safe inspection/configuration and EEPROM
+  dump/backup are furthest along. Firmware flashing, autoinstall/update, ROM
+  bootstrap, destructive EEPROM wipe, and full signing-key management are not
+  implemented.
+- `rnstatus-rs` covers the practical operator surface, but does not implement
+  every display/API behavior from upstream.
+- `rnpath-rs` remote mode is read-only for table/rates, including destination
+  filters, apart from the remote blackhole-list query path. Remote mutations
+  and remote active path requests are full gaps.
+- `rncp-rs` implements the listener `-b` announce interval. `-P/--phy-rates`
+  is not supported for the time being.
+- `rns-ratkey` hardware identity support is feature-gated and still has known
+  hardware-verification gaps before it should be described as release-ready.
+
+## Contributing
+
+If the issue or contribution belongs upstream as well, start there. Python LXMF
+and Reticulum remain the reference implementations.
+
+PRs are closed for now until I have time to catch up on everything. I'm tired.
+
+## License
+
+GNU Affero General Public License v3.0 or later. See [LICENSE](LICENSE).

@@ -1,0 +1,18 @@
+[package]
+name = "rns-wire"
+description = "Wire format, packet encoding, and hash computation for Reticulum"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+default = ["std"]
+std = ["rns-crypto/std"]
+
+[dependencies]
+rns-crypto = { workspace = true }
+thiserror = { workspace = true }
+sha2 = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }

@@ -1,0 +1,21 @@
+[package]
+name = "rns-protocol"
+description = "Resource, Channel, and Buffer protocols for Reticulum"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+rns-crypto = { workspace = true, features = ["std"] }
+rns-wire = { workspace = true, features = ["std"] }
+rns-link = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+bzip2 = { workspace = true }
+rmpv = { workspace = true }
+rmp-serde = { workspace = true }
+hex = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }

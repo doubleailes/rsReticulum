@@ -1,0 +1,21 @@
+[package]
+name = "rns-identity"
+description = "Identity, Destination, and Announce system for Reticulum"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+rns-crypto = { workspace = true, features = ["std"] }
+rns-wire = { workspace = true, features = ["std"] }
+zeroize = { workspace = true }
+thiserror = { workspace = true }
+rmp-serde = { workspace = true }
+rmpv = { workspace = true }
+serde = { workspace = true }
+rand = { workspace = true }
+tracing = { workspace = true }
+hex = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }

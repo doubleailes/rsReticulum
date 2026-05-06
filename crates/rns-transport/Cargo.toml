@@ -1,0 +1,32 @@
+[package]
+name = "rns-transport"
+description = "Transport and routing engine for Reticulum"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+default = []
+# When enabled, the transport actor tick slows from 250ms to 2s while the
+# shared `is_foreground` flag is false. Enabled only on mobile builds of the
+# Tauri wrapper — desktop leaves this off so nothing degrades when a window
+# is minimized or hidden.
+mobile-throttle = []
+
+[dependencies]
+rns-crypto = { workspace = true, features = ["std"] }
+rns-wire = { workspace = true, features = ["std"] }
+rns-identity = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+bytes = { workspace = true }
+rand = { workspace = true }
+tracing = { workspace = true }
+subtle = { workspace = true }
+serde = { workspace = true }
+rmp-serde = { workspace = true }
+rmpv = { workspace = true }
+hex = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }

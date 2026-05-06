@@ -1,0 +1,3435 @@
+//! Responder side of Reticulum links: accepts link requests, holds per-link
+//! state (session keys, channel, in/outbound transfers), drives keepalives
+//! and teardown. Lives here to break the rns-transport ↔ rns-link cycle.
+
+use std::collections::{HashMap, VecDeque};
+use std::sync::{Arc, Mutex};
+
+use bytes::Bytes;
+use tokio::sync::{mpsc, oneshot};
+
+use rns_crypto::ed25519::Ed25519PrivateKey;
+use rns_identity::destination::{DestType, Destination, Direction};
+use rns_identity::identity::Identity;
+use rns_link::link::{CloseReason, Link, LinkAction, LinkState};
+use rns_protocol::channel::{ChannelError, LinkChannel};
+use rns_protocol::channel_message::MessageBase;
+use rns_protocol::resource::{
+    InboundTransfer, MAX_EFFICIENT_SIZE, MAX_SEGMENTS, MultiSegmentInbound, MultiSegmentOutbound,
+    OutboundTransfer, TransferAction,
+};
+use rns_protocol::resource_adv::ResourceAdvertisement;
+use rns_transport::link_messages::{AnnounceRequest, DestinationEvent};
+use rns_transport::messages::{OutboundRequest, TransportMessage};
+
+struct ActiveLink {
+    link: Link,
+    _interface_id: u64,
+    /// Created lazily on first CHANNEL packet.
+    channel: Option<LinkChannel>,
+    inbound_resources: HashMap<[u8; 32], InboundTransfer>,
+    outbound_resources: HashMap<[u8; 32], OutboundTransfer>,
+    outbound_split_queues: HashMap<[u8; 32], VecDeque<OutboundTransfer>>,
+    /// Split-resource reassembly keyed by `original_hash`; dropped on full delivery or cancel.
+    inbound_split_resources: HashMap<[u8; 32], MultiSegmentInbound>,
+    /// Reverse index per-segment `resource_hash` → coordinator; routes assembled
+    /// bytes without re-parsing the ADV.
+    segment_routing: HashMap<[u8; 32], SegmentRoute>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SegmentRoute {
+    original_hash: [u8; 32],
+    segment_index: usize,
+}
+
+#[derive(Debug)]
+pub struct LinkResponse {
+    pub link_id: [u8; 16],
+    pub request_id: [u8; 16],
+    pub data: Vec<u8>,
+}
+
+#[derive(Debug, Clone)]
+pub struct LinkChannelMessage {
+    pub link_id: [u8; 16],
+    pub msg_type: u16,
+    pub payload: Vec<u8>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ChannelSendReceipt {
+    pub link_id: [u8; 16],
+    pub sequence: u16,
+    pub packet_hash: [u8; 32],
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum ChannelSendError {
+    #[error("link not found")]
+    LinkNotFound,
+    #[error("link is not active")]
+    LinkNotActive,
+    #[error("link session keys are unavailable")]
+    NoSessionKeys,
+    #[error("channel error: {0}")]
+    Channel(#[from] ChannelError),
+    #[error("transport channel is full or closed")]
+    TransportUnavailable,
+}
+
+pub enum LinkManagerCommand {
+    SendChannelMessage {
+        link_id: [u8; 16],
+        message: Box<dyn MessageBase>,
+        result_tx: Option<oneshot::Sender<Result<ChannelSendReceipt, ChannelSendError>>>,
+    },
+    CloseLink {
+        link_id: [u8; 16],
+        reason: CloseReason,
+        send_teardown: bool,
+    },
+    Announce,
+    Shutdown,
+}
+
+/// Resource hash + sender metadata (e.g. rncp filename).
+#[derive(Debug, Clone)]
+pub struct ResourceCompletion {
+    pub link_id: [u8; 16],
+    pub resource_hash: [u8; 32],
+    pub data: Vec<u8>,
+    /// msgpack-encoded metadata, if the sender attached any.
+    pub metadata: Option<Vec<u8>>,
+}
+
+/// Result of an extended request handler. `Reply` is the ordinary response;
+/// `ReplyWithResource` sends an inline ack followed by a resource transfer
+/// (rncp --fetch). Python: `RNS.Resource(..., target_link=link)`.
+#[derive(Debug, Clone)]
+pub enum RequestOutcome {
+    Reply(Vec<u8>),
+    ReplyWithResource {
+        ack: Vec<u8>,
+        data: Vec<u8>,
+        /// Optional msgpack-encoded metadata (e.g. `{"name": "file.bin"}`).
+        metadata: Option<Vec<u8>>,
+        auto_compress: bool,
+    },
+    /// Silently drop; caller sees a timeout. Useful for ACL denies.
+    Drop,
+}
+
+type RequestHandler = Box<dyn Fn([u8; 16], [u8; 16], Vec<u8>) -> Option<Vec<u8>> + Send>;
+type RequestHandlerEx = Box<dyn Fn([u8; 16], [u8; 16], Vec<u8>) -> RequestOutcome + Send>;
+type LinkIdentityGate = Box<dyn Fn([u8; 16], [u8; 16]) -> bool + Send>;
+
+struct ResourceTransferStart {
+    data: Vec<u8>,
+    metadata: Option<Vec<u8>>,
+    auto_compress: bool,
+    request_id: Option<Vec<u8>>,
+    is_response: bool,
+    allow_handshake: bool,
+}
+
+pub struct LinkManager {
+    transport_tx: mpsc::Sender<TransportMessage>,
+    event_rx: mpsc::Receiver<DestinationEvent>,
+    active_links: HashMap<[u8; 16], ActiveLink>,
+    /// `None` rejects all links.
+    identity_key: Option<Ed25519PrivateKey>,
+    pub destination_hash: [u8; 16],
+    destination: Option<Destination>,
+    identity: Option<Identity>,
+    /// `(link_id, path_hash, data) -> Option<response>`.
+    request_handler: Option<RequestHandler>,
+    /// Wins over `request_handler` when set; can schedule a resource transfer.
+    request_handler_ex: Option<RequestHandlerEx>,
+    /// Called when the transport actor asks this destination to re-announce.
+    announce_handler: Option<Box<dyn FnMut() + Send>>,
+    response_tx: Option<mpsc::Sender<LinkResponse>>,
+    /// Legacy LXMF completion notifier.
+    resource_completed_tx: Option<mpsc::Sender<(Vec<u8>, [u8; 16])>>,
+    /// Resource hash + metadata.
+    resource_completion_tx: Option<mpsc::Sender<ResourceCompletion>>,
+    /// Fires when a link reaches the active state.
+    link_established_tx: Option<mpsc::Sender<[u8; 16]>>,
+    /// Fires on LinkIdentify before a resource ADV can race it.
+    link_identified_tx: Option<mpsc::Sender<([u8; 16], [u8; 16])>>,
+    /// Synchronous LinkIdentify gate. Returning false closes the link before
+    /// later resource packets can be accepted.
+    link_identity_gate: Option<LinkIdentityGate>,
+    /// Decrypted link-packet stream (LXMF DIRECT).
+    link_packet_tx: Option<mpsc::Sender<(Vec<u8>, [u8; 16])>>,
+    /// Decrypted channel envelopes as `(link_id, msg_type, payload)`.
+    channel_message_tx: Option<mpsc::Sender<LinkChannelMessage>>,
+    /// Fires when an active link is closed or torn down.
+    link_closed_tx: Option<mpsc::Sender<[u8; 16]>>,
+    /// Raw pass-through for non-link packets (e.g. opportunistic LXMF).
+    inbound_raw_tx: Option<mpsc::Sender<Vec<u8>>>,
+    /// Remote identity hash → link_id; populated on LinkIdentify for outbound reuse.
+    backchannel_links: HashMap<[u8; 16], [u8; 16]>,
+    /// Shared reverse map so sync request handlers can look up the authenticated peer.
+    link_identities: Arc<Mutex<HashMap<[u8; 16], [u8; 16]>>>,
+}
+
+impl LinkManager {
+    pub fn new(
+        transport_tx: mpsc::Sender<TransportMessage>,
+        event_rx: mpsc::Receiver<DestinationEvent>,
+        destination_hash: [u8; 16],
+        identity_key: Option<Ed25519PrivateKey>,
+    ) -> Self {
+        Self {
+            transport_tx,
+            event_rx,
+            active_links: HashMap::new(),
+            identity_key,
+            destination_hash,
+            destination: None,
+            identity: None,
+            request_handler: None,
+            request_handler_ex: None,
+            announce_handler: None,
+            response_tx: None,
+            resource_completed_tx: None,
+            resource_completion_tx: None,
+            link_established_tx: None,
+            link_identified_tx: None,
+            link_identity_gate: None,
+            link_packet_tx: None,
+            channel_message_tx: None,
+            link_closed_tx: None,
+            inbound_raw_tx: None,
+            backchannel_links: HashMap::new(),
+            link_identities: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    /// Wraps its own [`Destination`] so acceptance gating + dest callbacks are active.
+    pub fn with_destination(
+        transport_tx: mpsc::Sender<TransportMessage>,
+        event_rx: mpsc::Receiver<DestinationEvent>,
+        identity: &Identity,
+        app_name: &str,
+        identity_key: Ed25519PrivateKey,
+    ) -> Self {
+        let dest = match Destination::new(Some(identity), Direction::In, DestType::Single, app_name)
+        {
+            Ok(d) => Some(d),
+            Err(e) => {
+                tracing::error!(error = %e, app_name, "Destination::new() failed — link manager will not accept links");
+                None
+            }
+        };
+
+        let destination_hash = dest.as_ref().map(|d| d.hash).unwrap_or([0; 16]);
+        let manager_identity = clone_identity(identity);
+
+        Self {
+            transport_tx,
+            event_rx,
+            active_links: HashMap::new(),
+            identity_key: Some(identity_key),
+            destination_hash,
+            destination: dest,
+            identity: manager_identity,
+            request_handler: None,
+            request_handler_ex: None,
+            announce_handler: None,
+            response_tx: None,
+            resource_completed_tx: None,
+            resource_completion_tx: None,
+            link_established_tx: None,
+            link_identified_tx: None,
+            link_identity_gate: None,
+            link_packet_tx: None,
+            channel_message_tx: None,
+            link_closed_tx: None,
+            inbound_raw_tx: None,
+            backchannel_links: HashMap::new(),
+            link_identities: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    pub fn get_backchannel_link(&self, identity_hash: &[u8; 16]) -> Option<[u8; 16]> {
+        self.backchannel_links.get(identity_hash).copied()
+    }
+
+    /// Shared auth map for sync request handlers (which can't borrow `self`).
+    /// Populated on `LinkIdentify`, pruned on link close.
+    pub fn link_identities_handle(&self) -> Arc<Mutex<HashMap<[u8; 16], [u8; 16]>>> {
+        Arc::clone(&self.link_identities)
+    }
+
+    pub fn try_step(&mut self) -> bool {
+        match self.event_rx.try_recv() {
+            Ok(event) => {
+                self.handle_event(event);
+                true
+            }
+            Err(mpsc::error::TryRecvError::Empty | mpsc::error::TryRecvError::Disconnected) => {
+                false
+            }
+        }
+    }
+
+    pub async fn step(&mut self) -> bool {
+        let Some(event) = self.event_rx.recv().await else {
+            return false;
+        };
+        self.handle_event(event);
+        true
+    }
+
+    pub fn tick(&mut self) {
+        self.on_tick();
+    }
+
+    pub async fn run(mut self) {
+        let mut tick_interval = tokio::time::interval(std::time::Duration::from_secs(1));
+
+        loop {
+            tokio::select! {
+                event = self.event_rx.recv() => {
+                    match event {
+                        Some(evt) => self.handle_event(evt),
+                        None => break,
+                    }
+                }
+                _ = tick_interval.tick() => {
+                    self.tick();
+                }
+            }
+        }
+    }
+
+    pub async fn run_with_commands(mut self, mut command_rx: mpsc::Receiver<LinkManagerCommand>) {
+        let mut last_tick = std::time::Instant::now();
+        loop {
+            while let Ok(command) = command_rx.try_recv() {
+                if !self.handle_command(command) {
+                    return;
+                }
+            }
+
+            while self.try_step() {}
+
+            if last_tick.elapsed() >= std::time::Duration::from_secs(1) {
+                self.tick();
+                last_tick = std::time::Instant::now();
+            }
+
+            if command_rx.is_closed() && command_rx.is_empty() {
+                return;
+            }
+
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+
+    fn handle_command(&mut self, command: LinkManagerCommand) -> bool {
+        match command {
+            LinkManagerCommand::SendChannelMessage {
+                link_id,
+                message,
+                result_tx,
+            } => {
+                let result = self.send_channel_message(&link_id, message.as_ref());
+                if let Some(tx) = result_tx {
+                    let _ = tx.send(result);
+                }
+                true
+            }
+            LinkManagerCommand::CloseLink {
+                link_id,
+                reason,
+                send_teardown,
+            } => {
+                self.close_active_link(link_id, reason, send_teardown);
+                true
+            }
+            LinkManagerCommand::Announce => {
+                if let Some(handler) = self.announce_handler.as_mut() {
+                    handler();
+                }
+                true
+            }
+            LinkManagerCommand::Shutdown => false,
+        }
+    }
+
+    fn handle_event(&mut self, event: DestinationEvent) {
+        match event {
+            DestinationEvent::LinkRequest { raw, interface_id } => {
+                self.handle_link_request(&raw, interface_id);
+            }
+            DestinationEvent::InboundPacket { raw, interface_id } => {
+                self.handle_inbound_packet(&raw, interface_id);
+            }
+            DestinationEvent::LinkEstablished { link_id } => {
+                if let Some(ref tx) = self.link_established_tx {
+                    let _ = tx.try_send(link_id);
+                }
+                tracing::debug!(link_id = hex::encode(link_id), "link established event");
+            }
+            DestinationEvent::LinkClosed { link_id } => {
+                if self.close_active_link(link_id, CloseReason::InitiatorClosed, true) {
+                    tracing::debug!(link_id = hex::encode(link_id), "link closed");
+                }
+            }
+            DestinationEvent::DeliveryProof { msg_id, .. } => {
+                tracing::debug!(msg_id = %msg_id, "delivery proof (unhandled in link manager)");
+            }
+            DestinationEvent::AnnounceRequested(request) => {
+                if request.path_response {
+                    self.send_destination_announce(request);
+                } else if let Some(handler) = self.announce_handler.as_mut() {
+                    handler();
+                } else {
+                    self.send_destination_announce(request);
+                }
+            }
+        }
+    }
+
+    fn send_destination_announce(&mut self, request: AnnounceRequest) {
+        let Some(destination) = self.destination.as_mut() else {
+            tracing::debug!(
+                app_name = %request.app_name,
+                path_response = request.path_response,
+                "announce requested but no destination is configured"
+            );
+            return;
+        };
+        let Some(identity) = self.identity.as_ref() else {
+            tracing::warn!(
+                app_name = %request.app_name,
+                path_response = request.path_response,
+                "announce requested but no private identity is available"
+            );
+            return;
+        };
+
+        let raw = match destination.announce_packet(
+            identity,
+            None,
+            None,
+            request.path_response,
+            request.tag.as_deref(),
+            unix_now(),
+        ) {
+            Ok(raw) => raw,
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    app_name = %request.app_name,
+                    path_response = request.path_response,
+                    "failed to build requested announce"
+                );
+                return;
+            }
+        };
+
+        let outbound = OutboundRequest {
+            raw: Bytes::from(raw),
+            destination_hash: self.destination_hash,
+        };
+        let message = if let Some(interface_id) = request.attached_interface {
+            TransportMessage::OutboundAttached {
+                request: outbound,
+                interface_id,
+            }
+        } else {
+            TransportMessage::Outbound(outbound)
+        };
+        if let Err(e) = self.transport_tx.try_send(message) {
+            tracing::warn!(
+                app_name = %request.app_name,
+                path_response = request.path_response,
+                err = %e,
+                "failed to queue requested announce"
+            );
+        }
+    }
+
+    fn handle_link_request(&mut self, raw: &[u8], interface_id: u64) {
+        let identity_key = match &self.identity_key {
+            Some(k) => k,
+            None => {
+                tracing::warn!("link request received but no identity key configured");
+                return;
+            }
+        };
+
+        let (header, data_offset) = match rns_wire::header::PacketHeader::unpack(raw) {
+            Ok(h) => h,
+            Err(_) => return,
+        };
+
+        if raw.len() <= data_offset {
+            tracing::warn!("link request has no payload data");
+            return;
+        }
+        let request_data = &raw[data_offset..];
+
+        let hops = header.hops;
+
+        if let Some(ref dest) = self.destination
+            && !dest.accept_link_requests
+        {
+            tracing::debug!("link request rejected — destination not accepting links");
+            return;
+        }
+
+        let (link, proof_data) =
+            match Link::new_responder(request_data, identity_key, self.destination_hash, hops) {
+                Ok(result) => result,
+                Err(e) => {
+                    tracing::warn!(error = %e, "link handshake failed");
+                    return;
+                }
+            };
+
+        let link_id = link.link_id;
+
+        let proof_flags = rns_wire::flags::PacketFlags {
+            header_type: rns_wire::flags::HeaderType::Header1,
+            context_flag: false,
+            transport_type: rns_wire::flags::TransportType::Broadcast,
+            destination_type: rns_wire::flags::DestinationType::Link,
+            packet_type: rns_wire::flags::PacketType::Proof,
+        };
+        // Hops = 0 at origin (Python `Packet.__init__`).
+        let proof_hops = 0;
+        let proof_header = rns_wire::header::PacketHeader {
+            flags: proof_flags,
+            hops: proof_hops,
+            transport_id: None,
+            destination_hash: link_id,
+            context: rns_wire::context::PacketContext::Lrproof,
+        };
+        let mut proof_raw = proof_header.pack();
+        proof_raw.extend_from_slice(&proof_data);
+
+        tracing::info!(
+            link_id = hex::encode(link_id),
+            proof_len = proof_raw.len(),
+            proof_data_len = proof_data.len(),
+            "link proof packet built"
+        );
+
+        let _ = self
+            .transport_tx
+            .try_send(TransportMessage::Outbound(OutboundRequest {
+                raw: Bytes::from(proof_raw),
+                destination_hash: link_id,
+            }));
+
+        // Required: transport drops link-addressed packets (LRRTT, Resource,
+        // Keepalive...) as unroutable without this registration.
+        let _ = self.transport_tx.try_send(TransportMessage::RegisterLink {
+            link_id,
+            destination_hash: self.destination_hash,
+            interface_id,
+            next_hop: None,
+            remaining_hops: 0,
+            initiator: false,
+        });
+
+        tracing::info!(
+            link_id = hex::encode(link_id),
+            dest = hex::encode(self.destination_hash),
+            request_hops = hops,
+            "link request handled — ECDH handshake complete, proof sent, link registered"
+        );
+
+        if let Some(ref mut dest) = self.destination {
+            dest.incoming_link_request(link_id);
+        }
+
+        // LXMF DIRECT uses resource transfer past `LINK_PACKET_MAX_CONTENT`;
+        // AcceptAll skips Python's `ACCEPT_APP` hook.
+        let mut link = link;
+        link.resource_strategy = rns_link::link::ResourceStrategy::AcceptAll;
+
+        self.active_links.insert(
+            link_id,
+            ActiveLink {
+                link,
+                _interface_id: interface_id,
+                channel: None,
+                inbound_resources: HashMap::new(),
+                outbound_resources: HashMap::new(),
+                outbound_split_queues: HashMap::new(),
+                inbound_split_resources: HashMap::new(),
+                segment_routing: HashMap::new(),
+            },
+        );
+    }
+
+    fn handle_inbound_packet(&mut self, raw: &[u8], _interface_id: u64) {
+        let (header, data_offset) = match rns_wire::header::PacketHeader::unpack(raw) {
+            Ok(h) => h,
+            Err(e) => {
+                tracing::warn!(error = %e, raw_len = raw.len(), "link_manager: packet header parse failed");
+                return;
+            }
+        };
+
+        let data = if raw.len() > data_offset {
+            &raw[data_offset..]
+        } else {
+            &[]
+        };
+
+        // For link packets `destination_hash` is the link_id; otherwise it's
+        // a destination-level packet for app decryption (opportunistic LXMF).
+        let link_id = header.destination_hash;
+
+        if !self.active_links.contains_key(&link_id) {
+            if let Some(ref tx) = self.inbound_raw_tx {
+                let _ = tx.try_send(raw.to_vec());
+            }
+            tracing::debug!(
+                dest = hex::encode(link_id),
+                data_len = data.len(),
+                "link_manager: non-link packet forwarded to application (raw)"
+            );
+            return;
+        }
+
+        tracing::info!(
+            link_id = hex::encode(link_id),
+            context = ?header.context,
+            data_len = data.len(),
+            "inbound link packet"
+        );
+
+        if header.flags.packet_type == rns_wire::flags::PacketType::Proof
+            && matches!(
+                header.context,
+                rns_wire::context::PacketContext::None
+                    | rns_wire::context::PacketContext::LinkProof
+            )
+        {
+            self.handle_link_packet_proof(link_id, data);
+            return;
+        }
+
+        match header.context {
+            rns_wire::context::PacketContext::Lrrtt => {
+                if let Some(active) = self.active_links.get_mut(&link_id)
+                    && active.link.state == LinkState::Handshake
+                {
+                    match active.link.receive_rtt_packet(data) {
+                        Ok(()) => {
+                            tracing::info!(
+                                link_id = hex::encode(link_id),
+                                rtt_ms = active.link.rtt.map(|r| r.as_millis()).unwrap_or(0),
+                                "link activated via LRRTT"
+                            );
+
+                            if let Some(ref cb) = active.link.link_established_callback {
+                                cb(&active.link);
+                            }
+                            if let Some(ref dest) = self.destination {
+                                dest.on_link_established(link_id);
+                            }
+                            if let Some(ref tx) = self.link_established_tx {
+                                let _ = tx.try_send(link_id);
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                link_id = hex::encode(link_id),
+                                error = %e,
+                                "LRRTT processing failed"
+                            );
+                        }
+                    }
+                }
+            }
+            rns_wire::context::PacketContext::LinkIdentify => {
+                let mut close_rejected_link = false;
+                if let Some(active) = self.active_links.get_mut(&link_id) {
+                    match active.link.handle_identification(data) {
+                        Ok(remote_pub) => {
+                            let identity_hash = rns_crypto::sha::truncated_hash(&remote_pub);
+                            let accepted = self
+                                .link_identity_gate
+                                .as_ref()
+                                .map(|gate| gate(link_id, identity_hash))
+                                .unwrap_or(true);
+                            self.backchannel_links.insert(identity_hash, link_id);
+                            if let Ok(mut ids) = self.link_identities.lock() {
+                                ids.insert(link_id, identity_hash);
+                            }
+                            if let Some(ref tx) = self.link_identified_tx {
+                                let _ = tx.try_send((link_id, identity_hash));
+                            }
+                            tracing::info!(
+                                link_id = hex::encode(link_id),
+                                remote_pub = hex::encode(&remote_pub[..8]),
+                                identity_hash = hex::encode(identity_hash),
+                                "remote peer identified on link — backchannel tracked"
+                            );
+                            if let Some(ref cb) = active.link.remote_identified_callback {
+                                cb(&active.link, &remote_pub);
+                            }
+                            if !accepted {
+                                close_rejected_link = true;
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                link_id = hex::encode(link_id),
+                                error = %e,
+                                "link identification failed"
+                            );
+                        }
+                    }
+                }
+                if close_rejected_link {
+                    let _ = self.close_active_link(link_id, CloseReason::InitiatorClosed, true);
+                }
+            }
+            rns_wire::context::PacketContext::Keepalive => {
+                if let Some(active) = self.active_links.get_mut(&link_id) {
+                    active.link.record_inbound();
+
+                    // Keepalives are NOT encrypted (Packet.py:205-208).
+                    if data.first() == Some(&rns_link::constants::KEEPALIVE_REQUEST) {
+                        // Only the responder replies.
+                        if active.link.is_initiator {
+                            tracing::trace!(
+                                link_id = hex::encode(link_id),
+                                "ignoring keepalive request on initiator side"
+                            );
+                        } else {
+                            let resp_header = rns_wire::header::PacketHeader {
+                                flags: rns_wire::flags::PacketFlags {
+                                    header_type: rns_wire::flags::HeaderType::Header1,
+                                    context_flag: false,
+                                    transport_type: rns_wire::flags::TransportType::Broadcast,
+                                    destination_type: rns_wire::flags::DestinationType::Link,
+                                    packet_type: rns_wire::flags::PacketType::Data,
+                                },
+                                hops: 0,
+                                transport_id: None,
+                                destination_hash: link_id,
+                                context: rns_wire::context::PacketContext::Keepalive,
+                            };
+                            let mut resp_raw = resp_header.pack();
+                            resp_raw.push(rns_link::constants::KEEPALIVE_RESPONSE);
+                            let _ = self.transport_tx.try_send(TransportMessage::Outbound(
+                                OutboundRequest {
+                                    raw: Bytes::from(resp_raw),
+                                    destination_hash: link_id,
+                                },
+                            ));
+                        }
+                    }
+                }
+            }
+            rns_wire::context::PacketContext::LinkClose => {
+                let verified = self
+                    .active_links
+                    .get_mut(&link_id)
+                    .is_some_and(|active| active.link.receive_teardown(data));
+                if verified {
+                    tracing::info!(link_id = hex::encode(link_id), "link torn down by remote");
+                    self.close_active_link(link_id, CloseReason::DestinationClosed, false);
+                }
+            }
+            rns_wire::context::PacketContext::Channel => {
+                if let Some(active) = self.active_links.get_mut(&link_id) {
+                    active.link.record_inbound();
+                    active.link.record_rx(data.len());
+
+                    if !matches!(active.link.state, LinkState::Active | LinkState::Stale) {
+                        tracing::debug!(
+                            link_id = hex::encode(link_id),
+                            state = ?active.link.state,
+                            "channel data received before active link"
+                        );
+                        return;
+                    }
+
+                    if active.channel.is_none()
+                        && Self::ensure_link_channel(active, link_id).is_none()
+                    {
+                        tracing::debug!(
+                            link_id = hex::encode(link_id),
+                            "channel data received before session keys were available"
+                        );
+                        return;
+                    }
+
+                    let pkt_hash = rns_wire::hash::packet_hash(raw, header.flags.header_type);
+                    if let Ok(proof_data) = active.link.prove_packet_with_link_key(&pkt_hash) {
+                        Self::send_link_packet_proof(
+                            &self.transport_tx,
+                            &link_id,
+                            &proof_data,
+                            rns_wire::context::PacketContext::None,
+                        );
+                        tracing::debug!(
+                            link_id = hex::encode(link_id),
+                            proof_len = proof_data.len(),
+                            "delivery proof sent for channel packet"
+                        );
+                    }
+
+                    if let Some(ref mut channel) = active.channel {
+                        match channel.receive_data(data) {
+                            Ok(messages) => {
+                                if let Some(ref tx) = self.channel_message_tx {
+                                    for (msg_type, payload) in messages {
+                                        let _ = tx.try_send(LinkChannelMessage {
+                                            link_id,
+                                            msg_type,
+                                            payload,
+                                        });
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    link_id = hex::encode(link_id),
+                                    error = %e,
+                                    "channel data processing failed"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+            rns_wire::context::PacketContext::ResourceAdv => {
+                if let Some(active) = self.active_links.get_mut(&link_id) {
+                    active.link.record_inbound();
+
+                    if let Ok(plaintext) = active.link.decrypt(data) {
+                        match ResourceAdvertisement::unpack(&plaintext) {
+                            Ok(adv) => {
+                                // Split-resource routing set up before the per-segment
+                                // transfer. The MAX_SEGMENTS cap is load-bearing: a peer
+                                // could otherwise advertise u32::MAX and OOM
+                                // `MultiSegmentInbound::new`.
+                                if adv.total_segments > 1 {
+                                    if adv.total_segments > MAX_SEGMENTS
+                                        || adv.segment_index == 0
+                                        || adv.segment_index > adv.total_segments
+                                    {
+                                        tracing::warn!(
+                                            link_id = hex::encode(link_id),
+                                            total_segments = adv.total_segments,
+                                            segment_index = adv.segment_index,
+                                            max_segments = MAX_SEGMENTS,
+                                            "rejecting split-resource ADV with out-of-range segment metadata"
+                                        );
+                                        return;
+                                    }
+                                    // Mid-stream changes to `total_segments` are rejected.
+                                    let entry = active
+                                        .inbound_split_resources
+                                        .entry(adv.original_hash)
+                                        .or_insert_with(|| {
+                                            MultiSegmentInbound::new(
+                                                adv.total_segments,
+                                                adv.original_hash,
+                                            )
+                                        });
+                                    if entry.total_segments != adv.total_segments {
+                                        tracing::warn!(
+                                            link_id = hex::encode(link_id),
+                                            original = hex::encode(&adv.original_hash[..8]),
+                                            coord_total = entry.total_segments,
+                                            adv_total = adv.total_segments,
+                                            "split-resource ADV total_segments mismatched coordinator; ignoring"
+                                        );
+                                        return;
+                                    }
+                                    active.segment_routing.insert(
+                                        adv.resource_hash,
+                                        SegmentRoute {
+                                            original_hash: adv.original_hash,
+                                            segment_index: adv.segment_index,
+                                        },
+                                    );
+                                }
+
+                                let map_hashes = adv.get_map_hashes();
+                                let mut transfer_flags = adv.flags;
+                                if adv.total_segments > 1 && adv.segment_index > 1 {
+                                    transfer_flags.has_metadata = false;
+                                }
+                                let rtt = active
+                                    .link
+                                    .rtt
+                                    .unwrap_or(std::time::Duration::from_millis(500));
+                                let mut rh = [0u8; rns_protocol::resource::RANDOM_HASH_SIZE];
+                                let copy_len = adv.random_hash.len().min(rh.len());
+                                rh[..copy_len].copy_from_slice(&adv.random_hash[..copy_len]);
+
+                                if let Ok(mut transfer) = InboundTransfer::from_advertisement(
+                                    adv.num_parts,
+                                    adv.transfer_size,
+                                    adv.data_size,
+                                    rh,
+                                    adv.resource_hash,
+                                    transfer_flags,
+                                    map_hashes,
+                                    rtt,
+                                ) {
+                                    // Python Resource.accept → request_next: initial request
+                                    // accepts the ADV and names the parts.
+                                    let action = transfer.request_next();
+                                    if let TransferAction::SendRequest(req_data) = action
+                                        && let Ok(encrypted) = active.link.encrypt(&req_data)
+                                    {
+                                        let req_header = rns_wire::header::PacketHeader {
+                                            flags: rns_wire::flags::PacketFlags {
+                                                header_type: rns_wire::flags::HeaderType::Header1,
+                                                context_flag: false,
+                                                transport_type:
+                                                    rns_wire::flags::TransportType::Broadcast,
+                                                destination_type:
+                                                    rns_wire::flags::DestinationType::Link,
+                                                packet_type: rns_wire::flags::PacketType::Data,
+                                            },
+                                            hops: 0,
+                                            transport_id: None,
+                                            destination_hash: link_id,
+                                            context: rns_wire::context::PacketContext::ResourceReq,
+                                        };
+                                        let mut req_raw = req_header.pack();
+                                        req_raw.extend_from_slice(&encrypted);
+                                        let _ = self.transport_tx.try_send(
+                                            TransportMessage::Outbound(OutboundRequest {
+                                                raw: Bytes::from(req_raw),
+                                                destination_hash: link_id,
+                                            }),
+                                        );
+                                    }
+
+                                    active.link.track_incoming_resource(adv.resource_hash);
+                                    active.inbound_resources.insert(adv.resource_hash, transfer);
+                                    tracing::info!(
+                                        link_id = hex::encode(link_id),
+                                        resource = hex::encode(&adv.resource_hash[..8]),
+                                        parts = adv.num_parts,
+                                        "inbound resource accepted — initial request sent"
+                                    );
+                                }
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    link_id = hex::encode(link_id),
+                                    error = %e,
+                                    "failed to parse resource advertisement"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+            rns_wire::context::PacketContext::Resource => {
+                // Python encrypts payload ONCE before chunking (Resource.py:424);
+                // chunks ride raw. Decrypt happens in InboundTransfer::complete.
+                if let Some(active) = self.active_links.get_mut(&link_id) {
+                    active.link.record_inbound();
+                    active.link.record_rx(data.len());
+
+                    {
+                        let plaintext = data.to_vec();
+                        let mut resource_action_to_send = None;
+                        let mut completed_rh = None;
+                        for (rh, transfer) in &mut active.inbound_resources {
+                            let action = transfer.receive_part(plaintext.clone());
+                            tracing::info!(
+                                link_id = hex::encode(link_id),
+                                resource = hex::encode(&rh[..8]),
+                                action = ?action,
+                                is_complete = transfer.resource.is_complete(),
+                                total_parts = transfer.resource.total_parts,
+                                received = transfer.resource.consecutive_completed,
+                                "resource part received — action"
+                            );
+                            match action {
+                                TransferAction::SendHmu(_) | TransferAction::SendRequest(_) => {
+                                    resource_action_to_send = Some(action);
+                                }
+                                TransferAction::Complete => {
+                                    completed_rh = Some(*rh);
+                                }
+                                _ => {}
+                            }
+                            if completed_rh.is_none() && transfer.resource.is_complete() {
+                                completed_rh = Some(*rh);
+                            }
+                            if resource_action_to_send.is_some() || completed_rh.is_some() {
+                                break;
+                            }
+                        }
+
+                        if let Some(action) = resource_action_to_send {
+                            let (context, payload) = match action {
+                                TransferAction::SendHmu(hmu) => {
+                                    (rns_wire::context::PacketContext::ResourceHmu, hmu)
+                                }
+                                TransferAction::SendRequest(req) => {
+                                    (rns_wire::context::PacketContext::ResourceReq, req)
+                                }
+                                _ => unreachable!(),
+                            };
+                            if let Ok(encrypted) = active.link.encrypt(&payload) {
+                                let hmu_header = rns_wire::header::PacketHeader {
+                                    flags: rns_wire::flags::PacketFlags {
+                                        header_type: rns_wire::flags::HeaderType::Header1,
+                                        context_flag: false,
+                                        transport_type: rns_wire::flags::TransportType::Broadcast,
+                                        destination_type: rns_wire::flags::DestinationType::Link,
+                                        packet_type: rns_wire::flags::PacketType::Data,
+                                    },
+                                    hops: 0,
+                                    transport_id: None,
+                                    destination_hash: link_id,
+                                    context,
+                                };
+                                let mut hmu_raw = hmu_header.pack();
+                                hmu_raw.extend_from_slice(&encrypted);
+                                active.link.record_tx(hmu_raw.len());
+                                let _ = self.transport_tx.try_send(TransportMessage::Outbound(
+                                    OutboundRequest {
+                                        raw: Bytes::from(hmu_raw),
+                                        destination_hash: link_id,
+                                    },
+                                ));
+                            }
+                        }
+
+                        if let Some(rh) = completed_rh {
+                            // Reverses pre-chunk encryption (Resource.py:424).
+                            let decrypt_fn = |data: &[u8]| -> Result<
+                                Vec<u8>,
+                                rns_protocol::resource::ResourceError,
+                            > {
+                                active.link.decrypt(data).map_err(|_| {
+                                    rns_protocol::resource::ResourceError::DecryptFailed
+                                })
+                            };
+
+                            if let Some(transfer) = active.inbound_resources.get_mut(&rh)
+                                && let Ok((assembled_data, proof)) =
+                                    transfer.complete(Some(&decrypt_fn))
+                            {
+                                // PROOF+RESOURCE_PRF = plaintext, PacketType::Proof
+                                // (Packet.py:195-197). Each split segment still needs its
+                                // own proof or the sender retries.
+                                let prf_header = rns_wire::header::PacketHeader {
+                                    flags: rns_wire::flags::PacketFlags {
+                                        header_type: rns_wire::flags::HeaderType::Header1,
+                                        context_flag: false,
+                                        transport_type: rns_wire::flags::TransportType::Broadcast,
+                                        destination_type: rns_wire::flags::DestinationType::Link,
+                                        packet_type: rns_wire::flags::PacketType::Proof,
+                                    },
+                                    hops: 0,
+                                    transport_id: None,
+                                    destination_hash: link_id,
+                                    context: rns_wire::context::PacketContext::ResourcePrf,
+                                };
+                                let mut prf_raw = prf_header.pack();
+                                prf_raw.extend_from_slice(&proof);
+                                active.link.record_tx(prf_raw.len());
+                                let _ = self.transport_tx.try_send(TransportMessage::Outbound(
+                                    OutboundRequest {
+                                        raw: Bytes::from(prf_raw),
+                                        destination_hash: link_id,
+                                    },
+                                ));
+
+                                // Split resources route to a coordinator keyed by
+                                // `original_hash`; completion fires only on full reassembly.
+                                if let Some(route) = active.segment_routing.remove(&rh) {
+                                    let seg_meta = active
+                                        .inbound_resources
+                                        .get(&rh)
+                                        .and_then(|t| t.resource.metadata.clone());
+
+                                    if let Some(coord) =
+                                        active.inbound_split_resources.get_mut(&route.original_hash)
+                                    {
+                                        match coord
+                                            .set_segment_data(route.segment_index, assembled_data)
+                                        {
+                                            Ok(()) => {
+                                                if let Some(meta) = seg_meta {
+                                                    coord.set_metadata(meta);
+                                                }
+                                            }
+                                            Err(e) => {
+                                                tracing::warn!(
+                                                    link_id = hex::encode(link_id),
+                                                    original = hex::encode(
+                                                        &route.original_hash[..8]
+                                                    ),
+                                                    segment = route.segment_index,
+                                                    error = ?e,
+                                                    "split-resource coordinator rejected segment"
+                                                );
+                                            }
+                                        }
+
+                                        if coord.is_complete() {
+                                            match coord.reassemble() {
+                                                Ok(blob) => {
+                                                    let metadata = coord.metadata.take();
+                                                    let total_segments = coord.total_segments;
+                                                    if let Some(ref tx) =
+                                                        self.resource_completion_tx
+                                                    {
+                                                        let _ = tx.try_send(ResourceCompletion {
+                                                            link_id,
+                                                            resource_hash: route.original_hash,
+                                                            data: blob.clone(),
+                                                            metadata,
+                                                        });
+                                                    }
+                                                    if let Some(ref tx) = self.resource_completed_tx
+                                                    {
+                                                        let _ = tx.try_send((blob, link_id));
+                                                    }
+                                                    tracing::info!(
+                                                        link_id = hex::encode(link_id),
+                                                        original =
+                                                            hex::encode(&route.original_hash[..8]),
+                                                        total_segments,
+                                                        "split-resource reassembly complete"
+                                                    );
+                                                }
+                                                Err(e) => {
+                                                    tracing::warn!(
+                                                        link_id = hex::encode(link_id),
+                                                        original = hex::encode(
+                                                            &route.original_hash[..8]
+                                                        ),
+                                                        error = ?e,
+                                                        "split-resource reassembly failed"
+                                                    );
+                                                }
+                                            }
+                                            active
+                                                .inbound_split_resources
+                                                .remove(&route.original_hash);
+                                        } else {
+                                            tracing::debug!(
+                                                link_id = hex::encode(link_id),
+                                                original = hex::encode(&route.original_hash[..8]),
+                                                segment = route.segment_index,
+                                                progress = coord.assembled_count(),
+                                                total = coord.total_segments,
+                                                "split-resource segment received — awaiting more"
+                                            );
+                                        }
+                                    } else {
+                                        tracing::warn!(
+                                            link_id = hex::encode(link_id),
+                                            original = hex::encode(&route.original_hash[..8]),
+                                            "split-resource coordinator missing for completed segment"
+                                        );
+                                    }
+                                } else {
+                                    // Single-segment path: rncp channel keeps metadata +
+                                    // resource hash; the legacy LXMF channel drops both.
+                                    if let Some(ref tx) = self.resource_completion_tx {
+                                        let metadata = active
+                                            .inbound_resources
+                                            .get(&rh)
+                                            .and_then(|t| t.resource.metadata.clone());
+                                        let _ = tx.try_send(ResourceCompletion {
+                                            link_id,
+                                            resource_hash: rh,
+                                            data: assembled_data.clone(),
+                                            metadata,
+                                        });
+                                    }
+
+                                    if let Some(ref tx) = self.resource_completed_tx {
+                                        let _ = tx.try_send((assembled_data, link_id));
+                                    }
+
+                                    tracing::debug!(
+                                        link_id = hex::encode(link_id),
+                                        resource = hex::encode(&rh[..8]),
+                                        "inbound resource transfer completed — proof sent"
+                                    );
+                                }
+                            }
+                            active.link.untrack_resource(&rh);
+                            active.inbound_resources.remove(&rh);
+                        }
+                    }
+                }
+            }
+            rns_wire::context::PacketContext::ResourceReq => {
+                // Receiver's HMU for outbound transfer (Link.py:1104-1124).
+                if let Some(active) = self.active_links.get_mut(&link_id) {
+                    active.link.record_inbound();
+                    if let Ok(plaintext) = active.link.decrypt(data)
+                        && plaintext.len() > 32
+                    {
+                        // Exhaustion flag shifts the resource hash by MAPHASH_LEN.
+                        let resource_hash_start =
+                            if plaintext[0] == rns_protocol::resource::HASHMAP_IS_EXHAUSTED {
+                                1 + rns_protocol::resource::MAPHASH_LEN
+                            } else {
+                                1
+                            };
+                        if plaintext.len() >= resource_hash_start + 32 {
+                            let mut rh = [0u8; 32];
+                            rh.copy_from_slice(
+                                &plaintext[resource_hash_start..resource_hash_start + 32],
+                            );
+                            let packet_hash =
+                                rns_wire::hash::packet_hash(raw, header.flags.header_type);
+                            let actions = active
+                                .outbound_resources
+                                .get_mut(&rh)
+                                .map(|transfer| {
+                                    transfer.handle_request_packet(packet_hash, &plaintext)
+                                })
+                                .unwrap_or_default();
+                            for action in actions {
+                                let (context, body) = match action {
+                                    TransferAction::SendPart(idx, part_data) => {
+                                        tracing::trace!(
+                                            link_id = hex::encode(link_id),
+                                            part = idx,
+                                            "sent resource part (request response)"
+                                        );
+                                        (
+                                            rns_wire::context::PacketContext::Resource,
+                                            Bytes::from(part_data),
+                                        )
+                                    }
+                                    TransferAction::SendHmu(hmu) => {
+                                        let Ok(encrypted) = active.link.encrypt(&hmu) else {
+                                            continue;
+                                        };
+                                        (
+                                            rns_wire::context::PacketContext::ResourceHmu,
+                                            Bytes::from(encrypted),
+                                        )
+                                    }
+                                    TransferAction::SendRequest(req) => {
+                                        let Ok(encrypted) = active.link.encrypt(&req) else {
+                                            continue;
+                                        };
+                                        (
+                                            rns_wire::context::PacketContext::ResourceReq,
+                                            Bytes::from(encrypted),
+                                        )
+                                    }
+                                    TransferAction::SendCancel(cancel_type, resource_hash) => {
+                                        let Ok(encrypted) = active.link.encrypt(&resource_hash)
+                                        else {
+                                            continue;
+                                        };
+                                        let context = match cancel_type {
+                                            rns_protocol::resource::CancelType::Icl => {
+                                                rns_wire::context::PacketContext::ResourceIcl
+                                            }
+                                            rns_protocol::resource::CancelType::Rcl => {
+                                                rns_wire::context::PacketContext::ResourceRcl
+                                            }
+                                        };
+                                        (context, Bytes::from(encrypted))
+                                    }
+                                    _ => continue,
+                                };
+                                let part_header = rns_wire::header::PacketHeader {
+                                    flags: rns_wire::flags::PacketFlags {
+                                        header_type: rns_wire::flags::HeaderType::Header1,
+                                        context_flag: false,
+                                        transport_type: rns_wire::flags::TransportType::Broadcast,
+                                        destination_type: rns_wire::flags::DestinationType::Link,
+                                        packet_type: rns_wire::flags::PacketType::Data,
+                                    },
+                                    hops: 0,
+                                    transport_id: None,
+                                    destination_hash: link_id,
+                                    context,
+                                };
+                                let mut raw = part_header.pack();
+                                raw.extend_from_slice(&body);
+                                active.link.record_tx(raw.len());
+                                let _ = self.transport_tx.try_send(TransportMessage::Outbound(
+                                    OutboundRequest {
+                                        raw: Bytes::from(raw),
+                                        destination_hash: link_id,
+                                    },
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+            rns_wire::context::PacketContext::ResourceIcl => {
+                // Sender-initiated cancel of an inbound transfer (Link.py:1135-1142).
+                if let Some(active) = self.active_links.get_mut(&link_id) {
+                    active.link.record_inbound();
+                    if let Ok(plaintext) = active.link.decrypt(data)
+                        && plaintext.len() >= 32
+                    {
+                        let mut rh = [0u8; 32];
+                        rh.copy_from_slice(&plaintext[..32]);
+                        if let Some(transfer) = active.inbound_resources.get_mut(&rh) {
+                            transfer.handle_cancel();
+                            tracing::debug!(
+                                link_id = hex::encode(link_id),
+                                "RESOURCE_ICL — inbound transfer cancelled"
+                            );
+                        }
+                        active.inbound_resources.remove(&rh);
+
+                        // Sender-cancel of a split-segment tears down the whole
+                        // reassembly state (coordinator + sibling segments) so
+                        // the coordinator isn't orphaned forever.
+                        if let Some(route) = active.segment_routing.remove(&rh) {
+                            let oh = route.original_hash;
+                            active.inbound_split_resources.remove(&oh);
+                            let siblings: Vec<[u8; 32]> = active
+                                .segment_routing
+                                .iter()
+                                .filter_map(|(seg_rh, r)| {
+                                    if r.original_hash == oh {
+                                        Some(*seg_rh)
+                                    } else {
+                                        None
+                                    }
+                                })
+                                .collect();
+                            for sibling_rh in siblings {
+                                active.segment_routing.remove(&sibling_rh);
+                                active.inbound_resources.remove(&sibling_rh);
+                                active.link.untrack_resource(&sibling_rh);
+                            }
+                            tracing::debug!(
+                                link_id = hex::encode(link_id),
+                                original = hex::encode(&oh[..8]),
+                                "split-resource cancelled by sender — coordinator + siblings dropped"
+                            );
+                        }
+                    }
+                }
+            }
+            rns_wire::context::PacketContext::ResourceRcl => {
+                // Receiver-initiated reject of an outbound transfer (Link.py:1144-1151).
+                if let Some(active) = self.active_links.get_mut(&link_id) {
+                    active.link.record_inbound();
+                    if let Ok(plaintext) = active.link.decrypt(data)
+                        && plaintext.len() >= 32
+                    {
+                        let mut rh = [0u8; 32];
+                        rh.copy_from_slice(&plaintext[..32]);
+                        if let Some(transfer) = active.outbound_resources.get_mut(&rh) {
+                            transfer.resource.handle_cancel();
+                            tracing::debug!(
+                                link_id = hex::encode(link_id),
+                                "RESOURCE_RCL — outbound transfer rejected"
+                            );
+                        }
+                        active.outbound_resources.remove(&rh);
+                    }
+                }
+            }
+            rns_wire::context::PacketContext::ResourceHmu => {
+                if let Some(active) = self.active_links.get_mut(&link_id) {
+                    active.link.record_inbound();
+                    if let Ok(plaintext) = active.link.decrypt(data)
+                        && let Ok((rh, segment, hashmap)) =
+                            rns_protocol::resource::parse_hashmap_update(&plaintext)
+                        && let Some(transfer) = active.inbound_resources.get_mut(&rh)
+                    {
+                        let action = transfer.hashmap_update(segment, &hashmap);
+                        if let TransferAction::SendRequest(req) = action
+                            && let Ok(encrypted) = active.link.encrypt(&req)
+                        {
+                            let req_header = rns_wire::header::PacketHeader {
+                                flags: rns_wire::flags::PacketFlags {
+                                    header_type: rns_wire::flags::HeaderType::Header1,
+                                    context_flag: false,
+                                    transport_type: rns_wire::flags::TransportType::Broadcast,
+                                    destination_type: rns_wire::flags::DestinationType::Link,
+                                    packet_type: rns_wire::flags::PacketType::Data,
+                                },
+                                hops: 0,
+                                transport_id: None,
+                                destination_hash: link_id,
+                                context: rns_wire::context::PacketContext::ResourceReq,
+                            };
+                            let mut req_raw = req_header.pack();
+                            req_raw.extend_from_slice(&encrypted);
+                            active.link.record_tx(req_raw.len());
+                            let _ = self.transport_tx.try_send(TransportMessage::Outbound(
+                                OutboundRequest {
+                                    raw: Bytes::from(req_raw),
+                                    destination_hash: link_id,
+                                },
+                            ));
+                        }
+                    }
+                }
+            }
+            rns_wire::context::PacketContext::ResourcePrf => {
+                if let Some(active) = self.active_links.get_mut(&link_id) {
+                    active.link.record_inbound();
+                    if data.len() >= 64 {
+                        let mut rh = [0u8; 32];
+                        rh.copy_from_slice(&data[..32]);
+                        let queue_key = active
+                            .outbound_resources
+                            .get(&rh)
+                            .and_then(|transfer| transfer.resource.original_hash);
+                        let complete = active
+                            .outbound_resources
+                            .get_mut(&rh)
+                            .is_some_and(|transfer| transfer.handle_proof(data));
+                        if complete {
+                            active.outbound_resources.remove(&rh);
+                            if let Some(key) = queue_key {
+                                let (next, empty) = if let Some(queue) =
+                                    active.outbound_split_queues.get_mut(&key)
+                                {
+                                    let next = queue.pop_front();
+                                    (next, queue.is_empty())
+                                } else {
+                                    (None, false)
+                                };
+                                if empty {
+                                    active.outbound_split_queues.remove(&key);
+                                }
+                                if let Some(next) = next {
+                                    let _ = Self::start_outbound_transfer(
+                                        &self.transport_tx,
+                                        active,
+                                        &link_id,
+                                        next,
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            rns_wire::context::PacketContext::Request => {
+                if let Some(active) = self.active_links.get_mut(&link_id) {
+                    active.link.record_inbound();
+
+                    if let Ok((_request_id, path_hash, _timestamp, data)) =
+                        active.link.handle_request(data)
+                    {
+                        // Python Reticulum uses the truncated RNS packet hash
+                        // as the request id for packet-sized Link requests.
+                        // The packed-request hash is only used for request
+                        // resources, where the request id is carried in the
+                        // Resource advertisement.
+                        let request_id =
+                            rns_wire::hash::truncated_packet_hash(raw, header.flags.header_type);
+                        // request_handler_ex wins; it can schedule a resource transfer.
+                        let outcome = if let Some(ref handler) = self.request_handler_ex {
+                            handler(link_id, path_hash, data.clone())
+                        } else if let Some(ref handler) = self.request_handler {
+                            match handler(link_id, path_hash, data.clone()) {
+                                Some(r) => RequestOutcome::Reply(r),
+                                None => RequestOutcome::Drop,
+                            }
+                        } else {
+                            RequestOutcome::Drop
+                        };
+
+                        let (resp_bytes_opt, fetch_spec) = match outcome {
+                            RequestOutcome::Reply(r) => (Some(r), None),
+                            RequestOutcome::ReplyWithResource {
+                                ack,
+                                data,
+                                metadata,
+                                auto_compress,
+                            } => (Some(ack), Some((data, metadata, auto_compress))),
+                            RequestOutcome::Drop => (None, None),
+                        };
+
+                        let mut response_resource = None;
+                        if let Some(resp_bytes) = resp_bytes_opt {
+                            if let Ok(packed_response) =
+                                rns_link::link::Link::pack_response(&request_id, &resp_bytes)
+                            {
+                                if packed_response.len() <= active.link.mdu {
+                                    if let Ok(encrypted) = active.link.encrypt(&packed_response) {
+                                        let resp_header = rns_wire::header::PacketHeader {
+                                            flags: rns_wire::flags::PacketFlags {
+                                                header_type: rns_wire::flags::HeaderType::Header1,
+                                                context_flag: false,
+                                                transport_type:
+                                                    rns_wire::flags::TransportType::Broadcast,
+                                                destination_type:
+                                                    rns_wire::flags::DestinationType::Link,
+                                                packet_type: rns_wire::flags::PacketType::Data,
+                                            },
+                                            hops: 0,
+                                            transport_id: None,
+                                            destination_hash: link_id,
+                                            context: rns_wire::context::PacketContext::Response,
+                                        };
+                                        let mut resp_raw = resp_header.pack();
+                                        resp_raw.extend_from_slice(&encrypted);
+                                        let _ = self.transport_tx.try_send(
+                                            TransportMessage::Outbound(OutboundRequest {
+                                                raw: Bytes::from(resp_raw),
+                                                destination_hash: link_id,
+                                            }),
+                                        );
+                                        tracing::debug!(
+                                            link_id = hex::encode(link_id),
+                                            request_id = hex::encode(request_id),
+                                            resp_len = resp_bytes.len(),
+                                            "link request handled — response sent"
+                                        );
+                                    }
+                                } else {
+                                    response_resource = Some((packed_response, request_id));
+                                }
+                            }
+                        } else {
+                            tracing::debug!(
+                                link_id = hex::encode(link_id),
+                                request_id = hex::encode(request_id),
+                                path = hex::encode(path_hash),
+                                "link request received — no handler response"
+                            );
+                        }
+
+                        if let Some((packed_response, request_id)) = response_resource {
+                            let _ =
+                                self.start_response_resource(&link_id, packed_response, request_id);
+                            tracing::debug!(
+                                link_id = hex::encode(link_id),
+                                request_id = hex::encode(request_id),
+                                "link request handled — response sent as resource"
+                            );
+                        }
+
+                        if let Some((data, metadata, auto_compress)) = fetch_spec
+                            && self
+                                .start_resource_transfer_inner(
+                                    &link_id,
+                                    ResourceTransferStart {
+                                        data,
+                                        metadata,
+                                        auto_compress,
+                                        request_id: None,
+                                        is_response: false,
+                                        allow_handshake: true,
+                                    },
+                                )
+                                .is_none()
+                        {
+                            tracing::warn!(
+                                link_id = hex::encode(link_id),
+                                "link request resource response could not be started"
+                            );
+                        }
+                    }
+                }
+            }
+            rns_wire::context::PacketContext::Response => {
+                if let Some(active) = self.active_links.get_mut(&link_id) {
+                    active.link.record_inbound();
+
+                    if let Ok((request_id, response_data)) = active.link.handle_response(data) {
+                        tracing::debug!(
+                            link_id = hex::encode(link_id),
+                            request_id = hex::encode(request_id),
+                            response_len = response_data.len(),
+                            "link response received — delivering to caller"
+                        );
+
+                        if let Some(ref tx) = self.response_tx {
+                            let _ = tx.try_send(LinkResponse {
+                                link_id,
+                                request_id,
+                                data: response_data,
+                            });
+                        }
+                    }
+                }
+            }
+            _ => {
+                // Application data on a link (LXMF DIRECT).
+                if let Some(active) = self.active_links.get_mut(&link_id) {
+                    active.link.record_inbound();
+                    active.link.record_rx(data.len());
+                    if let Ok(plaintext) = active.link.decrypt(data) {
+                        if let Some(ref cb) = active.link.packet_callback {
+                            cb(&plaintext);
+                        }
+                        if let Some(ref tx) = self.link_packet_tx {
+                            let _ = tx.try_send((plaintext, link_id));
+                        }
+                        tracing::debug!(
+                            link_id = hex::encode(link_id),
+                            "link data packet decrypted and forwarded"
+                        );
+
+                        // Link proofs are unencrypted (Packet.py:198-200).
+                        if let Some(ref signing_key) = self.identity_key {
+                            let pkt_hash =
+                                rns_wire::hash::packet_hash(raw, header.flags.header_type);
+                            if let Ok(proof_data) = active.link.prove_packet(&pkt_hash, signing_key)
+                            {
+                                let proof_header = rns_wire::header::PacketHeader {
+                                    flags: rns_wire::flags::PacketFlags {
+                                        header_type: rns_wire::flags::HeaderType::Header1,
+                                        context_flag: false,
+                                        transport_type: rns_wire::flags::TransportType::Broadcast,
+                                        destination_type: rns_wire::flags::DestinationType::Link,
+                                        packet_type: rns_wire::flags::PacketType::Proof,
+                                    },
+                                    hops: 0,
+                                    transport_id: None,
+                                    destination_hash: link_id,
+                                    context: rns_wire::context::PacketContext::LinkProof,
+                                };
+                                let mut proof_raw = proof_header.pack();
+                                proof_raw.extend_from_slice(&proof_data);
+                                let _ = self.transport_tx.try_send(TransportMessage::Outbound(
+                                    OutboundRequest {
+                                        raw: Bytes::from(proof_raw),
+                                        destination_hash: link_id,
+                                    },
+                                ));
+                                tracing::info!(
+                                    link_id = hex::encode(link_id),
+                                    proof_len = proof_data.len(),
+                                    "delivery proof sent for link data packet (unencrypted)"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn on_tick(&mut self) {
+        let mut to_remove = Vec::new();
+
+        for (link_id, active) in &mut self.active_links {
+            let timed_out_channel_sequences = active
+                .channel
+                .as_ref()
+                .map(LinkChannel::timed_out_sequences)
+                .unwrap_or_default();
+            for sequence in timed_out_channel_sequences {
+                let resend =
+                    active
+                        .channel
+                        .as_mut()
+                        .and_then(|channel| match channel.timeout(sequence) {
+                            Ok(resend) => resend,
+                            Err(ChannelError::MaxRetriesExceeded) => {
+                                tracing::warn!(
+                                    link_id = hex::encode(link_id),
+                                    sequence,
+                                    "channel packet exceeded max retries"
+                                );
+                                to_remove.push(*link_id);
+                                None
+                            }
+                            Err(error) => {
+                                tracing::warn!(
+                                    link_id = hex::encode(link_id),
+                                    sequence,
+                                    error = %error,
+                                    "channel packet retry failed"
+                                );
+                                None
+                            }
+                        });
+                let Some(data) = resend else {
+                    continue;
+                };
+
+                let (packet_hash, raw_len) =
+                    Self::resend_channel_data(&self.transport_tx, link_id, sequence, &data);
+                if let Some(channel) = active.channel.as_mut() {
+                    channel.track_outbound_packet_hash(packet_hash, sequence);
+                }
+                active.link.record_tx(raw_len);
+            }
+
+            if !active.inbound_resources.is_empty() || !active.outbound_resources.is_empty() {
+                active.link.record_inbound();
+            }
+            let action = active.link.tick();
+            match action {
+                LinkAction::SendKeepalive => {
+                    Self::send_keepalive_packet(&self.transport_tx, link_id);
+                }
+                LinkAction::TransitionedToStale => {
+                    // Python double-sends on stale transition (Link.py:797-802, initiator only).
+                    if active.link.is_initiator {
+                        Self::send_keepalive_packet(&self.transport_tx, link_id);
+                    }
+                    tracing::debug!(link_id = hex::encode(link_id), "link transitioned to stale");
+                }
+                LinkAction::SendTeardownAndClose(ref teardown_data) => {
+                    if !teardown_data.is_empty() {
+                        let td_header = rns_wire::header::PacketHeader {
+                            flags: rns_wire::flags::PacketFlags {
+                                header_type: rns_wire::flags::HeaderType::Header1,
+                                context_flag: false,
+                                transport_type: rns_wire::flags::TransportType::Broadcast,
+                                destination_type: rns_wire::flags::DestinationType::Link,
+                                packet_type: rns_wire::flags::PacketType::Data,
+                            },
+                            hops: 0,
+                            transport_id: None,
+                            destination_hash: *link_id,
+                            context: rns_wire::context::PacketContext::LinkClose,
+                        };
+                        let mut td_raw = td_header.pack();
+                        td_raw.extend_from_slice(teardown_data);
+                        let _ = self.transport_tx.try_send(TransportMessage::Outbound(
+                            OutboundRequest {
+                                raw: Bytes::from(td_raw),
+                                destination_hash: *link_id,
+                            },
+                        ));
+                    }
+                    to_remove.push(*link_id);
+                    tracing::info!(
+                        link_id = hex::encode(link_id),
+                        "link stale timeout, teardown sent"
+                    );
+                }
+                LinkAction::Closed(_) => {
+                    to_remove.push(*link_id);
+                }
+                LinkAction::None => {}
+            }
+        }
+
+        for link_id in to_remove {
+            if self.close_active_link(link_id, CloseReason::Timeout, false) {
+                tracing::debug!(link_id = hex::encode(link_id), "link removed by tick");
+            }
+        }
+    }
+
+    fn close_active_link(
+        &mut self,
+        link_id: [u8; 16],
+        reason: CloseReason,
+        send_teardown: bool,
+    ) -> bool {
+        let Some(mut active) = self.active_links.remove(&link_id) else {
+            return false;
+        };
+
+        if send_teardown {
+            if let Some(teardown_data) = active.link.teardown(reason) {
+                Self::send_link_close_packet(&self.transport_tx, &link_id, &teardown_data);
+            }
+        } else {
+            active.link.mark_closed(reason);
+        }
+
+        if let Some(ref cb) = active.link.link_closed_callback {
+            cb(&active.link);
+        }
+
+        self.backchannel_links.retain(|_, lid| *lid != link_id);
+        if let Ok(mut ids) = self.link_identities.lock() {
+            ids.remove(&link_id);
+        }
+        let _ = self
+            .transport_tx
+            .try_send(TransportMessage::DeregisterDestination { hash: link_id });
+        if let Some(ref tx) = self.link_closed_tx {
+            let _ = tx.try_send(link_id);
+        }
+
+        true
+    }
+
+    fn send_link_close_packet(
+        transport_tx: &mpsc::Sender<TransportMessage>,
+        link_id: &[u8; 16],
+        teardown_data: &[u8],
+    ) {
+        let td_header = rns_wire::header::PacketHeader {
+            flags: rns_wire::flags::PacketFlags {
+                header_type: rns_wire::flags::HeaderType::Header1,
+                context_flag: false,
+                transport_type: rns_wire::flags::TransportType::Broadcast,
+                destination_type: rns_wire::flags::DestinationType::Link,
+                packet_type: rns_wire::flags::PacketType::Data,
+            },
+            hops: 0,
+            transport_id: None,
+            destination_hash: *link_id,
+            context: rns_wire::context::PacketContext::LinkClose,
+        };
+        let mut td_raw = td_header.pack();
+        td_raw.extend_from_slice(teardown_data);
+        let _ = transport_tx.try_send(TransportMessage::Outbound(OutboundRequest {
+            raw: Bytes::from(td_raw),
+            destination_hash: *link_id,
+        }));
+    }
+
+    fn send_keepalive_packet(transport_tx: &mpsc::Sender<TransportMessage>, link_id: &[u8; 16]) {
+        let ka_header = rns_wire::header::PacketHeader {
+            flags: rns_wire::flags::PacketFlags {
+                header_type: rns_wire::flags::HeaderType::Header1,
+                context_flag: false,
+                transport_type: rns_wire::flags::TransportType::Broadcast,
+                destination_type: rns_wire::flags::DestinationType::Link,
+                packet_type: rns_wire::flags::PacketType::Data,
+            },
+            hops: 0,
+            transport_id: None,
+            destination_hash: *link_id,
+            context: rns_wire::context::PacketContext::Keepalive,
+        };
+        let mut ka_raw = ka_header.pack();
+        ka_raw.push(rns_link::constants::KEEPALIVE_REQUEST);
+        let _ = transport_tx.try_send(TransportMessage::Outbound(OutboundRequest {
+            raw: Bytes::from(ka_raw),
+            destination_hash: *link_id,
+        }));
+    }
+
+    fn send_link_packet_proof(
+        transport_tx: &mpsc::Sender<TransportMessage>,
+        link_id: &[u8; 16],
+        proof_data: &[u8],
+        context: rns_wire::context::PacketContext,
+    ) {
+        let proof_header = rns_wire::header::PacketHeader {
+            flags: rns_wire::flags::PacketFlags {
+                header_type: rns_wire::flags::HeaderType::Header1,
+                context_flag: false,
+                transport_type: rns_wire::flags::TransportType::Broadcast,
+                destination_type: rns_wire::flags::DestinationType::Link,
+                packet_type: rns_wire::flags::PacketType::Proof,
+            },
+            hops: 0,
+            transport_id: None,
+            destination_hash: *link_id,
+            context,
+        };
+        let mut proof_raw = proof_header.pack();
+        proof_raw.extend_from_slice(proof_data);
+        let _ = transport_tx.try_send(TransportMessage::Outbound(OutboundRequest {
+            raw: Bytes::from(proof_raw),
+            destination_hash: *link_id,
+        }));
+    }
+
+    fn resend_channel_data(
+        transport_tx: &mpsc::Sender<TransportMessage>,
+        link_id: &[u8; 16],
+        sequence: u16,
+        data: &[u8],
+    ) -> ([u8; 32], usize) {
+        let channel_header = rns_wire::header::PacketHeader {
+            flags: rns_wire::flags::PacketFlags {
+                header_type: rns_wire::flags::HeaderType::Header1,
+                context_flag: false,
+                transport_type: rns_wire::flags::TransportType::Broadcast,
+                destination_type: rns_wire::flags::DestinationType::Link,
+                packet_type: rns_wire::flags::PacketType::Data,
+            },
+            hops: 0,
+            transport_id: None,
+            destination_hash: *link_id,
+            context: rns_wire::context::PacketContext::Channel,
+        };
+        let mut raw = channel_header.pack();
+        raw.extend_from_slice(data);
+        let packet_hash = rns_wire::hash::packet_hash(&raw, channel_header.flags.header_type);
+        let raw_len = raw.len();
+        let _ = transport_tx.try_send(TransportMessage::Outbound(OutboundRequest {
+            raw: Bytes::from(raw),
+            destination_hash: *link_id,
+        }));
+        tracing::debug!(
+            link_id = hex::encode(link_id),
+            sequence,
+            packet_hash = hex::encode(&packet_hash[..8]),
+            "channel packet retransmitted"
+        );
+        (packet_hash, raw_len)
+    }
+
+    fn ensure_link_channel(active: &mut ActiveLink, link_id: [u8; 16]) -> Option<&mut LinkChannel> {
+        if active.channel.is_none() {
+            let rtt = active.link.rtt_secs();
+            let keys = active.link.session_keys()?;
+            active.channel = Some(LinkChannel::new_encrypted(link_id, rtt, keys));
+            active.link.mark_channel_created();
+        }
+        active.channel.as_mut()
+    }
+
+    fn handle_link_packet_proof(&mut self, link_id: [u8; 16], proof_data: &[u8]) {
+        let Some(active) = self.active_links.get_mut(&link_id) else {
+            return;
+        };
+
+        active.link.record_inbound();
+        if proof_data.len() < 96 {
+            tracing::warn!(
+                link_id = hex::encode(link_id),
+                proof_len = proof_data.len(),
+                "short link packet proof ignored"
+            );
+            return;
+        }
+
+        let mut packet_hash = [0u8; 32];
+        packet_hash.copy_from_slice(&proof_data[..32]);
+        if !active.link.validate_packet_proof(&packet_hash, proof_data) {
+            tracing::warn!(
+                link_id = hex::encode(link_id),
+                packet_hash = hex::encode(&packet_hash[..8]),
+                "invalid link packet proof ignored"
+            );
+            return;
+        }
+
+        let rtt = active.link.rtt_secs();
+        if let Some(channel) = active.channel.as_mut()
+            && let Some(sequence) = channel.delivered_by_packet_hash(&packet_hash, rtt)
+        {
+            active.link.keepalive.record_proof();
+            tracing::debug!(
+                link_id = hex::encode(link_id),
+                sequence,
+                packet_hash = hex::encode(&packet_hash[..8]),
+                "channel packet delivery proof accepted"
+            );
+        }
+    }
+
+    pub fn set_request_handler<F>(&mut self, handler: F)
+    where
+        F: Fn([u8; 16], [u8; 16], Vec<u8>) -> Option<Vec<u8>> + Send + 'static,
+    {
+        self.request_handler = Some(Box::new(handler));
+    }
+
+    /// Handler that may schedule a follow-up resource transfer (rncp --fetch).
+    /// Takes precedence over [`Self::set_request_handler`].
+    pub fn set_request_handler_ex<F>(&mut self, handler: F)
+    where
+        F: Fn([u8; 16], [u8; 16], Vec<u8>) -> RequestOutcome + Send + 'static,
+    {
+        self.request_handler_ex = Some(Box::new(handler));
+    }
+
+    pub fn set_announce_handler<F>(&mut self, handler: F)
+    where
+        F: FnMut() + Send + 'static,
+    {
+        self.announce_handler = Some(Box::new(handler));
+    }
+
+    pub fn set_response_channel(&mut self, tx: mpsc::Sender<LinkResponse>) {
+        self.response_tx = Some(tx);
+    }
+
+    pub fn set_resource_completed_channel(&mut self, tx: mpsc::Sender<(Vec<u8>, [u8; 16])>) {
+        self.resource_completed_tx = Some(tx);
+    }
+
+    pub fn set_resource_completion_channel(&mut self, tx: mpsc::Sender<ResourceCompletion>) {
+        self.resource_completion_tx = Some(tx);
+    }
+
+    /// Fires when a link reaches the active state.
+    pub fn set_link_established_channel(&mut self, tx: mpsc::Sender<[u8; 16]>) {
+        self.link_established_tx = Some(tx);
+    }
+
+    /// Fires on LinkIdentify before any resource ADV can race it.
+    pub fn set_link_identified_channel(&mut self, tx: mpsc::Sender<([u8; 16], [u8; 16])>) {
+        self.link_identified_tx = Some(tx);
+    }
+
+    pub fn set_link_identity_gate<F>(&mut self, gate: F)
+    where
+        F: Fn([u8; 16], [u8; 16]) -> bool + Send + 'static,
+    {
+        self.link_identity_gate = Some(Box::new(gate));
+    }
+
+    pub fn set_link_packet_channel(&mut self, tx: mpsc::Sender<(Vec<u8>, [u8; 16])>) {
+        self.link_packet_tx = Some(tx);
+    }
+
+    pub fn set_channel_message_channel(&mut self, tx: mpsc::Sender<LinkChannelMessage>) {
+        self.channel_message_tx = Some(tx);
+    }
+
+    pub fn set_link_closed_channel(&mut self, tx: mpsc::Sender<[u8; 16]>) {
+        self.link_closed_tx = Some(tx);
+    }
+
+    /// Raw destination-encrypted packets for app-level decryption (opportunistic LXMF).
+    pub fn set_inbound_raw_channel(&mut self, tx: mpsc::Sender<Vec<u8>>) {
+        self.inbound_raw_tx = Some(tx);
+    }
+
+    pub fn active_link_count(&self) -> usize {
+        self.active_links.len()
+    }
+
+    pub fn get_link(&self, link_id: &[u8; 16]) -> Option<&Link> {
+        self.active_links.get(link_id).map(|a| &a.link)
+    }
+
+    pub fn get_link_mut(&mut self, link_id: &[u8; 16]) -> Option<&mut Link> {
+        self.active_links.get_mut(link_id).map(|a| &mut a.link)
+    }
+
+    pub fn get_channel(&mut self, link_id: &[u8; 16]) -> Option<&mut LinkChannel> {
+        let active = self.active_links.get_mut(link_id)?;
+        Self::ensure_link_channel(active, *link_id)
+    }
+
+    pub fn send_channel_message(
+        &mut self,
+        link_id: &[u8; 16],
+        msg: &dyn MessageBase,
+    ) -> Result<ChannelSendReceipt, ChannelSendError> {
+        let active = self
+            .active_links
+            .get(link_id)
+            .ok_or(ChannelSendError::LinkNotFound)?;
+        if !matches!(active.link.state, LinkState::Active | LinkState::Stale) {
+            return Err(ChannelSendError::LinkNotActive);
+        }
+
+        let transport_tx = self.transport_tx.clone();
+        let permit = transport_tx
+            .try_reserve()
+            .map_err(|_| ChannelSendError::TransportUnavailable)?;
+
+        let active = self
+            .active_links
+            .get_mut(link_id)
+            .ok_or(ChannelSendError::LinkNotFound)?;
+        let prepared = Self::ensure_link_channel(active, *link_id)
+            .ok_or(ChannelSendError::NoSessionKeys)?
+            .prepare_send_tracked(msg)?;
+
+        let channel_header = rns_wire::header::PacketHeader {
+            flags: rns_wire::flags::PacketFlags {
+                header_type: rns_wire::flags::HeaderType::Header1,
+                context_flag: false,
+                transport_type: rns_wire::flags::TransportType::Broadcast,
+                destination_type: rns_wire::flags::DestinationType::Link,
+                packet_type: rns_wire::flags::PacketType::Data,
+            },
+            hops: 0,
+            transport_id: None,
+            destination_hash: *link_id,
+            context: rns_wire::context::PacketContext::Channel,
+        };
+        let mut raw = channel_header.pack();
+        raw.extend_from_slice(&prepared.data);
+
+        let packet_hash = rns_wire::hash::packet_hash(&raw, channel_header.flags.header_type);
+        if let Some(channel) = active.channel.as_mut() {
+            channel.track_outbound_packet_hash(packet_hash, prepared.sequence);
+        }
+        active.link.record_tx(raw.len());
+
+        permit.send(TransportMessage::Outbound(OutboundRequest {
+            raw: Bytes::from(raw),
+            destination_hash: *link_id,
+        }));
+
+        Ok(ChannelSendReceipt {
+            link_id: *link_id,
+            sequence: prepared.sequence,
+            packet_hash,
+        })
+    }
+
+    pub fn process_destination_packet(&self, raw: &[u8], identity: &Identity) -> Option<Vec<u8>> {
+        let dest = self.destination.as_ref()?;
+        let (header, data_offset) = rns_wire::header::PacketHeader::unpack(raw).ok()?;
+        let data = &raw[data_offset..];
+        let packet_type = header.flags.packet_type as u8;
+
+        match dest.receive(packet_type, data, identity) {
+            Ok(Some(plaintext)) => Some(plaintext),
+            _ => None,
+        }
+    }
+
+    /// Sends ADV + initial window, registers transfer so later HMU drives the rest.
+    pub fn start_resource_transfer(
+        &mut self,
+        link_id: &[u8; 16],
+        data: Vec<u8>,
+        auto_compress: bool,
+    ) -> Option<[u8; 32]> {
+        self.start_resource_transfer_with_metadata(link_id, data, None, auto_compress)
+    }
+
+    /// As [`Self::start_resource_transfer`] but attaches msgpack metadata
+    /// (e.g. `{"name": "file.bin"}`). Used by rncp --fetch.
+    pub fn start_resource_transfer_with_metadata(
+        &mut self,
+        link_id: &[u8; 16],
+        data: Vec<u8>,
+        metadata: Option<Vec<u8>>,
+        auto_compress: bool,
+    ) -> Option<[u8; 32]> {
+        self.start_resource_transfer_inner(
+            link_id,
+            ResourceTransferStart {
+                data,
+                metadata,
+                auto_compress,
+                request_id: None,
+                is_response: false,
+                allow_handshake: false,
+            },
+        )
+    }
+
+    fn start_response_resource(
+        &mut self,
+        link_id: &[u8; 16],
+        packed_response: Vec<u8>,
+        request_id: [u8; 16],
+    ) -> Option<[u8; 32]> {
+        self.start_resource_transfer_inner(
+            link_id,
+            ResourceTransferStart {
+                data: packed_response,
+                metadata: None,
+                auto_compress: false,
+                request_id: Some(request_id.to_vec()),
+                is_response: true,
+                allow_handshake: false,
+            },
+        )
+    }
+
+    fn start_resource_transfer_inner(
+        &mut self,
+        link_id: &[u8; 16],
+        request: ResourceTransferStart,
+    ) -> Option<[u8; 32]> {
+        let ResourceTransferStart {
+            data,
+            metadata,
+            auto_compress,
+            request_id,
+            is_response,
+            allow_handshake,
+        } = request;
+        let active = self.active_links.get_mut(link_id)?;
+        let state_allows_transfer = active.link.state == LinkState::Active
+            || (allow_handshake && active.link.state == LinkState::Handshake);
+        if !state_allows_transfer {
+            return None;
+        }
+
+        let rtt = active
+            .link
+            .rtt
+            .unwrap_or(std::time::Duration::from_millis(500));
+        // Pre-encrypt before chunking so each part is raw ciphertext under MTU
+        // (matches Python Resource over a link).
+        let session_keys = active.link.session_keys()?;
+        let encrypt_fn = |plaintext: &[u8]| -> Vec<u8> {
+            rns_link::encryption::link_encrypt(&session_keys, plaintext)
+                .unwrap_or_else(|_| plaintext.to_vec())
+        };
+        let metadata_wire_size = metadata.as_ref().map(|m| 3 + m.len()).unwrap_or(0);
+        let resources = if metadata_wire_size + data.len() <= MAX_EFFICIENT_SIZE {
+            let mut resource = if metadata.is_some() {
+                rns_protocol::resource::OutboundResource::with_options(
+                    data,
+                    auto_compress,
+                    metadata,
+                    None,
+                    Some(&encrypt_fn),
+                )
+                .ok()?
+            } else {
+                rns_protocol::resource::OutboundResource::new(
+                    data,
+                    auto_compress,
+                    Some(&encrypt_fn),
+                )
+                .ok()?
+            };
+            resource.flags.is_response = is_response;
+            resource.request_id = request_id.clone();
+            vec![resource]
+        } else {
+            MultiSegmentOutbound::with_options(
+                data,
+                auto_compress,
+                metadata,
+                request_id.clone(),
+                is_response,
+                Some(&encrypt_fn),
+            )
+            .ok()?
+            .segments
+        };
+
+        let resource_key = resources
+            .first()
+            .map(|r| r.original_hash.unwrap_or(r.resource_hash))?;
+
+        let mut transfers: VecDeque<OutboundTransfer> = resources
+            .into_iter()
+            .map(|resource| OutboundTransfer::from_prebuilt(resource, rtt))
+            .collect();
+        let first = transfers.pop_front()?;
+        Self::start_outbound_transfer(&self.transport_tx, active, link_id, first)?;
+        if !transfers.is_empty() {
+            active.outbound_split_queues.insert(resource_key, transfers);
+        }
+
+        Some(resource_key)
+    }
+
+    fn start_outbound_transfer(
+        transport_tx: &mpsc::Sender<TransportMessage>,
+        active: &mut ActiveLink,
+        link_id: &[u8; 16],
+        mut transfer: OutboundTransfer,
+    ) -> Option<[u8; 32]> {
+        let action = transfer.tick();
+        let adv_data = match action {
+            TransferAction::SendAdvertisement(adv) => adv,
+            _ => return None,
+        };
+
+        let resource_hash = transfer.resource.resource_hash;
+        let encrypted = active.link.encrypt(&adv_data).ok()?;
+        let adv_header = rns_wire::header::PacketHeader {
+            flags: rns_wire::flags::PacketFlags {
+                header_type: rns_wire::flags::HeaderType::Header1,
+                context_flag: false,
+                transport_type: rns_wire::flags::TransportType::Broadcast,
+                destination_type: rns_wire::flags::DestinationType::Link,
+                packet_type: rns_wire::flags::PacketType::Data,
+            },
+            hops: 0,
+            transport_id: None,
+            destination_hash: *link_id,
+            context: rns_wire::context::PacketContext::ResourceAdv,
+        };
+        let mut raw = adv_header.pack();
+        raw.extend_from_slice(&encrypted);
+        active.link.record_tx(raw.len());
+        let _ = transport_tx.try_send(TransportMessage::Outbound(OutboundRequest {
+            raw: Bytes::from(raw),
+            destination_hash: *link_id,
+        }));
+
+        active.outbound_resources.insert(resource_hash, transfer);
+        tracing::debug!(
+            link_id = hex::encode(link_id),
+            resource = hex::encode(&resource_hash[..8]),
+            "outbound resource transfer started"
+        );
+        Some(resource_hash)
+    }
+
+    pub fn complete_resource(
+        &mut self,
+        link_id: &[u8; 16],
+        resource_hash: &[u8; 32],
+    ) -> Option<(Vec<u8>, Vec<u8>)> {
+        let active = self.active_links.get_mut(link_id)?;
+        let transfer = active.inbound_resources.get_mut(resource_hash)?;
+        match transfer.complete(None) {
+            Ok((data, proof)) => {
+                active.link.untrack_resource(resource_hash);
+                active.inbound_resources.remove(resource_hash);
+                Some((data, proof))
+            }
+            Err(_) => None,
+        }
+    }
+}
+
+fn clone_identity(identity: &Identity) -> Option<Identity> {
+    let private_key = identity.get_private_key()?;
+    Identity::from_private_key(&*private_key).ok()
+}
+
+fn unix_now() -> f64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs_f64()
+}
+
+pub fn register_destination(
+    transport_tx: &mpsc::Sender<TransportMessage>,
+    dest_hash: [u8; 16],
+    app_name: &str,
+) -> mpsc::Receiver<DestinationEvent> {
+    let (tx, rx) = mpsc::channel(256);
+    if let Err(e) = transport_tx.try_send(TransportMessage::RegisterDestination {
+        hash: dest_hash,
+        app_name: app_name.to_string(),
+        delivery_tx: Some(tx),
+    }) {
+        tracing::warn!(dest = hex::encode(dest_hash), err = %e,
+            "failed to register destination with transport; packets will not be delivered");
+    }
+    rx
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const TEST_CHANNEL_MSG_TYPE: u16 = 0x1234;
+
+    struct TestChannelNoop;
+
+    impl rns_protocol::channel_message::MessageBase for TestChannelNoop {
+        fn msg_type(&self) -> u16 {
+            TEST_CHANNEL_MSG_TYPE
+        }
+
+        fn pack(&self) -> Vec<u8> {
+            Vec::new()
+        }
+
+        fn unpack(
+            &mut self,
+            _raw: &[u8],
+        ) -> Result<(), rns_protocol::channel_message::ChannelMessageError> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn test_link_manager_creation() {
+        let (tx, _rx) = mpsc::channel(16);
+        let (_event_tx, event_rx) = mpsc::channel(16);
+        let lm = LinkManager::new(tx, event_rx, [0xAA; 16], None);
+        assert_eq!(lm.active_link_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_register_destination_channel() {
+        let (actor, tx) = rns_transport::actor::TransportActor::new();
+        tokio::spawn(actor.run());
+
+        let dest_hash = [0xAA; 16];
+        let _rx = register_destination(&tx, dest_hash, "test.app");
+
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+
+        let _ = tx.send(TransportMessage::Shutdown).await;
+    }
+
+    #[test]
+    fn test_link_manager_handles_link_closed() {
+        let (tx, mut rx) = mpsc::channel(16);
+        let (_event_tx, event_rx) = mpsc::channel(16);
+        let mut lm = LinkManager::new(tx, event_rx, [0xCC; 16], None);
+        let (closed_tx, mut closed_rx) = mpsc::channel(1);
+        lm.set_link_closed_channel(closed_tx);
+
+        let identity_key = Ed25519PrivateKey::generate();
+        let dest_hash = [0xCC; 16];
+        let (link, _proof) = rns_link::link::Link::new_initiator(dest_hash, 1);
+        let link_id = link.link_id;
+
+        lm.active_links.insert(
+            link_id,
+            ActiveLink {
+                link,
+                _interface_id: 1,
+                channel: None,
+                inbound_resources: HashMap::new(),
+                outbound_resources: HashMap::new(),
+                outbound_split_queues: HashMap::new(),
+                inbound_split_resources: HashMap::new(),
+                segment_routing: HashMap::new(),
+            },
+        );
+        assert_eq!(lm.active_link_count(), 1);
+
+        lm.handle_event(DestinationEvent::LinkClosed { link_id });
+        assert_eq!(lm.active_link_count(), 0);
+        assert_eq!(closed_rx.try_recv().unwrap(), link_id);
+        assert!(
+            matches!(
+                rx.try_recv().unwrap(),
+                TransportMessage::DeregisterDestination { hash } if hash == link_id
+            ),
+            "link manager must deregister closed link destination"
+        );
+
+        let _ = identity_key;
+    }
+
+    #[test]
+    fn remote_link_close_runs_full_cleanup() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+
+        let dest_hash = [0xD0; 16];
+        let identity_key = Ed25519PrivateKey::generate();
+        let identity_pub = identity_key.public_key();
+        let (mut initiator, request_data) = Link::new_initiator(dest_hash, 1);
+        let (mut responder, proof_data) =
+            Link::new_responder(&request_data, &identity_key, dest_hash, 1).unwrap();
+        let rtt_data = initiator
+            .validate_proof(&proof_data, &identity_pub, &identity_pub.to_bytes())
+            .unwrap();
+        responder.receive_rtt_packet(&rtt_data).unwrap();
+        let link_id = responder.link_id;
+
+        let callback_fired = Arc::new(AtomicBool::new(false));
+        let callback_fired_clone = Arc::clone(&callback_fired);
+        responder.set_link_closed_callback(move |link| {
+            assert_eq!(link.state, LinkState::Closed);
+            callback_fired_clone.store(true, Ordering::SeqCst);
+        });
+
+        let close_body = initiator.teardown(CloseReason::InitiatorClosed).unwrap();
+        let close_header = rns_wire::header::PacketHeader {
+            flags: rns_wire::flags::PacketFlags {
+                header_type: rns_wire::flags::HeaderType::Header1,
+                context_flag: false,
+                transport_type: rns_wire::flags::TransportType::Broadcast,
+                destination_type: rns_wire::flags::DestinationType::Link,
+                packet_type: rns_wire::flags::PacketType::Data,
+            },
+            hops: 0,
+            transport_id: None,
+            destination_hash: link_id,
+            context: rns_wire::context::PacketContext::LinkClose,
+        };
+        let mut close_raw = close_header.pack();
+        close_raw.extend_from_slice(&close_body);
+
+        let (transport_tx, mut transport_rx) = mpsc::channel(16);
+        let (_event_tx, event_rx) = mpsc::channel(16);
+        let mut lm = LinkManager::new(transport_tx, event_rx, dest_hash, None);
+        let (closed_tx, mut closed_rx) = mpsc::channel(1);
+        lm.set_link_closed_channel(closed_tx);
+        lm.backchannel_links.insert([0xAB; 16], link_id);
+        lm.link_identities
+            .lock()
+            .unwrap()
+            .insert(link_id, [0xAB; 16]);
+        lm.active_links.insert(
+            link_id,
+            ActiveLink {
+                link: responder,
+                _interface_id: 1,
+                channel: None,
+                inbound_resources: HashMap::new(),
+                outbound_resources: HashMap::new(),
+                outbound_split_queues: HashMap::new(),
+                inbound_split_resources: HashMap::new(),
+                segment_routing: HashMap::new(),
+            },
+        );
+
+        lm.handle_inbound_packet(&close_raw, 1);
+
+        assert_eq!(lm.active_link_count(), 0);
+        assert!(callback_fired.load(Ordering::SeqCst));
+        assert_eq!(closed_rx.try_recv().unwrap(), link_id);
+        assert!(lm.backchannel_links.is_empty());
+        assert!(lm.link_identities.lock().unwrap().get(&link_id).is_none());
+        assert!(
+            matches!(
+                transport_rx.try_recv().unwrap(),
+                TransportMessage::DeregisterDestination { hash } if hash == link_id
+            ),
+            "verified remote close must deregister link destination"
+        );
+    }
+
+    #[test]
+    fn try_step_processes_queued_destination_event_without_consuming_manager() {
+        let (tx, _rx) = mpsc::channel(16);
+        let (event_tx, event_rx) = mpsc::channel(16);
+        let mut lm = LinkManager::new(tx, event_rx, [0xCE; 16], None);
+
+        let dest_hash = [0xCE; 16];
+        let (link, _proof) = rns_link::link::Link::new_initiator(dest_hash, 1);
+        let link_id = link.link_id;
+        lm.active_links.insert(
+            link_id,
+            ActiveLink {
+                link,
+                _interface_id: 1,
+                channel: None,
+                inbound_resources: HashMap::new(),
+                outbound_resources: HashMap::new(),
+                outbound_split_queues: HashMap::new(),
+                inbound_split_resources: HashMap::new(),
+                segment_routing: HashMap::new(),
+            },
+        );
+
+        event_tx
+            .try_send(DestinationEvent::LinkClosed { link_id })
+            .unwrap();
+
+        assert!(lm.try_step());
+        assert_eq!(lm.active_link_count(), 0);
+        assert!(!lm.try_step());
+    }
+
+    #[test]
+    fn test_link_request_without_identity_rejected() {
+        let (tx, _rx) = mpsc::channel(16);
+        let (_event_tx, event_rx) = mpsc::channel(16);
+        let mut lm = LinkManager::new(tx, event_rx, [0xDD; 16], None);
+
+        let flags = rns_wire::flags::PacketFlags {
+            header_type: rns_wire::flags::HeaderType::Header1,
+            context_flag: false,
+            transport_type: rns_wire::flags::TransportType::Broadcast,
+            destination_type: rns_wire::flags::DestinationType::Single,
+            packet_type: rns_wire::flags::PacketType::LinkRequest,
+        };
+        let header = rns_wire::header::PacketHeader {
+            flags,
+            hops: 0,
+            transport_id: None,
+            destination_hash: [0xDD; 16],
+            context: rns_wire::context::PacketContext::None,
+        };
+        let mut raw = header.pack();
+        raw.extend_from_slice(&[0xAA; 67]);
+
+        lm.handle_link_request(&raw, 1);
+
+        assert_eq!(lm.active_link_count(), 0);
+    }
+
+    #[test]
+    fn test_with_destination_constructor() {
+        let (tx, _rx) = mpsc::channel(16);
+        let (_event_tx, event_rx) = mpsc::channel(16);
+
+        let identity = Identity::new();
+        let signing_key = identity.get_signing_key().unwrap();
+
+        let lm = LinkManager::with_destination(tx, event_rx, &identity, "test.app", signing_key);
+
+        assert!(lm.destination.is_some());
+        assert_eq!(lm.active_link_count(), 0);
+    }
+
+    #[test]
+    fn path_response_announce_request_sends_attached_path_response() {
+        let (tx, mut rx) = mpsc::channel(16);
+        let (_event_tx, event_rx) = mpsc::channel(16);
+
+        let identity = Identity::new();
+        let signing_key = identity.get_signing_key().unwrap();
+        let mut lm =
+            LinkManager::with_destination(tx, event_rx, &identity, "test.app", signing_key);
+
+        let tag = vec![0xA5; 16];
+        lm.handle_event(DestinationEvent::AnnounceRequested(AnnounceRequest {
+            app_name: "test.app".to_string(),
+            path_response: true,
+            tag: Some(tag.clone()),
+            attached_interface: Some(7),
+        }));
+
+        let first = rx
+            .try_recv()
+            .expect("path response announce should be queued");
+        let TransportMessage::OutboundAttached {
+            request,
+            interface_id,
+        } = first
+        else {
+            panic!("expected attached outbound path response");
+        };
+        assert_eq!(interface_id, 7);
+        let first_raw = request.raw.clone();
+        let (header, _offset) = rns_wire::header::PacketHeader::unpack(&request.raw).unwrap();
+        assert_eq!(header.destination_hash, lm.destination_hash);
+        assert_eq!(
+            header.context,
+            rns_wire::context::PacketContext::PathResponse
+        );
+        assert_eq!(
+            header.flags.header_type,
+            rns_wire::flags::HeaderType::Header1
+        );
+
+        lm.handle_event(DestinationEvent::AnnounceRequested(AnnounceRequest {
+            app_name: "test.app".to_string(),
+            path_response: true,
+            tag: Some(tag),
+            attached_interface: Some(7),
+        }));
+
+        let second = rx
+            .try_recv()
+            .expect("cached path response announce should be queued");
+        let TransportMessage::OutboundAttached {
+            request: second_request,
+            interface_id: second_interface_id,
+        } = second
+        else {
+            panic!("expected attached outbound path response");
+        };
+        assert_eq!(second_interface_id, 7);
+        assert_eq!(
+            second_request.raw, first_raw,
+            "same path-response tag should reuse cached announce bytes"
+        );
+    }
+
+    #[test]
+    fn link_established_channel_fires_when_responder_activates() {
+        let dest_hash = [0x35; 16];
+        let identity_key = Ed25519PrivateKey::generate();
+        let identity_pub = identity_key.public_key();
+        let (mut initiator, request_data) = Link::new_initiator(dest_hash, 1);
+        let (responder, proof_data) =
+            Link::new_responder(&request_data, &identity_key, dest_hash, 1).unwrap();
+        let rtt_data = initiator
+            .validate_proof(&proof_data, &identity_pub, &identity_pub.to_bytes())
+            .unwrap();
+        let link_id = responder.link_id;
+
+        let (transport_tx, _transport_rx) = mpsc::channel(16);
+        let (_event_tx, event_rx) = mpsc::channel(16);
+        let mut lm = LinkManager::new(transport_tx, event_rx, dest_hash, None);
+        let (established_tx, mut established_rx) = mpsc::channel(1);
+        lm.set_link_established_channel(established_tx);
+        lm.active_links.insert(
+            link_id,
+            ActiveLink {
+                link: responder,
+                _interface_id: 1,
+                channel: None,
+                inbound_resources: HashMap::new(),
+                outbound_resources: HashMap::new(),
+                outbound_split_queues: HashMap::new(),
+                inbound_split_resources: HashMap::new(),
+                segment_routing: HashMap::new(),
+            },
+        );
+
+        let header = rns_wire::header::PacketHeader {
+            flags: rns_wire::flags::PacketFlags {
+                header_type: rns_wire::flags::HeaderType::Header1,
+                context_flag: false,
+                transport_type: rns_wire::flags::TransportType::Broadcast,
+                destination_type: rns_wire::flags::DestinationType::Link,
+                packet_type: rns_wire::flags::PacketType::Data,
+            },
+            hops: 0,
+            transport_id: None,
+            destination_hash: link_id,
+            context: rns_wire::context::PacketContext::Lrrtt,
+        };
+        let mut raw = header.pack();
+        raw.extend_from_slice(&rtt_data);
+
+        lm.handle_inbound_packet(&raw, 1);
+
+        assert_eq!(established_rx.try_recv().unwrap(), link_id);
+        assert_eq!(lm.get_link(&link_id).unwrap().state, LinkState::Active);
+    }
+
+    #[test]
+    fn request_resource_transfer_can_start_before_responder_lrrtt_activation() {
+        let dest_hash = [0x36; 16];
+        let identity_key = Ed25519PrivateKey::generate();
+        let (_initiator, request_data) = Link::new_initiator(dest_hash, 1);
+        let (responder, _proof_data) =
+            Link::new_responder(&request_data, &identity_key, dest_hash, 1).unwrap();
+        let link_id = responder.link_id;
+        assert_eq!(responder.state, LinkState::Handshake);
+
+        let (transport_tx, mut transport_rx) = mpsc::channel(64);
+        let (_event_tx, event_rx) = mpsc::channel(16);
+        let mut lm = LinkManager::new(transport_tx, event_rx, dest_hash, None);
+
+        lm.active_links.insert(
+            link_id,
+            ActiveLink {
+                link: responder,
+                _interface_id: 1,
+                channel: None,
+                inbound_resources: HashMap::new(),
+                outbound_resources: HashMap::new(),
+                outbound_split_queues: HashMap::new(),
+                inbound_split_resources: HashMap::new(),
+                segment_routing: HashMap::new(),
+            },
+        );
+
+        assert!(
+            lm.start_resource_transfer(&link_id, b"direct".to_vec(), false)
+                .is_none(),
+            "ordinary callers still require an active link"
+        );
+
+        let resource_hash = lm
+            .start_resource_transfer_inner(
+                &link_id,
+                ResourceTransferStart {
+                    data: b"fetch-response".to_vec(),
+                    metadata: None,
+                    auto_compress: false,
+                    request_id: None,
+                    is_response: false,
+                    allow_handshake: true,
+                },
+            )
+            .expect("request-triggered resource can start during handshake");
+
+        let outbound = transport_rx.try_recv().expect("resource adv queued");
+        let TransportMessage::Outbound(request) = outbound else {
+            panic!("expected outbound resource advertisement");
+        };
+        let (header, _) = rns_wire::header::PacketHeader::unpack(&request.raw).unwrap();
+        assert_eq!(header.destination_hash, link_id);
+        assert_eq!(
+            header.context,
+            rns_wire::context::PacketContext::ResourceAdv
+        );
+
+        assert!(
+            lm.active_links
+                .get(&link_id)
+                .unwrap()
+                .outbound_resources
+                .contains_key(&resource_hash)
+        );
+    }
+
+    #[test]
+    fn test_destination_link_acceptance_gating() {
+        let (tx, _transport_rx) = mpsc::channel(64);
+        let (_event_tx, event_rx) = mpsc::channel(16);
+
+        let identity = Identity::new();
+        let signing_key = identity.get_signing_key().unwrap();
+
+        let mut lm =
+            LinkManager::with_destination(tx, event_rx, &identity, "test.gate", signing_key);
+
+        if let Some(ref mut dest) = lm.destination {
+            dest.set_accepts_links(false);
+        }
+
+        let dest_hash = lm.destination_hash;
+        let (_initiator, request_data) = Link::new_initiator(dest_hash, 1);
+        let flags = rns_wire::flags::PacketFlags {
+            header_type: rns_wire::flags::HeaderType::Header1,
+            context_flag: false,
+            transport_type: rns_wire::flags::TransportType::Broadcast,
+            destination_type: rns_wire::flags::DestinationType::Single,
+            packet_type: rns_wire::flags::PacketType::LinkRequest,
+        };
+        let header = rns_wire::header::PacketHeader {
+            flags,
+            hops: 0,
+            transport_id: None,
+            destination_hash: dest_hash,
+            context: rns_wire::context::PacketContext::None,
+        };
+        let mut raw = header.pack();
+        raw.extend_from_slice(&request_data);
+
+        lm.handle_link_request(&raw, 1);
+
+        assert_eq!(lm.active_link_count(), 0);
+    }
+
+    /// Drives a full handshake; returns both ends `Active` with matching keys.
+    fn handshaken_link_pair_with_identity() -> (Link, Link, Ed25519PrivateKey) {
+        let dest_hash = [0x77u8; 16];
+        let identity_key = Ed25519PrivateKey::generate();
+        let identity_pub = identity_key.public_key();
+
+        let (mut initiator, request_data) = Link::new_initiator(dest_hash, 1);
+        let (mut responder, proof_data) =
+            rns_link::link::Link::new_responder(&request_data, &identity_key, dest_hash, 1)
+                .expect("responder");
+        let rtt_data = initiator
+            .validate_proof(&proof_data, &identity_pub, &identity_pub.to_bytes())
+            .expect("validate proof");
+        responder
+            .receive_rtt_packet(&rtt_data)
+            .expect("receive rtt");
+        assert_eq!(initiator.state, LinkState::Active);
+        assert_eq!(responder.state, LinkState::Active);
+        (initiator, responder, identity_key)
+    }
+
+    /// Drives a full handshake; returns both ends `Active` with matching keys.
+    fn handshaken_link_pair() -> (Link, Link) {
+        let (initiator, responder, _identity_key) = handshaken_link_pair_with_identity();
+        (initiator, responder)
+    }
+
+    #[test]
+    fn channel_packet_is_proved_and_dispatched() {
+        let (sender_link, receiver_link, _identity_key) = handshaken_link_pair_with_identity();
+        let link_id = receiver_link.link_id;
+        let receiver_rtt = receiver_link.rtt_secs();
+        let receiver_keys = receiver_link.session_keys().unwrap();
+        let mut sender_channel = rns_protocol::channel::LinkChannel::new_encrypted(
+            link_id,
+            sender_link.rtt_secs(),
+            sender_link.session_keys().unwrap(),
+        );
+        let payload = sender_channel.prepare_send(&TestChannelNoop).unwrap();
+
+        let header = rns_wire::header::PacketHeader {
+            flags: rns_wire::flags::PacketFlags {
+                header_type: rns_wire::flags::HeaderType::Header1,
+                context_flag: false,
+                transport_type: rns_wire::flags::TransportType::Broadcast,
+                destination_type: rns_wire::flags::DestinationType::Link,
+                packet_type: rns_wire::flags::PacketType::Data,
+            },
+            hops: 0,
+            transport_id: None,
+            destination_hash: link_id,
+            context: rns_wire::context::PacketContext::Channel,
+        };
+        let mut raw = header.pack();
+        raw.extend_from_slice(&payload);
+        let packet_hash = rns_wire::hash::packet_hash(&raw, header.flags.header_type);
+
+        let (transport_tx, mut transport_rx) = mpsc::channel(16);
+        let (_event_tx, event_rx) = mpsc::channel(16);
+        let mut lm = LinkManager::new(transport_tx, event_rx, [0xBB; 16], None);
+        let (channel_tx, mut channel_rx) = mpsc::channel(4);
+        lm.set_channel_message_channel(channel_tx);
+        lm.active_links.insert(
+            link_id,
+            ActiveLink {
+                link: receiver_link,
+                _interface_id: 1,
+                channel: Some(rns_protocol::channel::LinkChannel::new_encrypted(
+                    link_id,
+                    receiver_rtt,
+                    receiver_keys,
+                )),
+                inbound_resources: HashMap::new(),
+                outbound_resources: HashMap::new(),
+                outbound_split_queues: HashMap::new(),
+                inbound_split_resources: HashMap::new(),
+                segment_routing: HashMap::new(),
+            },
+        );
+
+        lm.handle_inbound_packet(&raw, 1);
+
+        let delivered = channel_rx.try_recv().expect("channel message dispatched");
+        assert_eq!(delivered.link_id, link_id);
+        assert_eq!(delivered.msg_type, TEST_CHANNEL_MSG_TYPE);
+        assert!(delivered.payload.is_empty());
+
+        let outbound = transport_rx.try_recv().expect("channel proof queued");
+        let TransportMessage::Outbound(request) = outbound else {
+            panic!("expected outbound proof");
+        };
+        let (proof_header, proof_offset) =
+            rns_wire::header::PacketHeader::unpack(&request.raw).unwrap();
+        assert_eq!(proof_header.destination_hash, link_id);
+        assert_eq!(
+            proof_header.flags.packet_type,
+            rns_wire::flags::PacketType::Proof
+        );
+        assert_eq!(proof_header.context, rns_wire::context::PacketContext::None);
+        let proof_data = &request.raw[proof_offset..];
+        assert_eq!(&proof_data[..32], &packet_hash);
+        assert!(sender_link.validate_packet_proof(&packet_hash, proof_data));
+    }
+
+    #[test]
+    fn channel_packet_opens_channel_before_proof_and_dispatch() {
+        let (sender_link, receiver_link, _identity_key) = handshaken_link_pair_with_identity();
+        let link_id = receiver_link.link_id;
+        let mut sender_channel = rns_protocol::channel::LinkChannel::new_encrypted(
+            link_id,
+            sender_link.rtt_secs(),
+            sender_link.session_keys().unwrap(),
+        );
+        let payload = sender_channel.prepare_send(&TestChannelNoop).unwrap();
+
+        let header = rns_wire::header::PacketHeader {
+            flags: rns_wire::flags::PacketFlags {
+                header_type: rns_wire::flags::HeaderType::Header1,
+                context_flag: false,
+                transport_type: rns_wire::flags::TransportType::Broadcast,
+                destination_type: rns_wire::flags::DestinationType::Link,
+                packet_type: rns_wire::flags::PacketType::Data,
+            },
+            hops: 0,
+            transport_id: None,
+            destination_hash: link_id,
+            context: rns_wire::context::PacketContext::Channel,
+        };
+        let mut raw = header.pack();
+        raw.extend_from_slice(&payload);
+
+        let (transport_tx, mut transport_rx) = mpsc::channel(16);
+        let (_event_tx, event_rx) = mpsc::channel(16);
+        let mut lm = LinkManager::new(transport_tx, event_rx, [0xBD; 16], None);
+        let (channel_tx, mut channel_rx) = mpsc::channel(4);
+        lm.set_channel_message_channel(channel_tx);
+        lm.active_links.insert(
+            link_id,
+            ActiveLink {
+                link: receiver_link,
+                _interface_id: 1,
+                channel: None,
+                inbound_resources: HashMap::new(),
+                outbound_resources: HashMap::new(),
+                outbound_split_queues: HashMap::new(),
+                inbound_split_resources: HashMap::new(),
+                segment_routing: HashMap::new(),
+            },
+        );
+
+        lm.handle_inbound_packet(&raw, 1);
+
+        let delivered = channel_rx.try_recv().expect("channel message dispatched");
+        assert_eq!(delivered.link_id, link_id);
+        assert_eq!(delivered.msg_type, TEST_CHANNEL_MSG_TYPE);
+        let outbound = transport_rx.try_recv().expect("channel proof queued");
+        assert!(matches!(outbound, TransportMessage::Outbound(_)));
+        assert!(lm.active_links.get(&link_id).unwrap().channel.is_some());
+    }
+
+    #[test]
+    fn channel_packet_before_active_link_is_not_proved_or_dispatched() {
+        let dest_hash = [0x78u8; 16];
+        let identity_key = Ed25519PrivateKey::generate();
+        let identity_pub = identity_key.public_key();
+        let (mut sender_link, request_data) = Link::new_initiator(dest_hash, 1);
+        let (receiver_link, proof_data) =
+            rns_link::link::Link::new_responder(&request_data, &identity_key, dest_hash, 1)
+                .expect("responder");
+        let _rtt_data = sender_link
+            .validate_proof(&proof_data, &identity_pub, &identity_pub.to_bytes())
+            .expect("validate proof");
+        assert_eq!(sender_link.state, LinkState::Active);
+        assert_eq!(receiver_link.state, LinkState::Handshake);
+
+        let link_id = receiver_link.link_id;
+        let receiver_keys = receiver_link.session_keys().unwrap();
+        let mut sender_channel = rns_protocol::channel::LinkChannel::new_encrypted(
+            link_id,
+            sender_link.rtt_secs(),
+            sender_link.session_keys().unwrap(),
+        );
+        let payload = sender_channel.prepare_send(&TestChannelNoop).unwrap();
+
+        let header = rns_wire::header::PacketHeader {
+            flags: rns_wire::flags::PacketFlags {
+                header_type: rns_wire::flags::HeaderType::Header1,
+                context_flag: false,
+                transport_type: rns_wire::flags::TransportType::Broadcast,
+                destination_type: rns_wire::flags::DestinationType::Link,
+                packet_type: rns_wire::flags::PacketType::Data,
+            },
+            hops: 0,
+            transport_id: None,
+            destination_hash: link_id,
+            context: rns_wire::context::PacketContext::Channel,
+        };
+        let mut raw = header.pack();
+        raw.extend_from_slice(&payload);
+
+        let (transport_tx, mut transport_rx) = mpsc::channel(16);
+        let (_event_tx, event_rx) = mpsc::channel(16);
+        let mut lm = LinkManager::new(transport_tx, event_rx, [0xBE; 16], None);
+        let (channel_tx, mut channel_rx) = mpsc::channel(4);
+        lm.set_channel_message_channel(channel_tx);
+        lm.active_links.insert(
+            link_id,
+            ActiveLink {
+                link: receiver_link,
+                _interface_id: 1,
+                channel: Some(rns_protocol::channel::LinkChannel::new_encrypted(
+                    link_id,
+                    0.0,
+                    receiver_keys,
+                )),
+                inbound_resources: HashMap::new(),
+                outbound_resources: HashMap::new(),
+                outbound_split_queues: HashMap::new(),
+                inbound_split_resources: HashMap::new(),
+                segment_routing: HashMap::new(),
+            },
+        );
+
+        lm.handle_inbound_packet(&raw, 1);
+
+        assert!(channel_rx.try_recv().is_err());
+        assert!(transport_rx.try_recv().is_err());
+        assert!(
+            lm.active_links
+                .get(&link_id)
+                .unwrap()
+                .channel
+                .as_ref()
+                .unwrap()
+                .is_ready_to_send()
+        );
+    }
+
+    #[test]
+    fn link_packet_proof_marks_channel_sequence_delivered() {
+        let (sender_link, receiver_link, _identity_key) = handshaken_link_pair_with_identity();
+        let link_id = sender_link.link_id;
+
+        let (transport_tx, mut transport_rx) = mpsc::channel(16);
+        let (_event_tx, event_rx) = mpsc::channel(16);
+        let mut lm = LinkManager::new(transport_tx, event_rx, [0xBC; 16], None);
+        lm.active_links.insert(
+            link_id,
+            ActiveLink {
+                link: sender_link,
+                _interface_id: 1,
+                channel: None,
+                inbound_resources: HashMap::new(),
+                outbound_resources: HashMap::new(),
+                outbound_split_queues: HashMap::new(),
+                inbound_split_resources: HashMap::new(),
+                segment_routing: HashMap::new(),
+            },
+        );
+
+        let receipt = lm
+            .send_channel_message(&link_id, &TestChannelNoop)
+            .expect("channel message sent");
+        assert_eq!(receipt.sequence, 0);
+
+        let outbound = transport_rx.try_recv().expect("channel packet queued");
+        let TransportMessage::Outbound(request) = outbound else {
+            panic!("expected outbound channel packet");
+        };
+        let (sent_header, _) = rns_wire::header::PacketHeader::unpack(&request.raw).unwrap();
+        assert_eq!(
+            sent_header.context,
+            rns_wire::context::PacketContext::Channel
+        );
+        assert_eq!(
+            receipt.packet_hash,
+            rns_wire::hash::packet_hash(&request.raw, sent_header.flags.header_type)
+        );
+        assert_eq!(lm.get_channel(&link_id).unwrap().outstanding_count(), 1);
+
+        let proof_data = receiver_link
+            .prove_packet_with_link_key(&receipt.packet_hash)
+            .unwrap();
+        let proof_header = rns_wire::header::PacketHeader {
+            flags: rns_wire::flags::PacketFlags {
+                header_type: rns_wire::flags::HeaderType::Header1,
+                context_flag: false,
+                transport_type: rns_wire::flags::TransportType::Broadcast,
+                destination_type: rns_wire::flags::DestinationType::Link,
+                packet_type: rns_wire::flags::PacketType::Proof,
+            },
+            hops: 0,
+            transport_id: None,
+            destination_hash: link_id,
+            context: rns_wire::context::PacketContext::None,
+        };
+        let mut proof_raw = proof_header.pack();
+        proof_raw.extend_from_slice(&proof_data);
+
+        lm.handle_inbound_packet(&proof_raw, 1);
+
+        assert_eq!(lm.get_channel(&link_id).unwrap().outstanding_count(), 0);
+        assert!(lm.get_channel(&link_id).unwrap().is_ready_to_send());
+    }
+
+    #[test]
+    fn unmatched_valid_link_packet_proof_does_not_record_keepalive_proof() {
+        let (sender_link, receiver_link, _identity_key) = handshaken_link_pair_with_identity();
+        let link_id = sender_link.link_id;
+
+        let (transport_tx, _transport_rx) = mpsc::channel(16);
+        let (_event_tx, event_rx) = mpsc::channel(16);
+        let mut lm = LinkManager::new(transport_tx, event_rx, [0xBF; 16], None);
+        lm.active_links.insert(
+            link_id,
+            ActiveLink {
+                link: sender_link,
+                _interface_id: 1,
+                channel: None,
+                inbound_resources: HashMap::new(),
+                outbound_resources: HashMap::new(),
+                outbound_split_queues: HashMap::new(),
+                inbound_split_resources: HashMap::new(),
+                segment_routing: HashMap::new(),
+            },
+        );
+
+        let packet_hash = [0x5Au8; 32];
+        let proof_data = receiver_link
+            .prove_packet_with_link_key(&packet_hash)
+            .expect("valid link-key proof");
+        let proof_header = rns_wire::header::PacketHeader {
+            flags: rns_wire::flags::PacketFlags {
+                header_type: rns_wire::flags::HeaderType::Header1,
+                context_flag: false,
+                transport_type: rns_wire::flags::TransportType::Broadcast,
+                destination_type: rns_wire::flags::DestinationType::Link,
+                packet_type: rns_wire::flags::PacketType::Proof,
+            },
+            hops: 0,
+            transport_id: None,
+            destination_hash: link_id,
+            context: rns_wire::context::PacketContext::None,
+        };
+        let mut proof_raw = proof_header.pack();
+        proof_raw.extend_from_slice(&proof_data);
+
+        assert!(
+            lm.active_links
+                .get(&link_id)
+                .unwrap()
+                .link
+                .keepalive
+                .last_proof
+                .is_none()
+        );
+        lm.handle_inbound_packet(&proof_raw, 1);
+        assert!(
+            lm.active_links
+                .get(&link_id)
+                .unwrap()
+                .link
+                .keepalive
+                .last_proof
+                .is_none()
+        );
+    }
+
+    /// Receive-side split-resource reassembly: two manually-marked segments
+    /// produce one `ResourceCompletion` keyed by `original_hash`. Synthesizing
+    /// segments avoids the >2000 parts that `MultiSegmentOutbound` would emit;
+    /// rncp_interop covers realistic sizes via the full HMU loop.
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_split_resource_inbound_reassembles_via_coordinator() {
+        use rns_protocol::resource::{OutboundResource, OutboundTransfer, TransferAction};
+
+        let (sender_link, receiver_link) = handshaken_link_pair();
+        let link_id = receiver_link.link_id;
+
+        let (transport_tx, mut transport_rx) = mpsc::channel(4096);
+        let (_event_tx, event_rx) = mpsc::channel(16);
+        let mut lm = LinkManager::new(transport_tx, event_rx, [0xBB; 16], None);
+
+        let (completion_tx, mut completion_rx) = mpsc::channel(8);
+        lm.set_resource_completion_channel(completion_tx);
+        let (legacy_tx, mut legacy_rx) = mpsc::channel(8);
+        lm.set_resource_completed_channel(legacy_tx);
+
+        lm.active_links.insert(
+            link_id,
+            ActiveLink {
+                link: receiver_link,
+                _interface_id: 1,
+                channel: None,
+                inbound_resources: HashMap::new(),
+                outbound_resources: HashMap::new(),
+                outbound_split_queues: HashMap::new(),
+                inbound_split_resources: HashMap::new(),
+                segment_routing: HashMap::new(),
+            },
+        );
+
+        // Two 8 KiB chunks; ~20 parts each fit in the ADV's initial hashmap
+        // (~70 entries) so no HMU round-trip is needed.
+        let chunk_size = 8 * 1024;
+        let chunk_a: Vec<u8> = (0..chunk_size).map(|i| (i % 251) as u8).collect();
+        let chunk_b: Vec<u8> = (0..chunk_size).map(|i| ((i + 7) % 251) as u8).collect();
+        let payload: Vec<u8> = chunk_a.iter().chain(chunk_b.iter()).copied().collect();
+
+        // `original_hash` is just the coordinator HashMap key; per-segment
+        // hashes enforce integrity.
+        let original_hash: [u8; 32] = [0x5A; 32];
+
+        let chunks = [chunk_a, chunk_b];
+        let total_segments = chunks.len();
+
+        let encrypt_fn = |d: &[u8]| sender_link.encrypt(d).expect("link encrypt");
+        let rtt = std::time::Duration::from_millis(50);
+
+        for (i, chunk) in chunks.into_iter().enumerate() {
+            let mut segment =
+                OutboundResource::with_options(chunk, false, None, None, Some(&encrypt_fn))
+                    .expect("build segment");
+            // Stamp split metadata so the ADV carries total_segments / segment_index / original_hash.
+            segment.flags.split = true;
+            segment.segment_index = i + 1;
+            segment.total_segments = total_segments;
+            segment.original_hash = Some(original_hash);
+
+            let mut transfer = OutboundTransfer::from_prebuilt(segment, rtt);
+            let action = transfer.tick();
+            let adv_bytes = match action {
+                TransferAction::SendAdvertisement(b) => b,
+                other => panic!("expected SendAdvertisement, got {other:?}"),
+            };
+
+            let encrypted_adv = sender_link.encrypt(&adv_bytes).expect("encrypt adv");
+            let adv_header = rns_wire::header::PacketHeader {
+                flags: rns_wire::flags::PacketFlags {
+                    header_type: rns_wire::flags::HeaderType::Header1,
+                    context_flag: false,
+                    transport_type: rns_wire::flags::TransportType::Broadcast,
+                    destination_type: rns_wire::flags::DestinationType::Link,
+                    packet_type: rns_wire::flags::PacketType::Data,
+                },
+                hops: 0,
+                transport_id: None,
+                destination_hash: link_id,
+                context: rns_wire::context::PacketContext::ResourceAdv,
+            };
+            let mut adv_raw = adv_header.pack();
+            adv_raw.extend_from_slice(&encrypted_adv);
+            lm.handle_inbound_packet(&adv_raw, 1);
+
+            // Widen the receiver's WINDOW_INITIAL=4 so the blast fits in one shot.
+            let segment_rh = transfer.resource.resource_hash;
+            let total_parts = transfer.resource.parts.len();
+            if let Some(active) = lm.active_links.get_mut(&link_id)
+                && let Some(in_transfer) = active.inbound_resources.get_mut(&segment_rh)
+            {
+                in_transfer.resource.window.window = total_parts;
+                in_transfer.outstanding_parts = total_parts;
+            }
+
+            for part in &transfer.resource.parts {
+                let part_header = rns_wire::header::PacketHeader {
+                    flags: rns_wire::flags::PacketFlags {
+                        header_type: rns_wire::flags::HeaderType::Header1,
+                        context_flag: false,
+                        transport_type: rns_wire::flags::TransportType::Broadcast,
+                        destination_type: rns_wire::flags::DestinationType::Link,
+                        packet_type: rns_wire::flags::PacketType::Data,
+                    },
+                    hops: 0,
+                    transport_id: None,
+                    destination_hash: link_id,
+                    context: rns_wire::context::PacketContext::Resource,
+                };
+                let mut part_raw = part_header.pack();
+                part_raw.extend_from_slice(part);
+                lm.handle_inbound_packet(&part_raw, 1);
+            }
+        }
+
+        // Drain the queued ResourceReq / ResourcePrf so the channel isn't pinned.
+        while transport_rx.try_recv().is_ok() {}
+
+        let completion = completion_rx
+            .try_recv()
+            .expect("expected exactly one ResourceCompletion");
+        assert_eq!(
+            completion.resource_hash, original_hash,
+            "completion must surface original_hash, not a per-segment hash"
+        );
+        assert_eq!(completion.link_id, link_id);
+        assert_eq!(completion.data, payload, "reassembled bytes match input");
+        assert!(
+            completion_rx.try_recv().is_err(),
+            "no per-segment completion events should fire for a split resource"
+        );
+
+        let (legacy_data, legacy_link) = legacy_rx
+            .try_recv()
+            .expect("legacy channel must also fire once");
+        assert_eq!(legacy_link, link_id);
+        assert_eq!(
+            legacy_data, payload,
+            "legacy callback receives reassembled blob, not per-segment chunks"
+        );
+        assert!(
+            legacy_rx.try_recv().is_err(),
+            "legacy channel must also collapse to one event per original"
+        );
+
+        // Coordinator + routing entries cleaned up after success.
+        let active = lm.active_links.get(&link_id).unwrap();
+        assert!(
+            active.inbound_split_resources.is_empty(),
+            "coordinator must be removed after reassembly completes"
+        );
+        assert!(
+            active.segment_routing.is_empty(),
+            "routing entries must be removed after each segment completes"
+        );
+        assert!(
+            active.inbound_resources.is_empty(),
+            "per-segment transfers must be removed after each segment completes"
+        );
+    }
+
+    /// MAX_SEGMENTS cap: oversized `total_segments` is rejected without
+    /// allocating a coordinator (would OOM `Vec` otherwise).
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_split_resource_rejects_oversized_total_segments() {
+        use rns_protocol::resource::{MAX_SEGMENTS, ResourceFlags};
+        use rns_protocol::resource_adv::ResourceAdvertisement;
+
+        let (sender_link, receiver_link) = handshaken_link_pair();
+        let link_id = receiver_link.link_id;
+
+        let (transport_tx, mut _transport_rx) = mpsc::channel(64);
+        let (_event_tx, event_rx) = mpsc::channel(16);
+        let mut lm = LinkManager::new(transport_tx, event_rx, [0xCC; 16], None);
+        lm.active_links.insert(
+            link_id,
+            ActiveLink {
+                link: receiver_link,
+                _interface_id: 1,
+                channel: None,
+                inbound_resources: HashMap::new(),
+                outbound_resources: HashMap::new(),
+                outbound_split_queues: HashMap::new(),
+                inbound_split_resources: HashMap::new(),
+                segment_routing: HashMap::new(),
+            },
+        );
+
+        let evil_total = MAX_SEGMENTS + 1;
+        let mut adv = ResourceAdvertisement::with_metadata_size(
+            64,
+            32,
+            1,
+            [0x42; 32],
+            vec![0x11; 4],
+            ResourceFlags {
+                split: true,
+                ..Default::default()
+            },
+            &[],
+            rns_wire::constants::ENCRYPTED_MDU,
+            0,
+        );
+        adv.original_hash = [0x99; 32];
+        adv.segment_index = 1;
+        adv.total_segments = evil_total;
+
+        let adv_bytes = adv.pack();
+        let encrypted = sender_link.encrypt(&adv_bytes).expect("encrypt");
+        let header = rns_wire::header::PacketHeader {
+            flags: rns_wire::flags::PacketFlags {
+                header_type: rns_wire::flags::HeaderType::Header1,
+                context_flag: false,
+                transport_type: rns_wire::flags::TransportType::Broadcast,
+                destination_type: rns_wire::flags::DestinationType::Link,
+                packet_type: rns_wire::flags::PacketType::Data,
+            },
+            hops: 0,
+            transport_id: None,
+            destination_hash: link_id,
+            context: rns_wire::context::PacketContext::ResourceAdv,
+        };
+        let mut raw = header.pack();
+        raw.extend_from_slice(&encrypted);
+        lm.handle_inbound_packet(&raw, 1);
+
+        let active = lm.active_links.get(&link_id).expect("link still present");
+        assert!(
+            active.inbound_split_resources.is_empty(),
+            "no coordinator must be allocated for an over-cap total_segments"
+        );
+        assert!(
+            active.segment_routing.is_empty(),
+            "no routing must be inserted for a rejected ADV"
+        );
+        assert!(
+            active.inbound_resources.is_empty(),
+            "no per-segment transfer must be opened for a rejected ADV"
+        );
+    }
+
+    #[test]
+    fn test_real_link_request_handshake() {
+        let (tx, mut transport_rx) = mpsc::channel(64);
+        let (_event_tx, event_rx) = mpsc::channel(16);
+
+        let identity_key = Ed25519PrivateKey::generate();
+        let dest_hash = [0xEE; 16];
+        let mut lm = LinkManager::new(tx, event_rx, dest_hash, Some(identity_key));
+
+        let (initiator_link, request_data) = Link::new_initiator(dest_hash, 1);
+
+        let flags = rns_wire::flags::PacketFlags {
+            header_type: rns_wire::flags::HeaderType::Header1,
+            context_flag: false,
+            transport_type: rns_wire::flags::TransportType::Broadcast,
+            destination_type: rns_wire::flags::DestinationType::Single,
+            packet_type: rns_wire::flags::PacketType::LinkRequest,
+        };
+        let header = rns_wire::header::PacketHeader {
+            flags,
+            hops: 0,
+            transport_id: None,
+            destination_hash: dest_hash,
+            context: rns_wire::context::PacketContext::None,
+        };
+        let mut raw = header.pack();
+        raw.extend_from_slice(&request_data);
+
+        lm.handle_link_request(&raw, 1);
+
+        assert_eq!(lm.active_link_count(), 1);
+        let link_id = initiator_link.link_id;
+        let active = lm.get_link(&link_id).unwrap();
+        assert_eq!(active.state, LinkState::Handshake);
+
+        let outbound = transport_rx.try_recv();
+        assert!(
+            outbound.is_ok(),
+            "proof packet should be queued for sending"
+        );
+    }
+}

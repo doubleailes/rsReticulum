@@ -1,0 +1,32 @@
+[package]
+name = "rns-runtime"
+description = "Core runtime, config parsing, and lifecycle for Reticulum"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+default = []
+serial = ["rns-interface/serial"]
+ble = ["rns-interface/ble"]
+
+[dependencies]
+rns-crypto = { workspace = true, features = ["std"] }
+rns-wire = { workspace = true, features = ["std"] }
+rns-identity = { workspace = true }
+rns-transport = { workspace = true }
+rns-link = { workspace = true }
+rns-protocol = { workspace = true }
+rns-interface = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+bytes = { workspace = true }
+tracing = { workspace = true }
+hmac = { workspace = true }
+sha2 = { workspace = true }
+rmp-serde = { workspace = true }
+rmpv = { workspace = true, features = ["with-serde"] }
+serde = { workspace = true }
+subtle = { workspace = true }
+hex = { workspace = true }
+nix = { workspace = true }

@@ -1,0 +1,917 @@
+//! Local control port for CLI tools (rnstatus, rnpath). Default 37429.
+//! Wire-compatible with Python `multiprocessing.connection`.
+
+use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::net::TcpListener;
+use tokio::sync::mpsc;
+
+use rns_transport::messages::TransportMessage;
+
+use crate::lifecycle::ShutdownSignal;
+use crate::rpc::{self, RpcError, RpcRequest, RpcResponse};
+
+const MAX_REQUEST_SIZE: usize = 1_048_576;
+
+pub async fn run_rpc_server(
+    port: u16,
+    rpc_key: Vec<u8>,
+    _transport_tx: mpsc::Sender<TransportMessage>,
+    shutdown: ShutdownSignal,
+) -> Result<(), RpcError> {
+    let listener = TcpListener::bind(format!("127.0.0.1:{}", port))
+        .await
+        .map_err(RpcError::Io)?;
+    run_rpc_server_with_listener(listener, rpc_key, _transport_tx, shutdown).await
+}
+
+#[cfg(unix)]
+pub async fn run_unix_rpc_server(
+    socket_path: &str,
+    rpc_key: Vec<u8>,
+    transport_tx: mpsc::Sender<TransportMessage>,
+    shutdown: ShutdownSignal,
+) -> Result<(), RpcError> {
+    let listener = bind_unix_rpc_listener(socket_path).map_err(RpcError::Io)?;
+    run_unix_rpc_server_with_listener(
+        listener,
+        display_socket_path(socket_path),
+        rpc_key,
+        transport_tx,
+        shutdown,
+    )
+    .await
+}
+
+#[cfg(not(unix))]
+pub async fn run_unix_rpc_server(
+    _socket_path: &str,
+    _rpc_key: Vec<u8>,
+    _transport_tx: mpsc::Sender<TransportMessage>,
+    _shutdown: ShutdownSignal,
+) -> Result<(), RpcError> {
+    Err(RpcError::Io(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "Unix shared-instance RPC is not supported on this platform",
+    )))
+}
+
+async fn run_rpc_server_with_listener(
+    listener: TcpListener,
+    rpc_key: Vec<u8>,
+    _transport_tx: mpsc::Sender<TransportMessage>,
+    shutdown: ShutdownSignal,
+) -> Result<(), RpcError> {
+    let port = listener.local_addr().map_err(RpcError::Io)?.port();
+    tracing::info!("RPC server listening on 127.0.0.1:{}", port);
+
+    loop {
+        tokio::select! {
+            accept_result = listener.accept() => {
+                match accept_result {
+                    Ok((stream, addr)) => {
+                        tracing::debug!("RPC connection from {}", addr);
+                        let key = rpc_key.clone();
+                        let tx = _transport_tx.clone();
+                        tokio::spawn(async move {
+                            if let Err(e) = handle_rpc_client(stream, &key, tx).await {
+                                tracing::debug!("RPC client error: {}", e);
+                            }
+                        });
+                    }
+                    Err(e) => {
+                        tracing::warn!("RPC accept error: {}", e);
+                    }
+                }
+            }
+            _ = shutdown.wait() => {
+                tracing::info!("RPC server shutting down");
+                break;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+#[cfg(unix)]
+async fn run_unix_rpc_server_with_listener(
+    listener: tokio::net::UnixListener,
+    display_path: String,
+    rpc_key: Vec<u8>,
+    transport_tx: mpsc::Sender<TransportMessage>,
+    shutdown: ShutdownSignal,
+) -> Result<(), RpcError> {
+    tracing::info!("RPC server listening on {}", display_path);
+
+    loop {
+        tokio::select! {
+            accept_result = listener.accept() => {
+                match accept_result {
+                    Ok((stream, _addr)) => {
+                        tracing::debug!("Unix RPC connection accepted");
+                        let key = rpc_key.clone();
+                        let tx = transport_tx.clone();
+                        tokio::spawn(async move {
+                            if let Err(e) = handle_rpc_client(stream, &key, tx).await {
+                                tracing::debug!("Unix RPC client error: {}", e);
+                            }
+                        });
+                    }
+                    Err(e) => {
+                        tracing::warn!("Unix RPC accept error: {}", e);
+                    }
+                }
+            }
+            _ = shutdown.wait() => {
+                tracing::info!("Unix RPC server shutting down");
+                break;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+#[cfg(unix)]
+fn bind_unix_rpc_listener(socket_path: &str) -> std::io::Result<tokio::net::UnixListener> {
+    if let Some(abstract_name) = socket_path.strip_prefix('\0') {
+        return bind_abstract_unix_listener(abstract_name);
+    }
+
+    let _ = std::fs::remove_file(socket_path);
+    tokio::net::UnixListener::bind(socket_path)
+}
+
+#[cfg(all(unix, any(target_os = "linux", target_os = "android")))]
+fn bind_abstract_unix_listener(name: &str) -> std::io::Result<tokio::net::UnixListener> {
+    use std::os::unix::net::{SocketAddr, UnixListener};
+
+    #[cfg(target_os = "android")]
+    use std::os::android::net::SocketAddrExt as _;
+    #[cfg(target_os = "linux")]
+    use std::os::linux::net::SocketAddrExt as _;
+
+    let addr = SocketAddr::from_abstract_name(name.as_bytes())?;
+    let listener = UnixListener::bind_addr(&addr)?;
+    listener.set_nonblocking(true)?;
+    tokio::net::UnixListener::from_std(listener)
+}
+
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
+fn bind_abstract_unix_listener(_name: &str) -> std::io::Result<tokio::net::UnixListener> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "abstract Unix sockets are only available on Linux/Android",
+    ))
+}
+
+fn display_socket_path(path: &str) -> String {
+    if let Some(rest) = path.strip_prefix('\0') {
+        format!("\\0{rest}")
+    } else {
+        path.to_string()
+    }
+}
+
+async fn handle_rpc_client(
+    mut stream: impl AsyncRead + AsyncWrite + Unpin,
+    rpc_key: &[u8],
+    transport_tx: mpsc::Sender<TransportMessage>,
+) -> Result<(), RpcError> {
+    let challenge = rpc::new_python_challenge();
+    let mut challenge_frame = Vec::with_capacity(rpc::MP_CHALLENGE.len() + challenge.len());
+    challenge_frame.extend_from_slice(rpc::MP_CHALLENGE);
+    challenge_frame.extend_from_slice(&challenge);
+    rpc::write_mp_frame(&mut stream, &challenge_frame).await?;
+
+    let response = rpc::read_mp_frame(&mut stream, 256).await?;
+
+    if !rpc::verify_python_auth_response(rpc_key, &challenge, &response) {
+        let _ = rpc::write_mp_frame(&mut stream, rpc::MP_FAILURE).await;
+        return Err(RpcError::AuthFailed);
+    }
+
+    rpc::write_mp_frame(&mut stream, rpc::MP_WELCOME).await?;
+
+    let client_challenge_frame = rpc::read_mp_frame(&mut stream, 256).await?;
+    if !client_challenge_frame.starts_with(rpc::MP_CHALLENGE) {
+        return Err(RpcError::AuthFailed);
+    }
+    let client_challenge = &client_challenge_frame[rpc::MP_CHALLENGE.len()..];
+    let client_response = rpc::compute_python_auth_response(rpc_key, client_challenge);
+    rpc::write_mp_frame(&mut stream, &client_response).await?;
+    let client_welcome = rpc::read_mp_frame(&mut stream, 256).await?;
+    if client_welcome != rpc::MP_WELCOME {
+        return Err(RpcError::AuthFailed);
+    }
+
+    let req_buf = rpc::read_mp_frame(&mut stream, MAX_REQUEST_SIZE).await?;
+    let request = rpc::decode_request(&req_buf)?;
+
+    let response = process_rpc_request(request, &transport_tx).await;
+    let resp_data = rpc::encode_response(&response)?;
+
+    rpc::write_mp_frame(&mut stream, &resp_data).await?;
+
+    Ok(())
+}
+
+/// 5 s cap so a wedged actor can't hold a client open indefinitely.
+async fn query_transport(
+    transport_tx: &mpsc::Sender<TransportMessage>,
+    query: rns_transport::messages::TransportQuery,
+) -> Option<rns_transport::messages::TransportQueryResponse> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    if transport_tx
+        .send(TransportMessage::Rpc {
+            query,
+            response_tx: tx,
+        })
+        .await
+        .is_err()
+    {
+        return None;
+    }
+    tokio::time::timeout(std::time::Duration::from_secs(5), rx)
+        .await
+        .ok()
+        .and_then(|r| r.ok())
+}
+
+async fn process_rpc_request(
+    request: RpcRequest,
+    transport_tx: &mpsc::Sender<TransportMessage>,
+) -> RpcResponse {
+    use rns_transport::messages::{TransportQuery, TransportQueryResponse};
+
+    match request {
+        RpcRequest::GetPathTable { max_hops } => {
+            match query_transport(transport_tx, TransportQuery::GetPathTable).await {
+                Some(TransportQueryResponse::PathTable(entries)) => {
+                    let rpc_entries = entries
+                        .into_iter()
+                        .filter(|e| max_hops.is_none_or(|max| e.hops <= max))
+                        .map(|e| rpc::PathTableEntry {
+                            hash: e.hash.to_vec(),
+                            timestamp: e.timestamp,
+                            via: e.via.map(|v| v.to_vec()),
+                            hops: e.hops,
+                            expires: e.expires,
+                            interface: e.interface,
+                        })
+                        .collect();
+                    RpcResponse::PathTable(rpc_entries)
+                }
+                _ => RpcResponse::PathTable(Vec::new()),
+            }
+        }
+        RpcRequest::GetInterfaceStats => {
+            match query_transport(transport_tx, TransportQuery::GetInterfaceStats).await {
+                Some(TransportQueryResponse::InterfaceStats(entries)) => {
+                    let rpc_entries = entries
+                        .into_iter()
+                        .map(|e| rpc::InterfaceStatEntry {
+                            id: e.id,
+                            name: e.name,
+                            rx_bytes: e.rx_bytes,
+                            tx_bytes: e.tx_bytes,
+                            rx_rate: e.rx_rate,
+                            tx_rate: e.tx_rate,
+                            online: e.online,
+                            bitrate: e.bitrate,
+                            mtu: e.mtu,
+                            mode: e.mode,
+                            role: e.role,
+                            announce_queue: e.announce_queue,
+                            held_announces: e.held_announces,
+                            incoming_announce_frequency: e.incoming_announce_frequency,
+                            outgoing_announce_frequency: e.outgoing_announce_frequency,
+                            clients: e.clients,
+                            announce_rate_target: e.announce_rate_target,
+                            announce_rate_grace: e.announce_rate_grace,
+                            announce_rate_penalty: e.announce_rate_penalty,
+                            announce_cap: e.announce_cap,
+                            ifac_size: e.ifac_size,
+                            tx_drops: e.tx_drops,
+                        })
+                        .collect();
+                    RpcResponse::InterfaceStats(rpc_entries)
+                }
+                _ => RpcResponse::InterfaceStats(Vec::new()),
+            }
+        }
+        RpcRequest::GetRateTable => {
+            match query_transport(transport_tx, TransportQuery::GetRateTable).await {
+                Some(TransportQueryResponse::RateTable(entries)) => {
+                    let rpc_entries = entries
+                        .into_iter()
+                        .map(|e| rpc::RateTableEntry {
+                            hash: e.hash.to_vec(),
+                            rate: e.rate,
+                            last: e.last,
+                            rate_violations: e.rate_violations,
+                            blocked_until: e.blocked_until,
+                            timestamps: e.timestamps,
+                        })
+                        .collect();
+                    RpcResponse::RateTable(rpc_entries)
+                }
+                _ => RpcResponse::RateTable(Vec::new()),
+            }
+        }
+        RpcRequest::GetLinkCount => {
+            match query_transport(transport_tx, TransportQuery::GetLinkCount).await {
+                Some(TransportQueryResponse::IntResult(n)) => RpcResponse::IntResult(n),
+                _ => RpcResponse::IntResult(0),
+            }
+        }
+        RpcRequest::GetNextHopIfName { destination_hash } => {
+            let dest = hash_to_array(&destination_hash);
+            match dest {
+                Some(d) => {
+                    match query_transport(
+                        transport_tx,
+                        TransportQuery::GetNextHopIfName { dest: d },
+                    )
+                    .await
+                    {
+                        Some(TransportQueryResponse::StringResult(s)) => {
+                            RpcResponse::StringResult(s)
+                        }
+                        _ => RpcResponse::StringResult(None),
+                    }
+                }
+                None => RpcResponse::StringResult(None),
+            }
+        }
+        RpcRequest::GetNextHop { destination_hash } => {
+            let dest = hash_to_array(&destination_hash);
+            match dest {
+                Some(d) => {
+                    match query_transport(transport_tx, TransportQuery::GetNextHop { dest: d })
+                        .await
+                    {
+                        Some(TransportQueryResponse::HashResult(h)) => {
+                            RpcResponse::HashResult(h.map(|a| a.to_vec()))
+                        }
+                        _ => RpcResponse::HashResult(None),
+                    }
+                }
+                None => RpcResponse::HashResult(None),
+            }
+        }
+        RpcRequest::DropPath { destination_hash } => {
+            let dest = hash_to_array(&destination_hash);
+            if let Some(d) = dest {
+                let _ = query_transport(transport_tx, TransportQuery::DropPath { dest: d }).await;
+            }
+            RpcResponse::Ok
+        }
+        RpcRequest::DropAnnounceQueues => {
+            let _ = query_transport(transport_tx, TransportQuery::DropAnnounceQueues).await;
+            RpcResponse::Ok
+        }
+        RpcRequest::GetBlackholedIdentities => {
+            match query_transport(transport_tx, TransportQuery::GetBlackholedIdentities).await {
+                Some(TransportQueryResponse::BlackholeList(entries)) => {
+                    let rpc_entries = entries
+                        .into_iter()
+                        .map(|e| rpc::BlackholeEntry {
+                            identity_hash: e.identity_hash.to_vec(),
+                            source: e.source.map(|source| source.to_vec()),
+                            // Wire compat: `until` is absolute expiry (created + ttl);
+                            // permanent entries report `None`.
+                            until: e.ttl.map(|t| e.created + t),
+                            reason: Some(
+                                e.reason_label
+                                    .unwrap_or_else(|| e.reason.as_str().to_string()),
+                            ),
+                        })
+                        .collect();
+                    RpcResponse::BlackholeList(rpc_entries)
+                }
+                _ => RpcResponse::BlackholeList(Vec::new()),
+            }
+        }
+        RpcRequest::BlackholeIdentity {
+            identity_hash,
+            until,
+            reason,
+        } => {
+            if let Some(h) = hash_to_array(&identity_hash) {
+                // `until` (absolute unix ts) → relative TTL; past timestamps
+                // clamp to ~0 so the entry expires on the next maintenance tick.
+                let ttl = until.map(|u| {
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs_f64();
+                    (u - now).max(0.001)
+                });
+                let reason_enum = reason
+                    .as_deref()
+                    .map(rns_transport::blackhole::BlackholeReason::parse)
+                    .unwrap_or_default();
+                let _ = query_transport(
+                    transport_tx,
+                    TransportQuery::BlackholeIdentity {
+                        hash: h,
+                        ttl,
+                        reason: reason_enum,
+                        reason_label: reason,
+                    },
+                )
+                .await;
+            }
+            RpcResponse::Ok
+        }
+        RpcRequest::UnblackholeIdentity { identity_hash } => {
+            if let Some(h) = hash_to_array(&identity_hash) {
+                let _ = query_transport(
+                    transport_tx,
+                    TransportQuery::UnblackholeIdentity { hash: h },
+                )
+                .await;
+            }
+            RpcResponse::Ok
+        }
+        RpcRequest::GetFirstHopTimeout { destination_hash } => {
+            let dest = hash_to_array(&destination_hash);
+            match dest {
+                Some(d) => {
+                    match query_transport(transport_tx, TransportQuery::FirstHopTimeout { dest: d })
+                        .await
+                    {
+                        Some(TransportQueryResponse::FloatResult(v)) => RpcResponse::FloatResult(v),
+                        _ => RpcResponse::FloatResult(None),
+                    }
+                }
+                None => RpcResponse::FloatResult(None),
+            }
+        }
+        RpcRequest::GetPacketRssi { packet_hash } => {
+            if let Some(hash) = packet_hash_to_array(&packet_hash)
+                && let Some(TransportQueryResponse::FloatResult(v)) = query_transport(
+                    transport_tx,
+                    TransportQuery::GetPacketRssi { packet_hash: hash },
+                )
+                .await
+            {
+                RpcResponse::FloatResult(v)
+            } else {
+                RpcResponse::FloatResult(None)
+            }
+        }
+        RpcRequest::GetPacketSnr { packet_hash } => {
+            if let Some(hash) = packet_hash_to_array(&packet_hash)
+                && let Some(TransportQueryResponse::FloatResult(v)) = query_transport(
+                    transport_tx,
+                    TransportQuery::GetPacketSnr { packet_hash: hash },
+                )
+                .await
+            {
+                RpcResponse::FloatResult(v)
+            } else {
+                RpcResponse::FloatResult(None)
+            }
+        }
+        RpcRequest::GetPacketQ { packet_hash } => {
+            if let Some(hash) = packet_hash_to_array(&packet_hash)
+                && let Some(TransportQueryResponse::FloatResult(v)) = query_transport(
+                    transport_tx,
+                    TransportQuery::GetPacketQ { packet_hash: hash },
+                )
+                .await
+            {
+                RpcResponse::FloatResult(v)
+            } else {
+                RpcResponse::FloatResult(None)
+            }
+        }
+        RpcRequest::DropAllVia { transport_hash } => {
+            if let Some(next_hop) = hash_to_array(&transport_hash)
+                && let Some(TransportQueryResponse::IntResult(n)) =
+                    query_transport(transport_tx, TransportQuery::DropAllVia { next_hop }).await
+            {
+                return RpcResponse::IntResult(n);
+            }
+            RpcResponse::IntResult(0)
+        }
+        RpcRequest::UseDestination { destination_hash } => {
+            if let Some(dest) = hash_to_array(&destination_hash)
+                && let Some(TransportQueryResponse::BoolResult(v)) =
+                    query_transport(transport_tx, TransportQuery::UseDestination { dest }).await
+            {
+                return RpcResponse::BoolResult(v);
+            }
+            RpcResponse::BoolResult(false)
+        }
+        RpcRequest::RetainDestination { destination_hash } => {
+            if let Some(dest) = hash_to_array(&destination_hash)
+                && let Some(TransportQueryResponse::BoolResult(v)) =
+                    query_transport(transport_tx, TransportQuery::RetainDestination { dest }).await
+            {
+                return RpcResponse::BoolResult(v);
+            }
+            RpcResponse::BoolResult(false)
+        }
+        RpcRequest::UnretainDestination { destination_hash } => {
+            if let Some(dest) = hash_to_array(&destination_hash)
+                && let Some(TransportQueryResponse::BoolResult(v)) =
+                    query_transport(transport_tx, TransportQuery::UnretainDestination { dest })
+                        .await
+            {
+                return RpcResponse::BoolResult(v);
+            }
+            RpcResponse::BoolResult(false)
+        }
+    }
+}
+
+fn hash_to_array(hash: &[u8]) -> Option<[u8; 16]> {
+    if hash.len() >= 16 {
+        let mut arr = [0u8; 16];
+        arr.copy_from_slice(&hash[..16]);
+        Some(arr)
+    } else {
+        None
+    }
+}
+
+fn packet_hash_to_array(hash: &[u8]) -> Option<[u8; 32]> {
+    if hash.len() >= 32 {
+        let mut arr = [0u8; 32];
+        arr.copy_from_slice(&hash[..32]);
+        Some(arr)
+    } else {
+        None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_rpc_server_bind_and_shutdown() {
+        let shutdown = ShutdownSignal::new();
+        let (tx, _rx) = mpsc::channel(16);
+        let rpc_key = vec![0x42u8; 32];
+
+        let shutdown_clone = shutdown.clone();
+        let handle = tokio::spawn(async move {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            run_rpc_server_with_listener(listener, rpc_key, tx, shutdown_clone).await
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        shutdown.trigger();
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(2), handle).await;
+        assert!(result.is_ok(), "server should shut down promptly");
+        assert!(result.unwrap().unwrap().is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_rpc_server_auth_and_query() {
+        let shutdown = ShutdownSignal::new();
+        let (actor, tx) = rns_transport::actor::TransportActor::new();
+        tokio::spawn(actor.run());
+        let rpc_key = b"test_rpc_key_for_auth".to_vec();
+
+        let port = spawn_test_rpc_server(rpc_key.clone(), tx, shutdown.clone()).await;
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let response = rpc_client_request(port, &rpc_key, RpcRequest::GetLinkCount).await;
+        match response {
+            RpcResponse::IntResult(n) => assert_eq!(n, 0),
+            other => panic!("expected IntResult(0), got {other:?}"),
+        }
+
+        shutdown.trigger();
+    }
+
+    #[tokio::test]
+    async fn test_rpc_server_auth_failure() {
+        let shutdown = ShutdownSignal::new();
+        let (tx, _rx) = mpsc::channel(16);
+        let rpc_key = b"correct_key".to_vec();
+
+        let port = spawn_test_rpc_server(rpc_key.clone(), tx, shutdown.clone()).await;
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let mut stream = connect_retry(port).await;
+
+        let challenge_frame = rpc::read_mp_frame(&mut stream, 256).await.unwrap();
+        assert!(challenge_frame.starts_with(rpc::MP_CHALLENGE));
+        let challenge = &challenge_frame[rpc::MP_CHALLENGE.len()..];
+
+        let bad_hmac = rpc::compute_python_auth_response(b"wrong_key", challenge);
+        rpc::write_mp_frame(&mut stream, &bad_hmac).await.unwrap();
+
+        let result = rpc::read_mp_frame(&mut stream, 256).await.unwrap();
+        assert_eq!(result, rpc::MP_FAILURE);
+
+        shutdown.trigger();
+    }
+
+    #[tokio::test]
+    async fn test_rpc_server_multiple_request_types() {
+        let shutdown = ShutdownSignal::new();
+        let (actor, tx) = rns_transport::actor::TransportActor::new();
+        tokio::spawn(actor.run());
+        let rpc_key = b"multi_test_key".to_vec();
+
+        let port = spawn_test_rpc_server(rpc_key.clone(), tx, shutdown.clone()).await;
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let response =
+            rpc_client_request(port, &rpc_key, RpcRequest::GetPathTable { max_hops: None }).await;
+        assert!(matches!(response, RpcResponse::PathTable(ref v) if v.is_empty()));
+
+        let response = rpc_client_request(port, &rpc_key, RpcRequest::GetInterfaceStats).await;
+        assert!(matches!(response, RpcResponse::InterfaceStats(ref v) if v.is_empty()));
+
+        let response = rpc_client_request(port, &rpc_key, RpcRequest::DropAnnounceQueues).await;
+        assert!(matches!(response, RpcResponse::Ok));
+
+        let response = rpc_client_request(
+            port,
+            &rpc_key,
+            RpcRequest::GetNextHopIfName {
+                destination_hash: vec![0; 16],
+            },
+        )
+        .await;
+        assert!(matches!(response, RpcResponse::StringResult(None)));
+
+        shutdown.trigger();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_rpc_server_accepts_python_multiprocessing_client() {
+        if std::process::Command::new("python3")
+            .arg("-c")
+            .arg("import multiprocessing.connection")
+            .status()
+            .is_err()
+        {
+            return;
+        }
+
+        let shutdown = ShutdownSignal::new();
+        let (actor, tx) = rns_transport::actor::TransportActor::new();
+        tokio::spawn(actor.run());
+        let rpc_key = b"python_multiprocessing_key".to_vec();
+
+        let port = spawn_test_rpc_server(rpc_key.clone(), tx, shutdown.clone()).await;
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let script = r#"
+import multiprocessing.connection
+import sys
+
+port = int(sys.argv[1])
+authkey = bytes.fromhex(sys.argv[2])
+conn = multiprocessing.connection.Client(("127.0.0.1", port), authkey=authkey)
+conn.send({"get": "link_count"})
+resp = conn.recv()
+conn.close()
+if resp != 0:
+    raise SystemExit(f"unexpected response: {resp!r}")
+conn = multiprocessing.connection.Client(("127.0.0.1", port), authkey=authkey)
+conn.send({"get": "interface_stats"})
+resp = conn.recv()
+conn.close()
+if not isinstance(resp, dict) or "interfaces" not in resp:
+    raise SystemExit(f"unexpected interface_stats response: {resp!r}")
+"#;
+        let output = std::process::Command::new("python3")
+            .arg("-c")
+            .arg(script)
+            .arg(port.to_string())
+            .arg(hex::encode(&rpc_key))
+            .output()
+            .expect("python3 should run");
+
+        shutdown.trigger();
+
+        assert!(
+            output.status.success(),
+            "python client failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_rust_client_accepts_python_multiprocessing_listener() {
+        if std::process::Command::new("python3")
+            .arg("-c")
+            .arg("import multiprocessing.connection")
+            .status()
+            .is_err()
+        {
+            return;
+        }
+
+        let port = portpicker_ephemeral();
+        let rpc_key = b"python_listener_key".to_vec();
+        let script = r#"
+import multiprocessing.connection
+import sys
+
+port = int(sys.argv[1])
+authkey = bytes.fromhex(sys.argv[2])
+listener = multiprocessing.connection.Listener(("127.0.0.1", port), authkey=authkey)
+print("READY", flush=True)
+conn = listener.accept()
+call = conn.recv()
+if call != {"get": "link_count"}:
+    raise SystemExit(f"unexpected call: {call!r}")
+conn.send(7)
+conn.close()
+listener.close()
+"#;
+        let mut child = std::process::Command::new("python3")
+            .arg("-c")
+            .arg(script)
+            .arg(port.to_string())
+            .arg(hex::encode(&rpc_key))
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .expect("python3 should start");
+
+        let stdout = child.stdout.take().expect("python listener stdout");
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            use std::io::BufRead as _;
+            let mut line = String::new();
+            let result = std::io::BufReader::new(stdout)
+                .read_line(&mut line)
+                .map(|_| line);
+            let _ = ready_tx.send(result);
+        });
+        match ready_rx.recv_timeout(std::time::Duration::from_secs(5)) {
+            Ok(Ok(line)) if line.trim() == "READY" => {}
+            Ok(Ok(line)) => {
+                let _ = child.kill();
+                panic!("unexpected Python listener readiness line: {line:?}");
+            }
+            Ok(Err(e)) => {
+                let _ = child.kill();
+                panic!("failed to read Python listener readiness: {e}");
+            }
+            Err(e) => {
+                let _ = child.kill();
+                panic!("timed out waiting for Python listener readiness: {e}");
+            }
+        }
+
+        match rpc::connect_and_request(
+            port,
+            &rpc_key,
+            &RpcRequest::GetLinkCount,
+            std::time::Duration::from_secs(5),
+        )
+        .await
+        {
+            Ok(RpcResponse::IntResult(7)) => {
+                let status = child.wait().expect("python listener should exit");
+                assert!(status.success(), "python listener exited with {status}");
+            }
+            Ok(other) => {
+                let _ = child.kill();
+                panic!("unexpected Python listener response: {other:?}");
+            }
+            Err(e) => {
+                let _ = child.kill();
+                panic!("Rust client could not connect to Python multiprocessing listener: {e}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_process_rpc_request_all_variants() {
+        let (actor, tx) = rns_transport::actor::TransportActor::new();
+        tokio::spawn(actor.run());
+
+        let requests = vec![
+            RpcRequest::GetPathTable { max_hops: Some(5) },
+            RpcRequest::GetInterfaceStats,
+            RpcRequest::GetRateTable,
+            RpcRequest::GetNextHopIfName {
+                destination_hash: vec![0; 16],
+            },
+            RpcRequest::GetNextHop {
+                destination_hash: vec![0; 16],
+            },
+            RpcRequest::GetFirstHopTimeout {
+                destination_hash: vec![0; 16],
+            },
+            RpcRequest::GetLinkCount,
+            RpcRequest::GetPacketRssi {
+                packet_hash: vec![0; 32],
+            },
+            RpcRequest::GetPacketSnr {
+                packet_hash: vec![0; 32],
+            },
+            RpcRequest::GetPacketQ {
+                packet_hash: vec![0; 32],
+            },
+            RpcRequest::GetBlackholedIdentities,
+            RpcRequest::DropPath {
+                destination_hash: vec![0; 16],
+            },
+            RpcRequest::DropAllVia {
+                transport_hash: vec![0; 16],
+            },
+            RpcRequest::DropAnnounceQueues,
+            RpcRequest::BlackholeIdentity {
+                identity_hash: vec![0; 16],
+                until: Some(99999.0),
+                reason: Some("test".to_string()),
+            },
+            RpcRequest::UnblackholeIdentity {
+                identity_hash: vec![0; 16],
+            },
+            RpcRequest::UseDestination {
+                destination_hash: vec![0; 16],
+            },
+            RpcRequest::RetainDestination {
+                destination_hash: vec![0; 16],
+            },
+            RpcRequest::UnretainDestination {
+                destination_hash: vec![0; 16],
+            },
+        ];
+
+        for req in requests {
+            let resp = process_rpc_request(req, &tx).await;
+            assert!(
+                !matches!(resp, RpcResponse::Error(_)),
+                "unexpected Error response"
+            );
+        }
+
+        let _ = tx.send(TransportMessage::Shutdown).await;
+    }
+
+    fn portpicker_ephemeral() -> u16 {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.local_addr().unwrap().port()
+    }
+
+    async fn rpc_client_request(port: u16, rpc_key: &[u8], request: RpcRequest) -> RpcResponse {
+        let mut last_err = None;
+        for _ in 0..20 {
+            match rpc::connect_and_request(
+                port,
+                rpc_key,
+                &request,
+                std::time::Duration::from_secs(2),
+            )
+            .await
+            {
+                Ok(response) => return response,
+                Err(e) => {
+                    last_err = Some(e.to_string());
+                    tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                }
+            }
+        }
+        panic!("RPC client request failed: {last_err:?}");
+    }
+
+    async fn spawn_test_rpc_server(
+        rpc_key: Vec<u8>,
+        tx: mpsc::Sender<TransportMessage>,
+        shutdown: ShutdownSignal,
+    ) -> u16 {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let _ = run_rpc_server_with_listener(listener, rpc_key, tx, shutdown).await;
+        });
+        port
+    }
+
+    async fn connect_retry(port: u16) -> tokio::net::TcpStream {
+        let addr = format!("127.0.0.1:{port}");
+        let mut last_err = None;
+        for _ in 0..20 {
+            match tokio::net::TcpStream::connect(&addr).await {
+                Ok(stream) => return stream,
+                Err(e) => {
+                    last_err = Some(e);
+                    tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                }
+            }
+        }
+        panic!("failed to connect to RPC server on {addr}: {last_err:?}");
+    }
+}

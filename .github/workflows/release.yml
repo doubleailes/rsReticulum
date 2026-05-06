@@ -1,0 +1,99 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag_name:
+        description: "Release tag to create or update"
+        required: true
+
+permissions:
+  contents: read
+
+env:
+  RELEASE_TAG: ${{ github.event.inputs.tag_name || github.ref_name }}
+  PACKAGE_ROOT: rsReticulum
+  RETICULUM_BINS: rnsd-rs rnstatus-rs rnpath-rs rnid-rs rnprobe-rs rncp-rs rnsh-rs rnodeconf-rs
+
+jobs:
+  build:
+    name: Build ${{ matrix.artifact_suffix }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            artifact_suffix: linux-x86_64
+            archive: tar.gz
+          - os: macos-latest
+            artifact_suffix: macos
+            archive: tar.gz
+          - os: windows-latest
+            artifact_suffix: windows-x86_64
+            archive: zip
+    runs-on: ${{ matrix.os }}
+    env:
+      ARCHIVE_NAME: rsReticulum-${{ github.event.inputs.tag_name || github.ref_name }}-${{ matrix.artifact_suffix }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install system deps (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libudev-dev libdbus-1-dev pkg-config
+      - name: Build release binaries
+        run: cargo build -p rns-tools --release --bins
+      - name: Stage archive contents
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "dist/${PACKAGE_ROOT}/bin"
+          for bin in ${RETICULUM_BINS}; do
+            if [[ "${RUNNER_OS}" == "Windows" ]]; then
+              cp "target/release/${bin}.exe" "dist/${PACKAGE_ROOT}/bin/${bin}.exe"
+            else
+              cp "target/release/${bin}" "dist/${PACKAGE_ROOT}/bin/${bin}"
+            fi
+          done
+          cp README.md LICENSE "dist/${PACKAGE_ROOT}/"
+      - name: Create tar archive
+        if: runner.os != 'Windows'
+        shell: bash
+        run: tar -czf "${ARCHIVE_NAME}.tar.gz" -C dist "${PACKAGE_ROOT}"
+      - name: Create zip archive
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: Compress-Archive -Path "dist/${env:PACKAGE_ROOT}" -DestinationPath "${env:ARCHIVE_NAME}.zip" -Force
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ARCHIVE_NAME }}
+          path: |
+            *.tar.gz
+            *.zip
+          if-no-files-found: error
+
+  publish:
+    name: Publish GitHub release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          merge-multiple: true
+      - name: Generate checksums
+        working-directory: release-assets
+        run: sha256sum * > SHA256SUMS
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.RELEASE_TAG }}
+          prerelease: true
+          files: release-assets/*

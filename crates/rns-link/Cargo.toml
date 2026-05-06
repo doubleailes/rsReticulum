@@ -1,0 +1,24 @@
+[package]
+name = "rns-link"
+description = "Link layer and encrypted channel for Reticulum"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+default = ["std"]
+std = ["rns-crypto/std", "rns-wire/std"]
+
+[dependencies]
+rns-crypto = { workspace = true }
+rns-wire = { workspace = true }
+rns-identity = { workspace = true }
+thiserror = { workspace = true }
+zeroize = { workspace = true }
+rmpv = { workspace = true }
+rand = { workspace = true }
+tracing = { workspace = true }
+hex = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }

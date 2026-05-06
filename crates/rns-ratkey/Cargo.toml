@@ -1,0 +1,31 @@
+[package]
+name = "rns-ratkey"
+description = "Hardware-backed identity (YubiKey/Nitrokey PIV) for Reticulum"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+rns-crypto = { workspace = true, features = ["std"] }
+rns-identity = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+hex = { workspace = true }
+zeroize = { workspace = true }
+toml = "0.8"
+
+[dev-dependencies]
+rns-crypto = { workspace = true, features = ["std"] }
+rns-identity = { workspace = true }
+rns-link = { path = "../rns-link" }
+
+[features]
+default = []
+# Enable real hardware PIV session (requires pcsc system library)
+hardware = ["dep:pcsc"]
+
+[dependencies.pcsc]
+version = "2"
+optional = true
