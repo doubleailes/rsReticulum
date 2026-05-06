@@ -497,7 +497,7 @@ fn get_link_local_addrs(
                 if let std::net::IpAddr::V6(addr) = iface.addr.ip()
                     && (addr.segments()[0] & 0xffc0) == 0xfe80
                 {
-                    let scope_id = iface_name_to_scope_id(&iface.name);
+                    let scope_id = iface_scope_id(&iface);
                     if scope_id == 0 {
                         tracing::warn!(
                             iface = %iface.name,
@@ -778,8 +778,14 @@ fn get_link_local_addrs_android(
     Ok(result)
 }
 
+fn iface_scope_id(iface: &if_addrs::Interface) -> u32 {
+    iface
+        .index
+        .unwrap_or_else(|| iface_name_to_scope_id(&iface.name))
+}
+
 /// Convert interface name to scope ID via POSIX/Windows `if_nametoindex`.
-/// Returns 0 if the lookup fails; callers fall back to OS auto-selection.
+/// Returns 0 if the lookup fails; callers must skip the address.
 #[cfg(any(unix, windows))]
 fn iface_name_to_scope_id(name: &str) -> u32 {
     use std::ffi::CString;
@@ -1551,6 +1557,40 @@ mod tests {
         let other_addr = Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 2);
         assert!(!verify_beacon(&beacon, "reticulum", &other_addr));
         assert!(!verify_beacon(&beacon[..16], "reticulum", &addr));
+    }
+
+    #[test]
+    fn test_scope_id_prefers_enumerated_interface_index() {
+        let addr = Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1);
+        let iface = test_interface("__ratspeak_missing_iface__", addr, Some(1234));
+        assert_eq!(iface_scope_id(&iface), 1234);
+    }
+
+    fn test_interface(name: &str, ip: Ipv6Addr, index: Option<u32>) -> if_addrs::Interface {
+        let addr = if_addrs::IfAddr::V6(if_addrs::Ifv6Addr {
+            ip,
+            netmask: Ipv6Addr::new(0xffff, 0xffff, 0xffff, 0xffff, 0, 0, 0, 0),
+            prefixlen: 64,
+            broadcast: None,
+        });
+
+        #[cfg(windows)]
+        {
+            if_addrs::Interface {
+                name: name.to_string(),
+                addr,
+                index,
+                adapter_name: name.to_string(),
+            }
+        }
+        #[cfg(not(windows))]
+        {
+            if_addrs::Interface {
+                name: name.to_string(),
+                addr,
+                index,
+            }
+        }
     }
 
     #[test]
