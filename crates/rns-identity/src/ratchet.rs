@@ -386,10 +386,10 @@ impl ReceivedRatchetStore {
     /// Record `ratchet_pub` for `dest_hash`. Re-inserting the identical key is a no-op;
     /// any other value replaces the entry and is written to disk when backed.
     pub fn remember(&mut self, dest_hash: [u8; 16], ratchet_pub: [u8; 32]) {
-        if let Some(existing) = self.entries.get(&dest_hash)
-            && existing.ratchet_pub == ratchet_pub
-        {
-            return;
+        if let Some(existing) = self.entries.get(&dest_hash) {
+            if existing.ratchet_pub == ratchet_pub {
+                return;
+            }
         }
 
         let received = ReceivedRatchet::new(ratchet_pub);
@@ -412,27 +412,27 @@ impl ReceivedRatchetStore {
     /// Return the current ratchet public key for `dest_hash`, loading from
     /// disk on miss. Yields `None` if the entry is expired or absent.
     pub fn get(&mut self, dest_hash: &[u8; 16]) -> Option<[u8; 32]> {
-        if !self.entries.contains_key(dest_hash)
-            && let Some(ref dir) = self.storage_dir
-        {
-            let hexhash = hex::encode(dest_hash);
-            let path = dir.join(&hexhash);
-            if path.exists() {
-                match ReceivedRatchet::load(&path) {
-                    Ok(ratchet) => {
-                        if !ratchet.is_expired() && ratchet.ratchet_pub.len() == 32 {
-                            self.entries.insert(*dest_hash, ratchet);
-                        } else {
+        if !self.entries.contains_key(dest_hash) {
+            if let Some(ref dir) = self.storage_dir {
+                let hexhash = hex::encode(dest_hash);
+                let path = dir.join(&hexhash);
+                if path.exists() {
+                    match ReceivedRatchet::load(&path) {
+                        Ok(ratchet) => {
+                            if !ratchet.is_expired() && ratchet.ratchet_pub.len() == 32 {
+                                self.entries.insert(*dest_hash, ratchet);
+                            } else {
+                                return None;
+                            }
+                        }
+                        Err(e) => {
+                            tracing::error!(
+                                dest = hexhash,
+                                error = %e,
+                                "failed to load ratchet from disk"
+                            );
                             return None;
                         }
-                    }
-                    Err(e) => {
-                        tracing::error!(
-                            dest = hexhash,
-                            error = %e,
-                            "failed to load ratchet from disk"
-                        );
-                        return None;
                     }
                 }
             }

@@ -233,10 +233,10 @@ impl Identity {
                 let mut shared = ratchet_prv.exchange(&peer_pub);
                 let derived_result = derive_key_64(&shared, &self.hash);
                 shared.zeroize();
-                if let Ok(derived) = derived_result
-                    && let Ok(plaintext) = token::decrypt(ct, &derived)
-                {
-                    return Ok(plaintext);
+                if let Ok(derived) = derived_result {
+                    if let Ok(plaintext) = token::decrypt(ct, &derived) {
+                        return Ok(plaintext);
+                    }
                 }
             }
         }

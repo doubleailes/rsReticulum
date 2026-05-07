@@ -34,7 +34,7 @@ pub fn encrypt(key: &[u8], iv: &[u8], plaintext: &[u8]) -> Result<Vec<u8>, AesCb
     if iv.len() != 16 {
         return Err(AesCbcError::InvalidIvLength(iv.len()));
     }
-    if plaintext.is_empty() || !plaintext.len().is_multiple_of(16) {
+    if plaintext.is_empty() || plaintext.len() % 16 != 0 {
         return Err(AesCbcError::NotBlockAligned);
     }
 
@@ -68,7 +68,7 @@ pub fn decrypt(key: &[u8], iv: &[u8], ciphertext: &[u8]) -> Result<Vec<u8>, AesC
     if iv.len() != 16 {
         return Err(AesCbcError::InvalidIvLength(iv.len()));
     }
-    if ciphertext.is_empty() || !ciphertext.len().is_multiple_of(16) {
+    if ciphertext.is_empty() || ciphertext.len() % 16 != 0 {
         return Err(AesCbcError::NotBlockAligned);
     }
 

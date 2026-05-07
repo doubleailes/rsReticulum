@@ -19,10 +19,10 @@ pub const DEFAULT_SOCKET_PATH: &str = "/tmp/rns_reticulum.sock";
 
 /// On Android `/tmp` isn't writable; falls back to caller's data directory.
 pub fn socket_path(data_dir: Option<&std::path::Path>) -> std::path::PathBuf {
-    if cfg!(target_os = "android")
-        && let Some(dir) = data_dir
-    {
-        return dir.join("cache").join("rns_reticulum.sock");
+    if cfg!(target_os = "android") {
+        if let Some(dir) = data_dir {
+            return dir.join("cache").join("rns_reticulum.sock");
+        }
     }
     std::path::PathBuf::from(DEFAULT_SOCKET_PATH)
 }

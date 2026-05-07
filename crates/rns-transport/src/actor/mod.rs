@@ -342,20 +342,21 @@ impl TransportActor {
                     .find(|(_, entry)| entry.packet_hash == Some(packet_hash))
                     .map(|(dest, _)| *dest.as_bytes());
 
-                if let Some(dest) = local_hit
-                    && let Some(cached) = self.recent_announces.get(&dest)
-                    && !cached.raw_packet.is_empty()
-                {
-                    debug!(hash = %hex::encode(&packet_hash[..8]), "cache request: local hit, replaying");
-                    let inbound = crate::messages::InboundPacket {
-                        raw: Bytes::copy_from_slice(&cached.raw_packet),
-                        interface_id: 0,
-                        rssi: None,
-                        snr: None,
-                        q: None,
-                    };
-                    self.on_inbound(inbound);
-                    return;
+                if let Some(dest) = local_hit {
+                    if let Some(cached) = self.recent_announces.get(&dest) {
+                        if !cached.raw_packet.is_empty() {
+                            debug!(hash = %hex::encode(&packet_hash[..8]), "cache request: local hit, replaying");
+                            let inbound = crate::messages::InboundPacket {
+                                raw: Bytes::copy_from_slice(&cached.raw_packet),
+                                interface_id: 0,
+                                rssi: None,
+                                snr: None,
+                                q: None,
+                            };
+                            self.on_inbound(inbound);
+                            return;
+                        }
+                    }
                 }
 
                 // Local miss: only transport nodes forward the request

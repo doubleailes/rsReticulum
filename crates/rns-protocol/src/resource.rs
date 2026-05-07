@@ -1545,10 +1545,11 @@ impl OutboundTransfer {
         for i in search_start..search_end {
             if i < self.resource.map_hashes.len()
                 && requested_map_hashes.contains(&self.resource.map_hashes[i])
-                && let Some(part_data) = self.resource.get_part(i)
             {
-                actions.push(TransferAction::SendPart(i, part_data.to_vec()));
-                sent_count += 1;
+                if let Some(part_data) = self.resource.get_part(i) {
+                    actions.push(TransferAction::SendPart(i, part_data.to_vec()));
+                    sent_count += 1;
+                }
             }
         }
 
@@ -1582,7 +1583,7 @@ impl OutboundTransfer {
 
             // Python cancels if an exhausted request cursor is not aligned to
             // a hashmap segment boundary.
-            if hashmap_max_len > 0 && !part_index.is_multiple_of(hashmap_max_len) {
+            if hashmap_max_len > 0 && part_index % hashmap_max_len != 0 {
                 self.resource.state = ResourceState::Failed;
                 actions.push(TransferAction::SendCancel(
                     CancelType::Icl,
@@ -2146,8 +2147,10 @@ impl InboundTransfer {
         hmu.push(exhausted);
 
         // If exhausted (complete), include the last map hash
-        if is_complete && let Some(last_mh) = self.resource.map_hashes.last() {
-            hmu.extend_from_slice(last_mh);
+        if is_complete {
+            if let Some(last_mh) = self.resource.map_hashes.last() {
+                hmu.extend_from_slice(last_mh);
+            }
         }
 
         // Include the resource hash for identification

@@ -140,10 +140,10 @@ impl ReceiverConfig {
         };
 
         let announced_identity = event.identity_hash.unwrap_or(info.transport_id);
-        if let Some(sources) = self.discovery_sources.as_ref()
-            && !sources.iter().any(|s| s == &announced_identity)
-        {
-            return Outcome::Rejected(Reason::UnauthorizedSource);
+        if let Some(sources) = self.discovery_sources.as_ref() {
+            if !sources.iter().any(|s| s == &announced_identity) {
+                return Outcome::Rejected(Reason::UnauthorizedSource);
+            }
         }
 
         let stamp_value = self.stamper.value(&infohash, stamp);

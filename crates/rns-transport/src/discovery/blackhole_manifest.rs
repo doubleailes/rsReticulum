@@ -215,18 +215,19 @@ pub fn apply_manifest(
 ) -> usize {
     let mut applied = 0usize;
     for (id_hash, entry) in manifest {
-        if let Some(until) = entry.until
-            && until <= now
-        {
-            continue;
+        if let Some(until) = entry.until {
+            if until <= now {
+                continue;
+            }
         }
         if let Some(existing) = table
             .iter_entries()
             .find(|(h, _)| h.as_bytes() == id_hash)
             .map(|(_, e)| e.clone())
-            && existing.source.is_none()
         {
-            continue;
+            if existing.source.is_none() {
+                continue;
+            }
         }
 
         let ttl = entry.until.map(|u| (u - now).max(0.0));

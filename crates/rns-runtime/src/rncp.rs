@@ -1293,21 +1293,21 @@ pub async fn rncp_fetch_file(request: RncpFetchRequest<'_>) -> Result<RncpFetchO
                 ) else {
                     continue;
                 };
-                if let TransferAction::SendRequest(req_data) = t.request_next()
-                    && let Ok(encrypted) = link.encrypt(&req_data)
-                {
-                    let req_raw = build_data_packet(
-                        link_id,
-                        rns_wire::context::PacketContext::ResourceReq,
-                        &encrypted,
-                    );
-                    transport_tx
-                        .send(TransportMessage::Outbound(OutboundRequest {
-                            raw: req_raw,
-                            destination_hash: link_id,
-                        }))
-                        .await
-                        .map_err(|_| RncpError::TransportUnavailable)?;
+                if let TransferAction::SendRequest(req_data) = t.request_next() {
+                    if let Ok(encrypted) = link.encrypt(&req_data) {
+                        let req_raw = build_data_packet(
+                            link_id,
+                            rns_wire::context::PacketContext::ResourceReq,
+                            &encrypted,
+                        );
+                        transport_tx
+                            .send(TransportMessage::Outbound(OutboundRequest {
+                                raw: req_raw,
+                                destination_hash: link_id,
+                            }))
+                            .await
+                            .map_err(|_| RncpError::TransportUnavailable)?;
+                    }
                 }
                 transfers.insert(adv.resource_hash, t);
             }
@@ -1454,21 +1454,21 @@ pub async fn rncp_fetch_file(request: RncpFetchRequest<'_>) -> Result<RncpFetchO
                 let Some(t) = transfers.get_mut(&rh) else {
                     continue;
                 };
-                if let TransferAction::SendRequest(req) = t.hashmap_update(segment, &hashmap)
-                    && let Ok(encrypted) = link.encrypt(&req)
-                {
-                    let req_raw = build_data_packet(
-                        link_id,
-                        rns_wire::context::PacketContext::ResourceReq,
-                        &encrypted,
-                    );
-                    transport_tx
-                        .send(TransportMessage::Outbound(OutboundRequest {
-                            raw: req_raw,
-                            destination_hash: link_id,
-                        }))
-                        .await
-                        .map_err(|_| RncpError::TransportUnavailable)?;
+                if let TransferAction::SendRequest(req) = t.hashmap_update(segment, &hashmap) {
+                    if let Ok(encrypted) = link.encrypt(&req) {
+                        let req_raw = build_data_packet(
+                            link_id,
+                            rns_wire::context::PacketContext::ResourceReq,
+                            &encrypted,
+                        );
+                        transport_tx
+                            .send(TransportMessage::Outbound(OutboundRequest {
+                                raw: req_raw,
+                                destination_hash: link_id,
+                            }))
+                            .await
+                            .map_err(|_| RncpError::TransportUnavailable)?;
+                    }
                 }
             }
             rns_wire::context::PacketContext::LinkClose if link.receive_teardown(body) => {

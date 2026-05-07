@@ -491,10 +491,10 @@ impl Destination {
 
         let plaintext = self.decrypt(data, identity)?;
 
-        if packet_type == 0x00
-            && let Some(ref cb) = self.packet_callback
-        {
-            cb(&plaintext, data);
+        if packet_type == 0x00 {
+            if let Some(ref cb) = self.packet_callback {
+                cb(&plaintext, data);
+            }
         }
 
         Ok(Some(plaintext))
@@ -581,10 +581,10 @@ impl Destination {
         self.path_responses
             .retain(|_, v| now <= v.timestamp + PR_TAG_WINDOW);
 
-        if let Some(tag_bytes) = tag
-            && let Some(cached) = self.path_responses.get(tag_bytes)
-        {
-            return Ok((cached.announce_data.clone(), ratchet.is_some()));
+        if let Some(tag_bytes) = tag {
+            if let Some(cached) = self.path_responses.get(tag_bytes) {
+                return Ok((cached.announce_data.clone(), ratchet.is_some()));
+            }
         }
 
         let effective_app_data = app_data

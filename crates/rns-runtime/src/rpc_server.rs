@@ -450,78 +450,82 @@ async fn process_rpc_request(
             }
         }
         RpcRequest::GetPacketRssi { packet_hash } => {
-            if let Some(hash) = packet_hash_to_array(&packet_hash)
-                && let Some(TransportQueryResponse::FloatResult(v)) = query_transport(
+            if let Some(hash) = packet_hash_to_array(&packet_hash) {
+                if let Some(TransportQueryResponse::FloatResult(v)) = query_transport(
                     transport_tx,
                     TransportQuery::GetPacketRssi { packet_hash: hash },
                 )
                 .await
-            {
-                RpcResponse::FloatResult(v)
-            } else {
-                RpcResponse::FloatResult(None)
+                {
+                    return RpcResponse::FloatResult(v);
+                }
             }
+            RpcResponse::FloatResult(None)
         }
         RpcRequest::GetPacketSnr { packet_hash } => {
-            if let Some(hash) = packet_hash_to_array(&packet_hash)
-                && let Some(TransportQueryResponse::FloatResult(v)) = query_transport(
+            if let Some(hash) = packet_hash_to_array(&packet_hash) {
+                if let Some(TransportQueryResponse::FloatResult(v)) = query_transport(
                     transport_tx,
                     TransportQuery::GetPacketSnr { packet_hash: hash },
                 )
                 .await
-            {
-                RpcResponse::FloatResult(v)
-            } else {
-                RpcResponse::FloatResult(None)
+                {
+                    return RpcResponse::FloatResult(v);
+                }
             }
+            RpcResponse::FloatResult(None)
         }
         RpcRequest::GetPacketQ { packet_hash } => {
-            if let Some(hash) = packet_hash_to_array(&packet_hash)
-                && let Some(TransportQueryResponse::FloatResult(v)) = query_transport(
+            if let Some(hash) = packet_hash_to_array(&packet_hash) {
+                if let Some(TransportQueryResponse::FloatResult(v)) = query_transport(
                     transport_tx,
                     TransportQuery::GetPacketQ { packet_hash: hash },
                 )
                 .await
-            {
-                RpcResponse::FloatResult(v)
-            } else {
-                RpcResponse::FloatResult(None)
+                {
+                    return RpcResponse::FloatResult(v);
+                }
             }
+            RpcResponse::FloatResult(None)
         }
         RpcRequest::DropAllVia { transport_hash } => {
-            if let Some(next_hop) = hash_to_array(&transport_hash)
-                && let Some(TransportQueryResponse::IntResult(n)) =
+            if let Some(next_hop) = hash_to_array(&transport_hash) {
+                if let Some(TransportQueryResponse::IntResult(n)) =
                     query_transport(transport_tx, TransportQuery::DropAllVia { next_hop }).await
-            {
-                return RpcResponse::IntResult(n);
+                {
+                    return RpcResponse::IntResult(n);
+                }
             }
             RpcResponse::IntResult(0)
         }
         RpcRequest::UseDestination { destination_hash } => {
-            if let Some(dest) = hash_to_array(&destination_hash)
-                && let Some(TransportQueryResponse::BoolResult(v)) =
+            if let Some(dest) = hash_to_array(&destination_hash) {
+                if let Some(TransportQueryResponse::BoolResult(v)) =
                     query_transport(transport_tx, TransportQuery::UseDestination { dest }).await
-            {
-                return RpcResponse::BoolResult(v);
+                {
+                    return RpcResponse::BoolResult(v);
+                }
             }
             RpcResponse::BoolResult(false)
         }
         RpcRequest::RetainDestination { destination_hash } => {
-            if let Some(dest) = hash_to_array(&destination_hash)
-                && let Some(TransportQueryResponse::BoolResult(v)) =
+            if let Some(dest) = hash_to_array(&destination_hash) {
+                if let Some(TransportQueryResponse::BoolResult(v)) =
                     query_transport(transport_tx, TransportQuery::RetainDestination { dest }).await
-            {
-                return RpcResponse::BoolResult(v);
+                {
+                    return RpcResponse::BoolResult(v);
+                }
             }
             RpcResponse::BoolResult(false)
         }
         RpcRequest::UnretainDestination { destination_hash } => {
-            if let Some(dest) = hash_to_array(&destination_hash)
-                && let Some(TransportQueryResponse::BoolResult(v)) =
+            if let Some(dest) = hash_to_array(&destination_hash) {
+                if let Some(TransportQueryResponse::BoolResult(v)) =
                     query_transport(transport_tx, TransportQuery::UnretainDestination { dest })
                         .await
-            {
-                return RpcResponse::BoolResult(v);
+                {
+                    return RpcResponse::BoolResult(v);
+                }
             }
             RpcResponse::BoolResult(false)
         }

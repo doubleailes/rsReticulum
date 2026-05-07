@@ -145,10 +145,10 @@ impl TransportActor {
             let pkt_hash = rns_wire::hash::packet_hash(&request.raw, parsed.flags.header_type);
             self.packet_hashlist.insert(pkt_hash);
             self.send_to_interface(interface_id, &request.raw);
-            if parsed.flags.packet_type == rns_wire::flags::PacketType::Announce
-                && let Some(entry) = self.interfaces.get_mut(&interface_id)
-            {
-                entry.ingress.sent_announce();
+            if parsed.flags.packet_type == rns_wire::flags::PacketType::Announce {
+                if let Some(entry) = self.interfaces.get_mut(&interface_id) {
+                    entry.ingress.sent_announce();
+                }
             }
         }
     }
@@ -287,11 +287,11 @@ impl TransportActor {
         let mut unique_tag = Vec::with_capacity(32);
         unique_tag.extend_from_slice(&requested_dest);
         unique_tag.extend_from_slice(tag);
-        if let Some(last) = self.discovery_pr_tags.get(&unique_tag)
-            && now - last < PATH_REQUEST_GATE_TIMEOUT
-        {
-            trace!(dest = %hex::encode(requested_dest), "ignoring duplicate path request");
-            return;
+        if let Some(last) = self.discovery_pr_tags.get(&unique_tag) {
+            if now - last < PATH_REQUEST_GATE_TIMEOUT {
+                trace!(dest = %hex::encode(requested_dest), "ignoring duplicate path request");
+                return;
+            }
         }
         self.discovery_pr_tags.insert(unique_tag, now);
 
@@ -300,8 +300,8 @@ impl TransportActor {
                 dest = %hex::encode(requested_dest),
                 "answering path request — destination is local"
             );
-            if let Some(tx) = self.destination_channels.get(&requested_dest)
-                && let Err(e) =
+            if let Some(tx) = self.destination_channels.get(&requested_dest) {
+                if let Err(e) =
                     tx.try_send(crate::link_messages::DestinationEvent::AnnounceRequested(
                         crate::link_messages::AnnounceRequest {
                             app_name: String::new(),
@@ -310,28 +310,31 @@ impl TransportActor {
                             attached_interface: Some(interface_id),
                         },
                     ))
-            {
-                self.channel_drops += 1;
-                warn!(dest = hex::encode(requested_dest), drops = self.channel_drops, err = %e,
-                    "failed to send AnnounceRequested for local path request");
+                {
+                    self.channel_drops += 1;
+                    warn!(dest = hex::encode(requested_dest), drops = self.channel_drops, err = %e,
+                        "failed to send AnnounceRequested for local path request");
+                }
             }
             self.fire_path_waiters(&requested_dest);
             return;
         }
 
-        if !is_from_local_client
-            && let Some(path) = self.path_table.get(&requested_dest)
-            && self.is_local_client_interface(path.interface_id)
-        {
-            self.pending_local_path_requests
-                .insert(requested_dest, interface_id);
+        if !is_from_local_client {
+            if let Some(path) = self.path_table.get(&requested_dest) {
+                if self.is_local_client_interface(path.interface_id) {
+                    self.pending_local_path_requests
+                        .insert(requested_dest, interface_id);
+                }
+            }
         }
 
         // Python Transport.py: local shared clients are allowed to use the
         // shared instance's path cache even when the instance is not a transport
         // node. Ordinary peers still require transport mode.
-        if (self.is_transport_enabled || is_from_local_client)
-            && let Some(path) = self.path_table.get(&requested_dest)
+        if let Some(path) = (self.is_transport_enabled || is_from_local_client)
+            .then(|| self.path_table.get(&requested_dest))
+            .flatten()
         {
             let requestor_is_next_hop =
                 requestor_transport_id.is_some_and(|requestor| path.next_hop == Some(requestor));
@@ -464,10 +467,10 @@ impl TransportActor {
     fn build_path_request_packet(&self, destination_hash: [u8; 16], tag: Option<&[u8]>) -> Vec<u8> {
         let mut request_data = Vec::with_capacity(48);
         request_data.extend_from_slice(&destination_hash);
-        if self.is_transport_enabled
-            && let Some(identity_hash) = self.transport_identity_hash
-        {
-            request_data.extend_from_slice(&identity_hash);
+        if self.is_transport_enabled {
+            if let Some(identity_hash) = self.transport_identity_hash {
+                request_data.extend_from_slice(&identity_hash);
+            }
         }
         if let Some(tag) = tag {
             request_data.extend_from_slice(&tag[..tag.len().min(16)]);
@@ -536,10 +539,10 @@ impl TransportActor {
     pub(super) fn on_path_request(&mut self, destination_hash: [u8; 16]) {
         let now = now_f64();
 
-        if let Some(last) = self.path_requests.get(&destination_hash)
-            && now - last < PATH_REQUEST_MI
-        {
-            return;
+        if let Some(last) = self.path_requests.get(&destination_hash) {
+            if now - last < PATH_REQUEST_MI {
+                return;
+            }
         }
 
         self.path_requests.insert(destination_hash, now);
@@ -560,10 +563,10 @@ impl TransportActor {
 
         let mut request_data = Vec::with_capacity(48);
         request_data.extend_from_slice(&destination_hash);
-        if self.is_transport_enabled
-            && let Some(identity_hash) = self.transport_identity_hash
-        {
-            request_data.extend_from_slice(&identity_hash);
+        if self.is_transport_enabled {
+            if let Some(identity_hash) = self.transport_identity_hash {
+                request_data.extend_from_slice(&identity_hash);
+            }
         }
         request_data.extend_from_slice(&request_tag);
 
@@ -661,16 +664,16 @@ impl TransportActor {
             }
         }
 
-        if !deprecated_paths.is_empty()
-            && let Some(tunnel) = self.tunnel_table.get_mut(tunnel_id)
-        {
-            for dest_hash in &deprecated_paths {
-                tunnel.tunnel_paths.remove(dest_hash);
-                debug!(
-                    dest = hex::encode(dest_hash),
-                    tunnel = hex::encode(&tunnel_id[..16]),
-                    "removed deprecated path from tunnel"
-                );
+        if !deprecated_paths.is_empty() {
+            if let Some(tunnel) = self.tunnel_table.get_mut(tunnel_id) {
+                for dest_hash in &deprecated_paths {
+                    tunnel.tunnel_paths.remove(dest_hash);
+                    debug!(
+                        dest = hex::encode(dest_hash),
+                        tunnel = hex::encode(&tunnel_id[..16]),
+                        "removed deprecated path from tunnel"
+                    );
+                }
             }
         }
     }

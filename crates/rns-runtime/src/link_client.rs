@@ -231,10 +231,10 @@ async fn wait_for_pubkey(
 ) -> Result<[u8; 64], LinkClientError> {
     let fut = async {
         while let Some(ev) = rx.recv().await {
-            if ev.destination_hash == target_dest_hash
-                && let Some(pk) = ev.public_key
-            {
-                return Ok(pk);
+            if ev.destination_hash == target_dest_hash {
+                if let Some(pk) = ev.public_key {
+                    return Ok(pk);
+                }
             }
         }
         Err(LinkClientError::PubkeyNotDiscovered)

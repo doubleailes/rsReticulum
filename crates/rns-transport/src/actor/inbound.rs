@@ -14,19 +14,21 @@ impl TransportActor {
         // Strip the IFAC tag if the interface gates membership on one; packets
         // that fail verification are silently dropped so a misconfigured peer
         // can't leak into a closed access group.
-        let raw: bytes::Bytes = if let Some(entry) = self.interfaces.get(&packet.interface_id)
-            && let Some(ref ifac_key) = entry.ifac_key
-        {
-            let ifac_size = entry.ifac_size;
-            match crate::ifac::ifac_verify(&packet.raw, ifac_key, ifac_size) {
-                Some(stripped) => bytes::Bytes::from(stripped),
-                None => {
-                    trace!(
-                        interface_id = packet.interface_id,
-                        "IFAC verification failed, dropping packet"
-                    );
-                    return;
+        let raw: bytes::Bytes = if let Some(entry) = self.interfaces.get(&packet.interface_id) {
+            if let Some(ref ifac_key) = entry.ifac_key {
+                let ifac_size = entry.ifac_size;
+                match crate::ifac::ifac_verify(&packet.raw, ifac_key, ifac_size) {
+                    Some(stripped) => bytes::Bytes::from(stripped),
+                    None => {
+                        trace!(
+                            interface_id = packet.interface_id,
+                            "IFAC verification failed, dropping packet"
+                        );
+                        return;
+                    }
                 }
+            } else {
+                packet.raw.clone()
             }
         } else {
             packet.raw.clone()
@@ -174,16 +176,24 @@ impl TransportActor {
                 .interfaces
                 .get(&interface_id)
                 .is_some_and(|entry| entry.announce_rate_target.is_some());
-        if has_interface_rate_limit
-            && let Some(entry) = self.interfaces.get(&interface_id)
-            && let Some(target) = entry.announce_rate_target
-            && self.rate_table.check_interface_rate(
-                header.destination_hash,
-                target,
-                entry.announce_rate_grace.unwrap_or(0),
-                entry.announce_rate_penalty.unwrap_or(0.0),
-            )
-        {
+        let interface_rate_blocked = if has_interface_rate_limit {
+            self.interfaces
+                .get(&interface_id)
+                .and_then(|entry| {
+                    entry.announce_rate_target.map(|target| {
+                        self.rate_table.check_interface_rate(
+                            header.destination_hash,
+                            target,
+                            entry.announce_rate_grace.unwrap_or(0),
+                            entry.announce_rate_penalty.unwrap_or(0.0),
+                        )
+                    })
+                })
+                .unwrap_or(false)
+        } else {
+            false
+        };
+        if interface_rate_blocked {
             debug!(
                 dest = hex::encode(header.destination_hash),
                 interface = interface_id,
@@ -296,33 +306,33 @@ impl TransportActor {
         // Cancel our queued rebroadcast when a neighbor already carried it.
         // Same-hop neighbor rebroadcast counts toward the local cap;
         // strict hops+1 forward drops our queued copy outright.
-        if self.is_transport_enabled
-            && let Some(existing) = self.announce_table.get(&header.destination_hash)
-        {
-            let existing_hops = existing.hops;
-            let existing_retries = existing.retries;
-            if header.hops > 0 && header.hops - 1 == existing_hops && existing_retries > 0 {
-                let existing_local_rebroadcasts = existing.local_rebroadcasts + 1;
-                if existing_local_rebroadcasts >= LOCAL_REBROADCASTS_MAX {
-                    debug!(
-                        dest = hex::encode(header.destination_hash),
-                        "announce dedup: local rebroadcast limit reached, removing from table"
-                    );
-                    self.announce_table.remove(&header.destination_hash);
-                } else if let Some(ae) = self.announce_table.get_mut(&header.destination_hash) {
-                    ae.local_rebroadcasts = existing_local_rebroadcasts;
+        if self.is_transport_enabled {
+            if let Some(existing) = self.announce_table.get(&header.destination_hash) {
+                let existing_hops = existing.hops;
+                let existing_retries = existing.retries;
+                if header.hops > 0 && header.hops - 1 == existing_hops && existing_retries > 0 {
+                    let existing_local_rebroadcasts = existing.local_rebroadcasts + 1;
+                    if existing_local_rebroadcasts >= LOCAL_REBROADCASTS_MAX {
+                        debug!(
+                            dest = hex::encode(header.destination_hash),
+                            "announce dedup: local rebroadcast limit reached, removing from table"
+                        );
+                        self.announce_table.remove(&header.destination_hash);
+                    } else if let Some(ae) = self.announce_table.get_mut(&header.destination_hash) {
+                        ae.local_rebroadcasts = existing_local_rebroadcasts;
+                    }
                 }
-            }
-            if header.hops > 0 && header.hops - 1 == existing_hops + 1 && existing_retries > 0 {
-                let now = now_f64();
-                if let Some(ae) = self.announce_table.get(&header.destination_hash)
-                    && now < ae.retransmit_timeout
-                {
-                    debug!(
-                        dest = hex::encode(header.destination_hash),
-                        "announce dedup: passed on by another node, cancelling rebroadcast"
-                    );
-                    self.announce_table.remove(&header.destination_hash);
+                if header.hops > 0 && header.hops - 1 == existing_hops + 1 && existing_retries > 0 {
+                    let now = now_f64();
+                    if let Some(ae) = self.announce_table.get(&header.destination_hash) {
+                        if now < ae.retransmit_timeout {
+                            debug!(
+                                dest = hex::encode(header.destination_hash),
+                                "announce dedup: passed on by another node, cancelling rebroadcast"
+                            );
+                            self.announce_table.remove(&header.destination_hash);
+                        }
+                    }
                 }
             }
         }
@@ -468,15 +478,19 @@ impl TransportActor {
             }
         }
 
-        if is_from_local_client
-            && header.context == rns_wire::context::PacketContext::PathResponse
-            && let Some(waiting_interface) = self
+        if is_from_local_client && header.context == rns_wire::context::PacketContext::PathResponse
+        {
+            if let Some(waiting_interface) = self
                 .pending_local_path_requests
                 .remove(&header.destination_hash)
-        {
-            let response =
-                self.path_response_from_cached_announce(raw, header.destination_hash, header.hops);
-            self.send_to_interface(waiting_interface, &response);
+            {
+                let response = self.path_response_from_cached_announce(
+                    raw,
+                    header.destination_hash,
+                    header.hops,
+                );
+                self.send_to_interface(waiting_interface, &response);
+            }
         }
 
         self.send_announce_to_local_clients(
@@ -690,33 +704,33 @@ impl TransportActor {
             "data packet routing"
         );
         if self.local_destinations.contains(&header.destination_hash) {
-            if let Some(tx) = self.destination_channels.get(&header.destination_hash)
-                && let Err(e) = tx.try_send(crate::link_messages::DestinationEvent::InboundPacket {
+            if let Some(tx) = self.destination_channels.get(&header.destination_hash) {
+                if let Err(e) = tx.try_send(crate::link_messages::DestinationEvent::InboundPacket {
                     raw: raw.clone(),
                     interface_id,
-                })
-            {
-                self.channel_drops += 1;
-                warn!(dest = hex::encode(header.destination_hash), drops = self.channel_drops, err = %e,
-                    "failed to deliver InboundPacket to local destination (channel full)");
+                }) {
+                    self.channel_drops += 1;
+                    warn!(dest = hex::encode(header.destination_hash), drops = self.channel_drops, err = %e,
+                        "failed to deliver InboundPacket to local destination (channel full)");
+                }
             }
             return;
         }
 
-        if (self.is_transport_enabled || from_local_client || for_local_client)
-            && let Some(path) = self.path_table.get(&header.destination_hash)
-        {
-            let target_interface = path.interface_id;
-            let mut forwarded = raw.to_vec();
-            if forwarded.len() >= 2 {
-                forwarded[1] = header.hops.saturating_add(1);
+        if self.is_transport_enabled || from_local_client || for_local_client {
+            if let Some(path) = self.path_table.get(&header.destination_hash) {
+                let target_interface = path.interface_id;
+                let mut forwarded = raw.to_vec();
+                if forwarded.len() >= 2 {
+                    forwarded[1] = header.hops.saturating_add(1);
+                }
+                self.send_to_interface(target_interface, &forwarded);
+                trace!(
+                    dest = hex::encode(header.destination_hash),
+                    via_interface = target_interface,
+                    "data packet forwarded"
+                );
             }
-            self.send_to_interface(target_interface, &forwarded);
-            trace!(
-                dest = hex::encode(header.destination_hash),
-                via_interface = target_interface,
-                "data packet forwarded"
-            );
         }
     }
 
@@ -739,21 +753,22 @@ impl TransportActor {
         }
 
         if self.local_destinations.contains(&header.destination_hash) {
-            if let Some(tx) = self.destination_channels.get(&header.destination_hash)
-                && let Err(e) = tx.try_send(crate::link_messages::DestinationEvent::LinkRequest {
+            if let Some(tx) = self.destination_channels.get(&header.destination_hash) {
+                if let Err(e) = tx.try_send(crate::link_messages::DestinationEvent::LinkRequest {
                     raw: raw.clone(),
                     interface_id,
-                })
-            {
-                self.channel_drops += 1;
-                error!(dest = hex::encode(header.destination_hash), drops = self.channel_drops, err = %e,
-                    "failed to deliver LinkRequest; link establishment will fail");
+                }) {
+                    self.channel_drops += 1;
+                    error!(dest = hex::encode(header.destination_hash), drops = self.channel_drops, err = %e,
+                        "failed to deliver LinkRequest; link establishment will fail");
+                }
             }
             return;
         }
 
-        if (self.is_transport_enabled || from_local_client || for_local_client)
-            && let Some(path) = self.path_table.get(&header.destination_hash)
+        if let Some(path) = (self.is_transport_enabled || from_local_client || for_local_client)
+            .then(|| self.path_table.get(&header.destination_hash))
+            .flatten()
         {
             let target_interface = path.interface_id;
             let remaining_hops = path.hops;
@@ -868,66 +883,65 @@ impl TransportActor {
         // `hops+1 == remaining_hops` here and we bump hops on forward so the
         // next relay sees the expected value.
         if header.context == rns_wire::context::PacketContext::Lrproof {
-            if (self.is_transport_enabled || from_local_client || for_local_client_link)
-                && self.link_table.contains(&header.destination_hash)
-                && let Some(link_entry) = self.link_table.get(&header.destination_hash)
-            {
-                let expected_hops = link_entry.remaining_hops;
-                let outbound_interface = link_entry.interface_id;
-                let target_interface = link_entry.receiving_interface;
+            if self.is_transport_enabled || from_local_client || for_local_client_link {
+                if let Some(link_entry) = self.link_table.get(&header.destination_hash) {
+                    let expected_hops = link_entry.remaining_hops;
+                    let outbound_interface = link_entry.interface_id;
+                    let target_interface = link_entry.receiving_interface;
 
-                // Require that the proof arrived on the same interface we
-                // forwarded the request to; a mismatch is either a routing
-                // change or a spoof and must not be relayed.
-                let hops_match = if expected_hops == 0 {
-                    header.hops == 0
-                } else {
-                    header.hops.saturating_add(1) == expected_hops
-                };
-                if hops_match && _interface_id == outbound_interface {
-                    let mut forwarded = raw.to_vec();
-                    if forwarded.len() >= 2 {
-                        forwarded[1] = header.hops.saturating_add(1);
+                    // Require that the proof arrived on the same interface we
+                    // forwarded the request to; a mismatch is either a routing
+                    // change or a spoof and must not be relayed.
+                    let hops_match = if expected_hops == 0 {
+                        header.hops == 0
+                    } else {
+                        header.hops.saturating_add(1) == expected_hops
+                    };
+                    if hops_match && _interface_id == outbound_interface {
+                        let mut forwarded = raw.to_vec();
+                        if forwarded.len() >= 2 {
+                            forwarded[1] = header.hops.saturating_add(1);
+                        }
+                        if let Some(entry) = self.link_table.get_mut(&header.destination_hash) {
+                            entry.validated = true;
+                        }
+                        self.send_to_interface(target_interface, &forwarded);
+                        debug!(
+                            link_id = hex::encode(header.destination_hash),
+                            via_interface = target_interface,
+                            hops = header.hops + 1,
+                            "link proof (LRPROOF) routed via link table"
+                        );
+                        return;
+                    } else if !hops_match {
+                        warn!(
+                            link_id = hex::encode(header.destination_hash),
+                            expected_hops,
+                            actual_hops = header.hops,
+                            "link proof hop mismatch, not transporting (expected hops+1 == remaining_hops)"
+                        );
+                    } else {
+                        warn!(
+                            link_id = hex::encode(header.destination_hash),
+                            expected_interface = outbound_interface,
+                            actual_interface = _interface_id,
+                            "link proof received on wrong interface, not transporting"
+                        );
                     }
-                    if let Some(entry) = self.link_table.get_mut(&header.destination_hash) {
-                        entry.validated = true;
-                    }
-                    self.send_to_interface(target_interface, &forwarded);
-                    debug!(
-                        link_id = hex::encode(header.destination_hash),
-                        via_interface = target_interface,
-                        hops = header.hops + 1,
-                        "link proof (LRPROOF) routed via link table"
-                    );
-                    return;
-                } else if !hops_match {
-                    warn!(
-                        link_id = hex::encode(header.destination_hash),
-                        expected_hops,
-                        actual_hops = header.hops,
-                        "link proof hop mismatch, not transporting (expected hops+1 == remaining_hops)"
-                    );
-                } else {
-                    warn!(
-                        link_id = hex::encode(header.destination_hash),
-                        expected_interface = outbound_interface,
-                        actual_interface = _interface_id,
-                        "link proof received on wrong interface, not transporting"
-                    );
                 }
             }
 
             // Fall through to local-pending-link delivery when link_table
             // didn't claim the proof.
-            if let Some(tx) = self.destination_channels.get(&header.destination_hash)
-                && let Err(e) = tx.try_send(crate::link_messages::DestinationEvent::InboundPacket {
+            if let Some(tx) = self.destination_channels.get(&header.destination_hash) {
+                if let Err(e) = tx.try_send(crate::link_messages::DestinationEvent::InboundPacket {
                     raw: raw.clone(),
                     interface_id: _interface_id,
-                })
-            {
-                self.channel_drops += 1;
-                warn!(dest = hex::encode(header.destination_hash), drops = self.channel_drops, err = %e,
-                    "failed to deliver LRPROOF to local pending link (channel full)");
+                }) {
+                    self.channel_drops += 1;
+                    warn!(dest = hex::encode(header.destination_hash), drops = self.channel_drops, err = %e,
+                        "failed to deliver LRPROOF to local pending link (channel full)");
+                }
             }
             return;
         }
@@ -940,17 +954,26 @@ impl TransportActor {
         // entry records the outbound interface we forwarded on, enforce the
         // match — a proof on the wrong interface means a routing change or
         // a spoof. Older entries without that field route unconditionally.
-        if (self.is_transport_enabled || from_local_client || proof_for_local_client)
-            && let Some(reverse_entry) = self.reverse_table.remove(&header.destination_hash)
-        {
-            if let Some(expected_outbound) = reverse_entry.outbound_interface {
-                if _interface_id != expected_outbound {
-                    debug!(
-                        dest = hex::encode(header.destination_hash),
-                        expected = expected_outbound,
-                        actual = _interface_id,
-                        "proof arrived on wrong interface, not routing via reverse table"
-                    );
+        if self.is_transport_enabled || from_local_client || proof_for_local_client {
+            if let Some(reverse_entry) = self.reverse_table.remove(&header.destination_hash) {
+                if let Some(expected_outbound) = reverse_entry.outbound_interface {
+                    if _interface_id != expected_outbound {
+                        debug!(
+                            dest = hex::encode(header.destination_hash),
+                            expected = expected_outbound,
+                            actual = _interface_id,
+                            "proof arrived on wrong interface, not routing via reverse table"
+                        );
+                    } else {
+                        let target_interface = reverse_entry.receiving_interface;
+                        self.send_to_interface(target_interface, raw);
+                        trace!(
+                            dest = hex::encode(header.destination_hash),
+                            via_interface = target_interface,
+                            "proof routed via reverse table"
+                        );
+                        return;
+                    }
                 } else {
                     let target_interface = reverse_entry.receiving_interface;
                     self.send_to_interface(target_interface, raw);
@@ -961,27 +984,18 @@ impl TransportActor {
                     );
                     return;
                 }
-            } else {
-                let target_interface = reverse_entry.receiving_interface;
-                self.send_to_interface(target_interface, raw);
-                trace!(
-                    dest = hex::encode(header.destination_hash),
-                    via_interface = target_interface,
-                    "proof routed via reverse table"
-                );
-                return;
             }
         }
 
-        if let Some(tx) = self.destination_channels.get(&header.destination_hash)
-            && let Err(e) = tx.try_send(crate::link_messages::DestinationEvent::InboundPacket {
+        if let Some(tx) = self.destination_channels.get(&header.destination_hash) {
+            if let Err(e) = tx.try_send(crate::link_messages::DestinationEvent::InboundPacket {
                 raw: raw.clone(),
                 interface_id: _interface_id,
-            })
-        {
-            self.channel_drops += 1;
-            error!(dest = hex::encode(header.destination_hash), drops = self.channel_drops, err = %e,
-                "failed to deliver link proof to local link");
+            }) {
+                self.channel_drops += 1;
+                error!(dest = hex::encode(header.destination_hash), drops = self.channel_drops, err = %e,
+                    "failed to deliver link proof to local link");
+            }
         }
     }
 

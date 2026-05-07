@@ -126,12 +126,12 @@ pub fn anti_loop_record(map: &AntiLoopMap, source: String, payload: &[u8]) {
 /// false iff `dest` is one of the peers `payload` arrived from.
 pub fn anti_loop_should_send(map: &AntiLoopMap, dest: &str, payload: &[u8]) -> bool {
     let h = payload_hash(payload);
-    if let Ok(g) = map.lock()
-        && let Some((srcs, t)) = g.get(&h)
-        && t.elapsed() < ANTI_LOOP_TTL
-        && srcs.contains(dest)
-    {
-        return false;
+    if let Ok(g) = map.lock() {
+        if let Some((srcs, t)) = g.get(&h) {
+            if t.elapsed() < ANTI_LOOP_TTL && srcs.contains(dest) {
+                return false;
+            }
+        }
     }
     true
 }
@@ -143,10 +143,11 @@ pub fn anti_loop_prune(map: &AntiLoopMap) {
 }
 
 fn reconnect_in_backoff(map: &RecentlyDisconnected, identity_hex: &str) -> bool {
-    if let Ok(guard) = map.lock()
-        && let Some((when, fails)) = guard.get(identity_hex)
-    {
-        return *fails >= RECONNECT_BACKOFF_FAILURES && when.elapsed() < RECONNECT_BACKOFF_DURATION;
+    if let Ok(guard) = map.lock() {
+        if let Some((when, fails)) = guard.get(identity_hex) {
+            return *fails >= RECONNECT_BACKOFF_FAILURES
+                && when.elapsed() < RECONNECT_BACKOFF_DURATION;
+        }
     }
     false
 }
@@ -372,14 +373,15 @@ pub fn clear_event_dispatcher() {
 /// can happen during burst events. Log so we see it instead of state silently
 /// going stale (e.g. UI stuck "Scanning…" because a Connected was dropped).
 pub(crate) fn dispatch_event(event: BlePeerEvent) {
-    if let Ok(slot) = event_dispatch_slot().read()
-        && let Some(tx) = slot.as_ref()
-        && let Err(e) = tx.try_send(event)
-    {
-        tracing::warn!(
-            error = %e,
-            "BLE peer event dispatch dropped — relay channel full or closed"
-        );
+    if let Ok(slot) = event_dispatch_slot().read() {
+        if let Some(tx) = slot.as_ref() {
+            if let Err(e) = tx.try_send(event) {
+                tracing::warn!(
+                    error = %e,
+                    "BLE peer event dispatch dropped — relay channel full or closed"
+                );
+            }
+        }
     }
 }
 
@@ -1642,10 +1644,10 @@ mod apple_peripheral {
                     let char_uuid = uuid_for_characteristic(characteristic);
                     let all_gone = {
                         let mut chars_map = central_subscribed_chars_map().lock().unwrap();
-                        if let Some(u) = char_uuid
-                            && let Some(set) = chars_map.get_mut(&id)
-                        {
-                            set.remove(&u);
+                        if let Some(u) = char_uuid {
+                            if let Some(set) = chars_map.get_mut(&id) {
+                                set.remove(&u);
+                            }
                         }
                         let empty = chars_map.get(&id).is_none_or(|s| s.is_empty());
                         if empty {
@@ -1879,17 +1881,19 @@ mod apple_peripheral {
     /// replayed coherently without per-central addressing, so they don't.
     pub fn notify_tx(to_peer: Option<&str>, char_uuid: Uuid, data: &[u8]) -> bool {
         let ok = notify_tx_inner(to_peer, char_uuid, data);
-        if !ok && let Some(peer_id) = to_peer {
-            let mut q = pending_notify_queue().lock().unwrap();
-            if q.len() >= PENDING_NOTIFY_CAP {
-                q.pop_front();
+        if !ok {
+            if let Some(peer_id) = to_peer {
+                let mut q = pending_notify_queue().lock().unwrap();
+                if q.len() >= PENDING_NOTIFY_CAP {
+                    q.pop_front();
+                }
+                q.push_back(PendingNotify {
+                    peer: peer_id.to_string(),
+                    char_uuid,
+                    data: data.to_vec(),
+                });
+                tracing::warn!(%char_uuid, bytes = data.len(), peer = %peer_id, depth = q.len(), "Apple BLE notify_tx: queued for retry (radio queue full)");
             }
-            q.push_back(PendingNotify {
-                peer: peer_id.to_string(),
-                char_uuid,
-                data: data.to_vec(),
-            });
-            tracing::warn!(%char_uuid, bytes = data.len(), peer = %peer_id, depth = q.len(), "Apple BLE notify_tx: queued for retry (radio queue full)");
         }
         ok
     }
@@ -2362,10 +2366,10 @@ mod apple_peripheral {
 
         // OnceLock can't be cleared, but the inner Mutex<SendPtr> lets us
         // null the pointer so notify_tx + the next start cycle see no manager.
-        if let Some(lock) = MANAGER_PTR.get()
-            && let Ok(mut guard) = lock.lock()
-        {
-            *guard = SendPtr(std::ptr::null_mut());
+        if let Some(lock) = MANAGER_PTR.get() {
+            if let Ok(mut guard) = lock.lock() {
+                *guard = SendPtr(std::ptr::null_mut());
+            }
         }
 
         // Any queued retries reference characteristics we just released;
@@ -3498,21 +3502,21 @@ mod linux_peripheral {
                     let char_uuid = rx_uuid_for_trace;
                     let byte_len = new_value.len();
                     Box::pin(async move {
-                        if let Some(tx) = INBOUND_TX.get()
-                            && let Err(e) = tx.try_send((addr.clone(), new_value))
-                        {
-                            // Channel full — log so operators see the
-                            // backpressure signal instead of finding
-                            // silent fragment loss.
-                            tracing::warn!(
-                                target: "ble_trace",
-                                step = "linux_rx.channel_full",
-                                peer = %addr,
-                                %char_uuid,
-                                bytes = byte_len,
-                                err = %e,
-                                "Linux BLE RX: inbound channel full, dropping frame"
-                            );
+                        if let Some(tx) = INBOUND_TX.get() {
+                            if let Err(e) = tx.try_send((addr.clone(), new_value)) {
+                                // Channel full — log so operators see the
+                                // backpressure signal instead of finding
+                                // silent fragment loss.
+                                tracing::warn!(
+                                    target: "ble_trace",
+                                    step = "linux_rx.channel_full",
+                                    peer = %addr,
+                                    %char_uuid,
+                                    bytes = byte_len,
+                                    err = %e,
+                                    "Linux BLE RX: inbound channel full, dropping frame"
+                                );
+                            }
                         }
                         Ok(())
                     })
@@ -4533,7 +4537,7 @@ async fn peer_write_loop(
             }
         }
         tx_count += 1;
-        if tx_count.is_multiple_of(5) {
+        if tx_count % 5 == 0 {
             tracing::info!(
                 target: "ble_trace",
                 step = "peer.tx_progress",
@@ -4710,17 +4714,19 @@ pub async fn spawn_ble_peer_interface(
                         // caller-side deduplication. Cheap: parses header only,
                         // doesn't validate the announce
                         // signature (transport will do that).
-                        if !identity_announced.contains(&peer)
-                            && let Ok(parsed) = &parse_result
-                            && parsed.header.flags.packet_type
-                                == rns_wire::flags::PacketType::Announce
-                        {
-                            let id_hex = hex::encode(parsed.header.destination_hash);
-                            identity_announced.insert(peer.clone());
-                            dispatch_event(BlePeerEvent::IdentityResolved {
-                                address: peer.clone(),
-                                identity_hash: id_hex,
-                            });
+                        if !identity_announced.contains(&peer) {
+                            if let Ok(parsed) = &parse_result {
+                                if parsed.header.flags.packet_type
+                                    == rns_wire::flags::PacketType::Announce
+                                {
+                                    let id_hex = hex::encode(parsed.header.destination_hash);
+                                    identity_announced.insert(peer.clone());
+                                    dispatch_event(BlePeerEvent::IdentityResolved {
+                                        address: peer.clone(),
+                                        identity_hash: id_hex,
+                                    });
+                                }
+                            }
                         }
                         // Record this packet's source so the outbound
                         // fan-out can skip echoing it back to the same peer.
@@ -5374,7 +5380,7 @@ pub async fn spawn_ble_peer_interface(
                                                 break;
                                             }
                                             tx_count += 1;
-                                            if tx_count.is_multiple_of(5) {
+                                            if tx_count % 5 == 0 {
                                                 tracing::info!(
                                                     target: "ble_trace",
                                                     step = "peer.tx_progress",

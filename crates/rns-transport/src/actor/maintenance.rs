@@ -358,16 +358,18 @@ impl TransportActor {
         }
 
         for dest_hash in &voided_destinations {
-            if self.local_destinations.contains(dest_hash)
-                && let Some(tx) = self.destination_channels.get(dest_hash)
-                && let Err(e) =
-                    tx.try_send(crate::link_messages::DestinationEvent::AnnounceRequested(
-                        crate::link_messages::AnnounceRequest::normal(String::new()),
-                    ))
-            {
-                self.channel_drops += 1;
-                warn!(dest = hex::encode(dest_hash), drops = self.channel_drops, err = %e,
-                        "failed to send re-announce after tunnel void (channel full)");
+            if self.local_destinations.contains(dest_hash) {
+                if let Some(tx) = self.destination_channels.get(dest_hash) {
+                    if let Err(e) =
+                        tx.try_send(crate::link_messages::DestinationEvent::AnnounceRequested(
+                            crate::link_messages::AnnounceRequest::normal(String::new()),
+                        ))
+                    {
+                        self.channel_drops += 1;
+                        warn!(dest = hex::encode(dest_hash), drops = self.channel_drops, err = %e,
+                                "failed to send re-announce after tunnel void (channel full)");
+                    }
+                }
             }
         }
     }

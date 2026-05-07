@@ -155,33 +155,39 @@ impl ReticulumHandle {
     /// Python exposes, then fall back to the local actor for Rust-only/local
     /// diagnostics such as recent announce snapshots.
     pub async fn query_control(&self, query: TransportQuery) -> Option<TransportQueryResponse> {
-        if self.instance_mode == InstanceMode::Client
-            && let Some(request) = transport_query_to_rpc_request(&query)
-            && let Some(rpc_key) = self.config.rpc_key.as_deref()
-        {
-            let rpc_result = match self.config.shared_rpc_endpoint(&self.socket_base) {
-                SharedInstanceRpcEndpoint::Tcp(port) => {
-                    crate::rpc::connect_and_request(port, rpc_key, &request, Duration::from_secs(5))
-                        .await
-                }
-                SharedInstanceRpcEndpoint::Unix(socket_path) => {
-                    crate::rpc::connect_unix_and_request(
-                        &socket_path,
-                        rpc_key,
-                        &request,
-                        Duration::from_secs(5),
-                    )
-                    .await
-                }
-            };
-            match rpc_result {
-                Ok(response) => {
-                    if let Some(mapped) = rpc_response_to_transport_response(response) {
-                        return Some(mapped);
+        if self.instance_mode == InstanceMode::Client {
+            if let Some(request) = transport_query_to_rpc_request(&query) {
+                if let Some(rpc_key) = self.config.rpc_key.as_deref() {
+                    let rpc_result = match self.config.shared_rpc_endpoint(&self.socket_base) {
+                        SharedInstanceRpcEndpoint::Tcp(port) => {
+                            crate::rpc::connect_and_request(
+                                port,
+                                rpc_key,
+                                &request,
+                                Duration::from_secs(5),
+                            )
+                            .await
+                        }
+                        SharedInstanceRpcEndpoint::Unix(socket_path) => {
+                            crate::rpc::connect_unix_and_request(
+                                &socket_path,
+                                rpc_key,
+                                &request,
+                                Duration::from_secs(5),
+                            )
+                            .await
+                        }
+                    };
+                    match rpc_result {
+                        Ok(response) => {
+                            if let Some(mapped) = rpc_response_to_transport_response(response) {
+                                return Some(mapped);
+                            }
+                        }
+                        Err(e) => {
+                            tracing::debug!(error = %e, "shared instance control RPC failed; falling back to local actor");
+                        }
                     }
-                }
-                Err(e) => {
-                    tracing::debug!(error = %e, "shared instance control RPC failed; falling back to local actor");
                 }
             }
         }
@@ -707,10 +713,10 @@ fn parse_hash16_list(key: &str, list: Option<Vec<String>>) -> Result<Vec<[u8; 16
 }
 
 fn expand_home_path(path: &str) -> PathBuf {
-    if (path == "~" || path.starts_with("~/"))
-        && let Ok(home) = std::env::var("HOME")
-    {
-        return PathBuf::from(format!("{home}{}", &path[1..]));
+    if path == "~" || path.starts_with("~/") {
+        if let Ok(home) = std::env::var("HOME") {
+            return PathBuf::from(format!("{home}{}", &path[1..]));
+        }
     }
     PathBuf::from(path)
 }
@@ -803,10 +809,10 @@ impl ReticulumConfig {
             }
         }
 
-        if let Some(sec) = config.section("logging")
-            && let Some(level) = config_int("logging", sec, "loglevel")?
-        {
-            rc.loglevel = (level as i32).clamp(0, 7);
+        if let Some(sec) = config.section("logging") {
+            if let Some(level) = config_int("logging", sec, "loglevel")? {
+                rc.loglevel = (level as i32).clamp(0, 7);
+            }
         }
 
         Ok(rc)
@@ -879,10 +885,10 @@ pub async fn init(
     // Python defaults the local shared-instance RPC key to a hash of the
     // persistent transport identity, so CLI/control clients work without an
     // explicit config key as long as they share the same config directory.
-    if rc.rpc_key.is_none()
-        && let Some(private_key) = transport_identity.get_private_key()
-    {
-        rc.rpc_key = Some(crate::rpc::derive_rpc_key(&*private_key).to_vec());
+    if rc.rpc_key.is_none() {
+        if let Some(private_key) = transport_identity.get_private_key() {
+            rc.rpc_key = Some(crate::rpc::derive_rpc_key(&*private_key).to_vec());
+        }
     }
     let transport_identity = Arc::new(transport_identity);
 
@@ -1275,34 +1281,35 @@ pub async fn init(
     }
 
     // RPC server runs only on Shared; CLI clients authenticate against `rpc_key`.
-    if instance_mode == InstanceMode::Shared
-        && let Some(rpc_key) = rc.rpc_key.clone()
-    {
-        let rpc_tx = transport_tx.clone();
-        let rpc_shutdown = shutdown.clone();
-        if rc.shared_instance_type == SharedInstanceType::Unix {
-            let rpc_socket = shared_unix_rpc_socket_path(&rc.instance_name, &socket_base);
-            tokio::spawn(async move {
-                if let Err(e) = crate::rpc_server::run_unix_rpc_server(
-                    &rpc_socket,
-                    rpc_key,
-                    rpc_tx,
-                    rpc_shutdown,
-                )
-                .await
-                {
-                    tracing::warn!("Unix RPC server error: {}", e);
-                }
-            });
-        } else {
-            let rpc_port = rc.control_port;
-            tokio::spawn(async move {
-                if let Err(e) =
-                    crate::rpc_server::run_rpc_server(rpc_port, rpc_key, rpc_tx, rpc_shutdown).await
-                {
-                    tracing::warn!("RPC server error: {}", e);
-                }
-            });
+    if instance_mode == InstanceMode::Shared {
+        if let Some(rpc_key) = rc.rpc_key.clone() {
+            let rpc_tx = transport_tx.clone();
+            let rpc_shutdown = shutdown.clone();
+            if rc.shared_instance_type == SharedInstanceType::Unix {
+                let rpc_socket = shared_unix_rpc_socket_path(&rc.instance_name, &socket_base);
+                tokio::spawn(async move {
+                    if let Err(e) = crate::rpc_server::run_unix_rpc_server(
+                        &rpc_socket,
+                        rpc_key,
+                        rpc_tx,
+                        rpc_shutdown,
+                    )
+                    .await
+                    {
+                        tracing::warn!("Unix RPC server error: {}", e);
+                    }
+                });
+            } else {
+                let rpc_port = rc.control_port;
+                tokio::spawn(async move {
+                    if let Err(e) =
+                        crate::rpc_server::run_rpc_server(rpc_port, rpc_key, rpc_tx, rpc_shutdown)
+                            .await
+                    {
+                        tracing::warn!("RPC server error: {}", e);
+                    }
+                });
+            }
         }
     }
 
@@ -3026,15 +3033,18 @@ fn clean_cache(cache_dir: &Path) {
 
     if let Ok(entries) = std::fs::read_dir(cache_dir) {
         for entry in entries.flatten() {
-            if let Ok(metadata) = entry.metadata()
-                && metadata.is_file()
-                && let Ok(modified) = metadata.modified()
-                && let Ok(age) = now.duration_since(modified)
-                && age > cache_ttl
-            {
-                let path = entry.path();
-                if std::fs::remove_file(&path).is_ok() {
-                    tracing::trace!("cleaned cache entry: {}", path.display());
+            if let Ok(metadata) = entry.metadata() {
+                if metadata.is_file() {
+                    if let Ok(modified) = metadata.modified() {
+                        if let Ok(age) = now.duration_since(modified) {
+                            if age > cache_ttl {
+                                let path = entry.path();
+                                if std::fs::remove_file(&path).is_ok() {
+                                    tracing::trace!("cleaned cache entry: {}", path.display());
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -3042,7 +3052,7 @@ fn clean_cache(cache_dir: &Path) {
 }
 
 fn hex_decode(s: &str) -> Option<Vec<u8>> {
-    if !s.len().is_multiple_of(2) {
+    if s.len() % 2 != 0 {
         return None;
     }
     (0..s.len())

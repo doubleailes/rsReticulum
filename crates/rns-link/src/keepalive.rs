@@ -112,20 +112,20 @@ impl KeepaliveState {
     /// link that just came up isn't immediately flagged stale on a quiet channel.
     pub fn is_stale(&self) -> bool {
         let mut latest = self.last_inbound;
-        if let Some(proof) = self.last_proof
-            && proof > latest
-        {
-            latest = proof;
+        if let Some(proof) = self.last_proof {
+            if proof > latest {
+                latest = proof;
+            }
         }
-        if let Some(outbound) = self.last_outbound
-            && outbound > latest
-        {
-            latest = outbound;
+        if let Some(outbound) = self.last_outbound {
+            if outbound > latest {
+                latest = outbound;
+            }
         }
-        if let Some(activated) = self.activated_at
-            && activated > latest
-        {
-            latest = activated;
+        if let Some(activated) = self.activated_at {
+            if activated > latest {
+                latest = activated;
+            }
         }
         latest.elapsed() >= self.stale_time
     }

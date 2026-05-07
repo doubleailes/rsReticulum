@@ -865,21 +865,21 @@ fn validate_rnode_multi_subinterface(
             message: format!("{} is outside 5..=8", sub.coding_rate),
         });
     }
-    if let Some(v) = sub.st_alock
-        && !(0.0..=100.0).contains(&v)
-    {
-        return Err(InterfaceFactoryError::InvalidValue {
-            field: format!("{}.airtime_limit_short", sub.name),
-            message: format!("{v} is outside 0..=100 percent"),
-        });
+    if let Some(v) = sub.st_alock {
+        if !(0.0..=100.0).contains(&v) {
+            return Err(InterfaceFactoryError::InvalidValue {
+                field: format!("{}.airtime_limit_short", sub.name),
+                message: format!("{v} is outside 0..=100 percent"),
+            });
+        }
     }
-    if let Some(v) = sub.lt_alock
-        && !(0.0..=100.0).contains(&v)
-    {
-        return Err(InterfaceFactoryError::InvalidValue {
-            field: format!("{}.airtime_limit_long", sub.name),
-            message: format!("{v} is outside 0..=100 percent"),
-        });
+    if let Some(v) = sub.lt_alock {
+        if !(0.0..=100.0).contains(&v) {
+            return Err(InterfaceFactoryError::InvalidValue {
+                field: format!("{}.airtime_limit_long", sub.name),
+                message: format!("{v} is outside 0..=100 percent"),
+            });
+        }
     }
     if sub.frequency == 0 {
         return Err(InterfaceFactoryError::InvalidValue {
