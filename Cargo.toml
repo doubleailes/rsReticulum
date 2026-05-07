@@ -51,9 +51,6 @@ bzip2 = "0.5"
 # Serial
 serialport = "4"
 
-# BLE
-btleplug = "0.11"
-
 # Networking
 # AutoInterface requires fe80::/10 discovery addresses. if-addrs filters them
 # unless this feature is enabled, which leaves Linux/Windows with no adopted NICs.
