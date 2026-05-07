@@ -8,6 +8,15 @@ use cbc::cipher::{BlockDecryptMut, BlockEncryptMut, KeyIvInit};
 use cbc::{Decryptor, Encryptor};
 use thiserror::Error;
 
+const AES_BLOCK_SIZE: usize = 16;
+
+/// Rust 1.85-compatible block alignment check. Newer Clippy suggests
+/// `usize::is_multiple_of`, but that API is not available on our MSRV.
+#[inline]
+pub(crate) fn is_nonzero_block_aligned(len: usize) -> bool {
+    len != 0 && len % AES_BLOCK_SIZE == 0
+}
+
 /// Errors surfaced by [`encrypt`] and [`decrypt`].
 #[derive(Debug, Error)]
 pub enum AesCbcError {
@@ -31,10 +40,10 @@ pub enum AesCbcError {
 /// AES-CBC encrypt. Caller pads; `plaintext.len()` must be a non-zero
 /// multiple of 16. IV must be 16 bytes.
 pub fn encrypt(key: &[u8], iv: &[u8], plaintext: &[u8]) -> Result<Vec<u8>, AesCbcError> {
-    if iv.len() != 16 {
+    if iv.len() != AES_BLOCK_SIZE {
         return Err(AesCbcError::InvalidIvLength(iv.len()));
     }
-    if plaintext.is_empty() || plaintext.len() % 16 != 0 {
+    if !is_nonzero_block_aligned(plaintext.len()) {
         return Err(AesCbcError::NotBlockAligned);
     }
 
@@ -65,10 +74,10 @@ pub fn encrypt(key: &[u8], iv: &[u8], plaintext: &[u8]) -> Result<Vec<u8>, AesCb
 
 /// AES-CBC decrypt. Output is still PKCS7-padded; caller strips it.
 pub fn decrypt(key: &[u8], iv: &[u8], ciphertext: &[u8]) -> Result<Vec<u8>, AesCbcError> {
-    if iv.len() != 16 {
+    if iv.len() != AES_BLOCK_SIZE {
         return Err(AesCbcError::InvalidIvLength(iv.len()));
     }
-    if ciphertext.is_empty() || ciphertext.len() % 16 != 0 {
+    if !is_nonzero_block_aligned(ciphertext.len()) {
         return Err(AesCbcError::NotBlockAligned);
     }
 

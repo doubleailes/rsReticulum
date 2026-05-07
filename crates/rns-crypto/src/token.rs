@@ -85,7 +85,7 @@ pub fn decrypt(token: &[u8], key: &[u8]) -> Result<Vec<u8>, TokenError> {
     let iv = &signed_parts[..16];
     let ciphertext = &signed_parts[16..];
 
-    if ciphertext.is_empty() || ciphertext.len() % 16 != 0 {
+    if !aes_cbc::is_nonzero_block_aligned(ciphertext.len()) {
         return Err(TokenError::AuthenticationFailed);
     }
 
