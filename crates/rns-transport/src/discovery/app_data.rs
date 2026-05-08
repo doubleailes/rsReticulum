@@ -22,7 +22,7 @@ use std::io::Cursor;
 use rmpv::Value;
 use thiserror::Error;
 
-use super::constants::{FLAG_ENCRYPTED, STAMP_SIZE, key};
+use super::constants::{DISCOVERABLE_INTERFACE_TYPES, FLAG_ENCRYPTED, STAMP_SIZE, key};
 
 /// A decoded discovery info payload. Mirrors the Python `info` dict.
 ///
@@ -77,6 +77,10 @@ pub enum AppDataError {
     Msgpack(String),
     #[error("top-level msgpack value must be a map")]
     NotAMap,
+    #[error("unsupported interface type: {0}")]
+    UnsupportedInterfaceType(String),
+    #[error("invalid reachable_on value: {0}")]
+    InvalidReachableOn(String),
 }
 
 /// Encoded payload — separates the stamp from the raw msgpack map so the
@@ -297,7 +301,52 @@ pub fn decode_info(packed: &[u8]) -> Result<DiscoveryInfo, AppDataError> {
     if !saw_transport_id {
         return Err(AppDataError::MissingKey(key::TRANSPORT_ID));
     }
+    info.name = sanitize_name(&info.name);
+    if !DISCOVERABLE_INTERFACE_TYPES.contains(&info.interface_type.as_str()) {
+        return Err(AppDataError::UnsupportedInterfaceType(info.interface_type));
+    }
+    if let Some(reachable_on) = info.reachable_on.as_deref() {
+        if !valid_reachable_on(reachable_on) {
+            return Err(AppDataError::InvalidReachableOn(reachable_on.to_string()));
+        }
+    }
     Ok(info)
+}
+
+pub fn sanitize_name(name: &str) -> String {
+    let ascii = name
+        .chars()
+        .filter(|c| c.is_ascii() && !c.is_ascii_control())
+        .collect::<String>();
+    let collapsed = ascii.split_whitespace().collect::<Vec<_>>().join(" ");
+    let trimmed = collapsed.trim();
+    let end = trimmed
+        .char_indices()
+        .rev()
+        .find(|(_, c)| c.is_ascii_alphanumeric() || *c == ')')
+        .map(|(idx, c)| idx + c.len_utf8())
+        .unwrap_or(0);
+    trimmed[..end].to_string()
+}
+
+fn valid_reachable_on(value: &str) -> bool {
+    let value = value.trim();
+    if value.is_empty() {
+        return false;
+    }
+    if value.parse::<std::net::IpAddr>().is_ok() {
+        return true;
+    }
+    value.len() <= 253
+        && value.split('.').all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && label
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+        })
 }
 
 fn value_as_u8(v: &Value) -> Option<u8> {
@@ -399,6 +448,37 @@ mod tests {
         let encoded = encode_info(&info).expect("encode");
         let decoded = decode_info(&encoded.packed).expect("decode");
         assert_eq!(decoded, info);
+    }
+
+    #[test]
+    fn decode_sanitizes_interface_name() {
+        let mut info = sample_backbone();
+        info.name = "  Relay\tΔ / !!  ".into();
+        let encoded = encode_info(&info).expect("encode");
+        let decoded = decode_info(&encoded.packed).expect("decode");
+        assert_eq!(decoded.name, "Relay");
+    }
+
+    #[test]
+    fn decode_rejects_unsupported_interface_type() {
+        let mut info = sample_backbone();
+        info.interface_type = "PipeInterface".into();
+        let encoded = encode_info(&info).expect("encode");
+        assert!(matches!(
+            decode_info(&encoded.packed),
+            Err(AppDataError::UnsupportedInterfaceType(_))
+        ));
+    }
+
+    #[test]
+    fn decode_rejects_invalid_reachable_on() {
+        let mut info = sample_backbone();
+        info.reachable_on = Some("bad host!".into());
+        let encoded = encode_info(&info).expect("encode");
+        assert!(matches!(
+            decode_info(&encoded.packed),
+            Err(AppDataError::InvalidReachableOn(_))
+        ));
     }
 
     #[test]

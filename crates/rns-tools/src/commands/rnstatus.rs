@@ -27,7 +27,7 @@ const DEFAULT_TIMEOUT_SECS: u64 = 5;
 const REMOTE_TIMEOUT_SECS: u64 = 30;
 const REMOTE_HOPS: u8 = 8;
 const MGMT_APP: &str = "rnstransport.remote.management";
-const RETICULUM_COMPAT_VERSION: &str = "1.2.2";
+const RETICULUM_COMPAT_VERSION: &str = "1.2.4";
 
 #[derive(Parser)]
 #[command(
@@ -458,9 +458,13 @@ fn print_local_human(stats: &[rpc::InterfaceStatEntry], link_count: Option<i64>,
                 if entry.incoming_announce_frequency > 0.0
                     || entry.outgoing_announce_frequency > 0.0
                 {
-                    println!(
-                        "    Announces: {:.3}/s rx / {:.3}/s tx",
-                        entry.incoming_announce_frequency, entry.outgoing_announce_frequency
+                    print_announce_frequency(
+                        entry.incoming_announce_frequency,
+                        entry.outgoing_announce_frequency,
+                        entry.clients,
+                        entry.announce_rate_target,
+                        entry.announce_rate_penalty,
+                        entry.announce_rate_grace,
                     );
                 }
             }
@@ -510,7 +514,7 @@ fn print_local_json(stats: &[rpc::InterfaceStatEntry], link_count: Option<i64>, 
             print!(",");
         }
         print!(
-            "{{\"name\":{},\"online\":{},\"mode\":{},\"role\":{},\"bitrate\":{},\"mtu\":{},\"rxb\":{},\"txb\":{},\"rxs\":{},\"txs\":{},\"announce_queue\":{},\"held_announces\":{},\"incoming_announce_frequency\":{},\"outgoing_announce_frequency\":{},\"tx_drops\":{}}}",
+            "{{\"name\":{},\"online\":{},\"mode\":{},\"role\":{},\"bitrate\":{},\"mtu\":{},\"rxb\":{},\"txb\":{},\"rxs\":{},\"txs\":{},\"announce_queue\":{},\"held_announces\":{},\"incoming_announce_frequency\":{},\"outgoing_announce_frequency\":{},\"clients\":{},\"announce_rate_target\":{},\"announce_rate_grace\":{},\"announce_rate_penalty\":{},\"tx_drops\":{}}}",
             json_str(&e.name),
             e.online,
             json_str(&e.mode),
@@ -527,6 +531,10 @@ fn print_local_json(stats: &[rpc::InterfaceStatEntry], link_count: Option<i64>, 
             e.held_announces,
             e.incoming_announce_frequency,
             e.outgoing_announce_frequency,
+            opt_u64_json(e.clients),
+            opt_f64_json(e.announce_rate_target),
+            opt_u32_json(e.announce_rate_grace),
+            opt_f64_json(e.announce_rate_penalty),
             e.tx_drops,
         );
     }
@@ -895,6 +903,9 @@ struct RemoteInterface {
     incoming_announce_frequency: f64,
     outgoing_announce_frequency: f64,
     clients: Option<u64>,
+    announce_rate_target: Option<f64>,
+    announce_rate_grace: Option<u32>,
+    announce_rate_penalty: Option<f64>,
 }
 
 impl RemoteInterface {
@@ -983,7 +994,7 @@ fn print_remote_status(bytes: &[u8], args: &Args) -> ExitCode {
                 print!(",");
             }
             print!(
-                "{{\"name\":{},\"online\":{},\"mode\":{},\"bitrate\":{},\"rxb\":{},\"txb\":{},\"rxs\":{},\"txs\":{},\"announce_queue\":{},\"held_announces\":{},\"incoming_announce_frequency\":{},\"outgoing_announce_frequency\":{}}}",
+                "{{\"name\":{},\"online\":{},\"mode\":{},\"bitrate\":{},\"rxb\":{},\"txb\":{},\"rxs\":{},\"txs\":{},\"announce_queue\":{},\"held_announces\":{},\"incoming_announce_frequency\":{},\"outgoing_announce_frequency\":{},\"clients\":{},\"announce_rate_target\":{},\"announce_rate_grace\":{},\"announce_rate_penalty\":{}}}",
                 json_str(&iface.name),
                 iface.online,
                 iface.mode,
@@ -999,6 +1010,10 @@ fn print_remote_status(bytes: &[u8], args: &Args) -> ExitCode {
                 iface.held_announces,
                 iface.incoming_announce_frequency,
                 iface.outgoing_announce_frequency,
+                opt_u64_json(iface.clients),
+                opt_f64_json(iface.announce_rate_target),
+                opt_u32_json(iface.announce_rate_grace),
+                opt_f64_json(iface.announce_rate_penalty),
             );
         }
         print!("]");
@@ -1044,9 +1059,13 @@ fn print_remote_status(bytes: &[u8], args: &Args) -> ExitCode {
                 if iface.incoming_announce_frequency > 0.0
                     || iface.outgoing_announce_frequency > 0.0
                 {
-                    println!(
-                        "    Announces: {:.3}/s rx / {:.3}/s tx",
-                        iface.incoming_announce_frequency, iface.outgoing_announce_frequency
+                    print_announce_frequency(
+                        iface.incoming_announce_frequency,
+                        iface.outgoing_announce_frequency,
+                        iface.clients,
+                        iface.announce_rate_target,
+                        iface.announce_rate_penalty,
+                        iface.announce_rate_grace,
                     );
                 }
             }
@@ -1100,6 +1119,10 @@ fn remote_interface_from_map(m: &[(rmpv::Value, rmpv::Value)]) -> RemoteInterfac
         outgoing_announce_frequency: map_f64_or_u64(m, "outgoing_announce_frequency")
             .unwrap_or(0.0),
         clients: map_u64(m, "clients"),
+        announce_rate_target: map_f64_or_u64(m, "announce_rate_target"),
+        announce_rate_grace: map_u64(m, "announce_rate_grace")
+            .map(|v| v.min(u32::MAX as u64) as u32),
+        announce_rate_penalty: map_f64_or_u64(m, "announce_rate_penalty"),
     }
 }
 
@@ -1125,6 +1148,68 @@ fn map_bool(map: &[(rmpv::Value, rmpv::Value)], key: &str) -> Option<bool> {
     map.iter()
         .find(|(k, _)| k.as_str() == Some(key))
         .and_then(|(_, v)| v.as_bool())
+}
+
+fn print_announce_frequency(
+    incoming: f64,
+    outgoing: f64,
+    clients: Option<u64>,
+    target: Option<f64>,
+    penalty: Option<f64>,
+    grace: Option<u32>,
+) {
+    let outgoing_text = format!("{}↑", format::pretty_frequency(outgoing));
+    let incoming_text = format!("{}↓", format::pretty_frequency(incoming));
+    let per_client = clients
+        .filter(|clients| *clients > 0)
+        .map(|clients| format!(" {}/c", format::pretty_frequency(outgoing / clients as f64)))
+        .unwrap_or_default();
+    let limits = announce_rate_limits_text(target, penalty, grace);
+    println!("    Announces: {outgoing_text}{per_client}");
+    println!("               {incoming_text} {limits}");
+}
+
+fn announce_rate_limits_text(
+    target: Option<f64>,
+    penalty: Option<f64>,
+    grace: Option<u32>,
+) -> String {
+    match (target, penalty, grace) {
+        (Some(t), Some(p), Some(g)) if t > 0.0 => {
+            format!(
+                "(t:{}/p:{}/g:{g})",
+                format::pretty_time(t),
+                format::pretty_time(p)
+            )
+        }
+        (Some(t), Some(p), _) if t > 0.0 => {
+            format!(
+                "(t:{}/p:{})",
+                format::pretty_time(t),
+                format::pretty_time(p)
+            )
+        }
+        (Some(t), _, _) if t > 0.0 => format!("(t:{})", format::pretty_time(t)),
+        _ => String::new(),
+    }
+}
+
+fn opt_u64_json(value: Option<u64>) -> String {
+    value
+        .map(|v| v.to_string())
+        .unwrap_or_else(|| "null".to_string())
+}
+
+fn opt_u32_json(value: Option<u32>) -> String {
+    value
+        .map(|v| v.to_string())
+        .unwrap_or_else(|| "null".to_string())
+}
+
+fn opt_f64_json(value: Option<f64>) -> String {
+    value
+        .map(|v| v.to_string())
+        .unwrap_or_else(|| "null".to_string())
 }
 
 fn remote_err(e: &LinkClientError) -> String {

@@ -44,6 +44,11 @@ pub enum InterfaceMode {
 pub const MODE_FULL: InterfaceMode = InterfaceMode::Full;
 pub const MODE_POINT_TO_POINT: InterfaceMode = InterfaceMode::PointToPoint;
 
+/// Python `Interface.DEFAULT_AR_*` announce-rate defaults.
+pub const DEFAULT_AR_TARGET: u64 = 3600;
+pub const DEFAULT_AR_PENALTY: u64 = 0;
+pub const DEFAULT_AR_GRACE: u32 = 5;
+
 /// Modes for which a Transport Node actively discovers paths.
 pub const DISCOVER_PATHS_FOR: &[InterfaceMode] = &[
     InterfaceMode::AccessPoint,
@@ -149,21 +154,21 @@ pub fn optimise_mtu(bitrate: u64) -> Option<u32> {
 pub const NAME_HASH_LENGTH: usize = 10;
 
 // Ingress control constants — must match Reticulum reference.
-pub const IA_FREQ_SAMPLES: usize = 6;
-pub const OA_FREQ_SAMPLES: usize = 6;
+pub const IA_FREQ_SAMPLES: usize = 128;
+pub const OA_FREQ_SAMPLES: usize = 128;
 pub const MAX_HELD_ANNOUNCES: usize = 256;
 /// Duration a new interface stays in "new" state (seconds).
 pub const IC_NEW_TIME: f64 = 7200.0;
 /// Burst threshold for new interfaces (announces/sec).
-pub const IC_BURST_FREQ_NEW: f64 = 3.5;
+pub const IC_BURST_FREQ_NEW: f64 = 6.0;
 /// Burst threshold for established interfaces (announces/sec).
-pub const IC_BURST_FREQ: f64 = 12.0;
+pub const IC_BURST_FREQ: f64 = 35.0;
 /// Burst detection window duration (seconds).
 pub const IC_BURST_HOLD: f64 = 60.0;
 /// Penalty duration after a detected burst (seconds).
-pub const IC_BURST_PENALTY: f64 = 300.0;
+pub const IC_BURST_PENALTY: f64 = 15.0;
 /// Interval between released held announces (seconds).
-pub const IC_HELD_RELEASE_INTERVAL: f64 = 30.0;
+pub const IC_HELD_RELEASE_INTERVAL: f64 = 2.0;
 
 #[derive(Debug, thiserror::Error)]
 pub enum InterfaceError {
@@ -234,11 +239,13 @@ mod tests {
 
     #[test]
     fn test_ingress_control_constants() {
-        assert_eq!(IC_BURST_FREQ, 12.0);
-        assert_eq!(IC_BURST_FREQ_NEW, 3.5);
+        assert_eq!(IA_FREQ_SAMPLES, 128);
+        assert_eq!(OA_FREQ_SAMPLES, 128);
+        assert_eq!(IC_BURST_FREQ, 35.0);
+        assert_eq!(IC_BURST_FREQ_NEW, 6.0);
         assert_eq!(IC_BURST_HOLD, 60.0);
-        assert_eq!(IC_BURST_PENALTY, 300.0);
+        assert_eq!(IC_BURST_PENALTY, 15.0);
         assert_eq!(IC_NEW_TIME, 7200.0);
-        assert_eq!(IC_HELD_RELEASE_INTERVAL, 30.0);
+        assert_eq!(IC_HELD_RELEASE_INTERVAL, 2.0);
     }
 }

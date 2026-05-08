@@ -537,6 +537,9 @@ pub struct ReticulumConfig {
     /// Python `force_shared_instance_bitrate` (bps). Caps announce rate /
     /// token bucket regardless of real link bitrate.
     pub force_shared_instance_bitrate: Option<u64>,
+    pub default_ar_target: Option<u64>,
+    pub default_ar_penalty: Option<u64>,
+    pub default_ar_grace: Option<u32>,
     pub loglevel: i32,
 
     /// Optional "network identity" file: discovery announce app_data is
@@ -582,6 +585,9 @@ impl Default for ReticulumConfig {
             remote_management_allowed: Vec::new(),
             rpc_key: None,
             force_shared_instance_bitrate: None,
+            default_ar_target: None,
+            default_ar_penalty: None,
+            default_ar_grace: None,
             loglevel: 4,
             network_identity_path: None,
             discover_interfaces: false,
@@ -768,6 +774,15 @@ impl ReticulumConfig {
             }
             rc.force_shared_instance_bitrate =
                 config_uint("reticulum", sec, "force_shared_instance_bitrate")?;
+            if let Some(v) = config_uint("reticulum", sec, "default_ar_target")? {
+                rc.default_ar_target = (v > 0).then_some(v);
+            }
+            if let Some(v) = config_uint("reticulum", sec, "default_ar_penalty")? {
+                rc.default_ar_penalty = Some(v);
+            }
+            if let Some(v) = config_uint("reticulum", sec, "default_ar_grace")? {
+                rc.default_ar_grace = Some(v.min(u32::MAX as u64) as u32);
+            }
 
             if let Some(list) = sec.get_list("remote_management_allowed") {
                 rc.remote_management_allowed =
@@ -1169,7 +1184,8 @@ pub async fn init(
     if instance_mode != InstanceMode::Client {
         for iface_config in &interfaces {
             let iface_id = next_id(&id_gen);
-            let post_init = get_post_init_for_config(&config, iface_config);
+            let mut post_init = get_post_init_for_config(&config, iface_config);
+            apply_default_announce_rate(&mut post_init, &rc);
             let discovery_config = discovery_config_for_interface(
                 &config,
                 iface_config,
@@ -1572,6 +1588,36 @@ fn get_post_init_for_config(
     }
     interface_factory::InterfacePostInit::from_section(&crate::config::ConfigSection::new())
         .with_default_ifac_size(default_ifac_size)
+}
+
+fn apply_default_announce_rate(
+    post_init: &mut interface_factory::InterfacePostInit,
+    config: &ReticulumConfig,
+) {
+    if !config.enable_transport {
+        return;
+    }
+    if post_init.announce_rate_target.is_none() {
+        post_init.announce_rate_target = Some(
+            config
+                .default_ar_target
+                .unwrap_or(rns_interface::traits::DEFAULT_AR_TARGET),
+        );
+    }
+    if post_init.announce_rate_penalty.is_none() {
+        post_init.announce_rate_penalty = Some(
+            config
+                .default_ar_penalty
+                .unwrap_or(rns_interface::traits::DEFAULT_AR_PENALTY),
+        );
+    }
+    if post_init.announce_rate_grace.is_none() {
+        post_init.announce_rate_grace = Some(
+            config
+                .default_ar_grace
+                .unwrap_or(rns_interface::traits::DEFAULT_AR_GRACE),
+        );
+    }
 }
 
 fn interface_config_name(iface_config: &interface_factory::InterfaceConfig) -> &str {
@@ -1991,6 +2037,10 @@ async fn maybe_autoconnect_discovered(handle: &ReticulumHandle, record: Discover
     let Some(host) = record.info.reachable_on.clone() else {
         return;
     };
+    if is_yggdrasil_ipv6(&host) {
+        tracing::debug!(host = %host, "skipping Yggdrasil IPv6 discovery autoconnect");
+        return;
+    }
     let Some(port) = record.info.port else {
         return;
     };
@@ -2045,6 +2095,7 @@ async fn spawn_discovered_backbone_client(
 
     let mut post_init = interface_factory::InterfacePostInit::from_section(&ConfigSection::new())
         .with_default_ifac_size(16);
+    apply_default_announce_rate(&mut post_init, &handle.config);
     post_init.ifac_network_name = record.info.ifac_netname.clone();
     post_init.ifac_passphrase = record.info.ifac_netkey.clone();
     let ifac_key = derive_ifac_key_from_post_init(&post_init);
@@ -2052,6 +2103,14 @@ async fn spawn_discovered_backbone_client(
         .await;
     tracing::info!(name = %name, id, endpoint = %format!("{host}:{port}"), "auto-connected discovered interface");
     Ok(id)
+}
+
+fn is_yggdrasil_ipv6(host: &str) -> bool {
+    let Ok(std::net::IpAddr::V6(addr)) = host.parse() else {
+        return false;
+    };
+    let first = addr.octets()[0];
+    first == 0x02 || first == 0x03
 }
 
 async fn maybe_teardown_bootstrap_interfaces(handle: &ReticulumHandle) {
@@ -3311,6 +3370,9 @@ loglevel = 7
                      autoconnect_discovered_interfaces = 2\n\
                      required_discovery_value = 16\n\
                      interface_discovery_sources = 521c87a83afb8f29e4455e77930b973b\n\
+                     default_ar_target = 7200\n\
+                     default_ar_penalty = 30\n\
+                     default_ar_grace = 9\n\
                      publish_blackhole = Yes\n\
                      network_identity = /opt/rnsd/network.identity\n";
         let config = Config::parse(input).unwrap();
@@ -3319,6 +3381,9 @@ loglevel = 7
         assert_eq!(rc.autoconnect_discovered_interfaces, 2);
         assert_eq!(rc.discover_interfaces_required_value, 16);
         assert_eq!(rc.interface_discovery_sources.len(), 1);
+        assert_eq!(rc.default_ar_target, Some(7200));
+        assert_eq!(rc.default_ar_penalty, Some(30));
+        assert_eq!(rc.default_ar_grace, Some(9));
         assert!(rc.publish_blackhole);
         assert_eq!(
             rc.network_identity_path,
@@ -3344,6 +3409,38 @@ loglevel = 7
                 Some(PathBuf::from(home).join("network.identity"))
             );
         }
+    }
+
+    #[test]
+    fn default_announce_rate_applies_only_when_transport_enabled() {
+        let mut post_init =
+            interface_factory::InterfacePostInit::from_section(&ConfigSection::new());
+        let mut rc = ReticulumConfig {
+            enable_transport: false,
+            default_ar_target: Some(7200),
+            default_ar_penalty: Some(30),
+            default_ar_grace: Some(9),
+            ..ReticulumConfig::default()
+        };
+
+        apply_default_announce_rate(&mut post_init, &rc);
+        assert_eq!(post_init.announce_rate_target, None);
+        assert_eq!(post_init.announce_rate_penalty, None);
+        assert_eq!(post_init.announce_rate_grace, None);
+
+        rc.enable_transport = true;
+        apply_default_announce_rate(&mut post_init, &rc);
+        assert_eq!(post_init.announce_rate_target, Some(7200));
+        assert_eq!(post_init.announce_rate_penalty, Some(30));
+        assert_eq!(post_init.announce_rate_grace, Some(9));
+    }
+
+    #[test]
+    fn yggdrasil_ipv6_detection_matches_200_prefix() {
+        assert!(is_yggdrasil_ipv6("200::1"));
+        assert!(is_yggdrasil_ipv6("3ff:ffff::1"));
+        assert!(!is_yggdrasil_ipv6("400::1"));
+        assert!(!is_yggdrasil_ipv6("relay.example.org"));
     }
 
     #[test]

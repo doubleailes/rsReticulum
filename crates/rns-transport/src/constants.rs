@@ -116,19 +116,19 @@ pub const ANNOUNCE_CAP: f64 = 0.02;
 pub const MAX_HELD_ANNOUNCES: usize = 256;
 
 /// Held announce release interval (seconds).
-/// Matches Python 1.1.6 `Interface.IC_HELD_RELEASE_INTERVAL = 2`.
+/// Matches Python 1.2.4 `Interface.IC_HELD_RELEASE_INTERVAL = 2`.
 pub const IC_HELD_RELEASE_INTERVAL: f64 = 2.0;
 
 /// Incoming announce frequency window samples.
-/// Matches Python 1.1.6 `Interface.IA_FREQ_SAMPLES = 128`.
+/// Matches Python 1.2.4 `Interface.IA_FREQ_SAMPLES = 128`.
 pub const IA_FREQ_SAMPLES: usize = 128;
 
 /// Outgoing announce frequency window samples.
-/// Matches Python 1.1.6 `Interface.OA_FREQ_SAMPLES = 128`.
+/// Matches Python 1.2.4 `Interface.OA_FREQ_SAMPLES = 128`.
 pub const OA_FREQ_SAMPLES: usize = 128;
 
 /// Minimum samples required before frequency is considered defined.
-/// Matches Python 1.1.6 `Interface.IC_DEQUE_MIN_SAMPLE = 32`.
+/// Matches Python 1.2.4 `Interface.IC_DEQUE_MIN_SAMPLE = 32`.
 pub const IC_DEQUE_MIN_SAMPLE: usize = 32;
 
 /// Duration interface is treated as "new" (seconds).
@@ -136,11 +136,11 @@ pub const IC_DEQUE_MIN_SAMPLE: usize = 32;
 pub const IC_NEW_TIME: f64 = 7200.0;
 
 /// Burst threshold for new interfaces (announces/sec).
-/// Matches Python 1.1.6 `Interface.IC_BURST_FREQ_NEW = 6`.
+/// Matches Python 1.2.4 `Interface.IC_BURST_FREQ_NEW = 6`.
 pub const IC_BURST_FREQ_NEW: f64 = 6.0;
 
 /// Burst threshold for established interfaces (announces/sec).
-/// Matches Python 1.1.6 `Interface.IC_BURST_FREQ = 35`.
+/// Matches Python 1.2.4 `Interface.IC_BURST_FREQ = 35`.
 pub const IC_BURST_FREQ: f64 = 35.0;
 
 /// Burst detection active duration (seconds).
@@ -148,7 +148,7 @@ pub const IC_BURST_FREQ: f64 = 35.0;
 pub const IC_BURST_HOLD: f64 = 60.0;
 
 /// Burst penalty delay (seconds).
-/// Matches Python 1.1.6 `Interface.IC_BURST_PENALTY = 15`.
+/// Matches Python 1.2.4 `Interface.IC_BURST_PENALTY = 15`.
 pub const IC_BURST_PENALTY: f64 = 15.0;
 
 /// Tunnel timeout (8 hours, in seconds).
