@@ -123,6 +123,20 @@ impl KnownDestinations {
         }
     }
 
+    /// Pin every known destination announced by `identity_hash`. Returns the
+    /// number of entries that matched.
+    pub fn retain_identity(&mut self, identity_hash: &[u8; 16]) -> usize {
+        let mut retained = 0usize;
+        for entry in self.entries.values_mut() {
+            let computed_id_hash = rns_crypto::sha::truncated_hash(&entry.public_key);
+            if &computed_id_hash == identity_hash {
+                entry.retained = true;
+                retained += 1;
+            }
+        }
+        retained
+    }
+
     /// Release a pin set by `retain()`. The entry's `timestamp` (last-seen
     /// announce wall-clock) drives `cleanup()` from now on.
     pub fn unretain(&mut self, dest_hash: &[u8; 16]) {
@@ -596,6 +610,26 @@ mod tests {
 
         kd.unretain(&hash);
         assert!(!kd.get(&hash).unwrap().retained);
+    }
+
+    #[test]
+    fn test_retain_identity_marks_matching_destinations() {
+        let mut kd = KnownDestinations::new();
+        let id = crate::identity::Identity::new();
+        let public_key = id.get_public_key();
+        let other_public_key = crate::identity::Identity::new().get_public_key();
+        let dest_a = [0xA1; 16];
+        let dest_b = [0xB2; 16];
+        let dest_c = [0xC3; 16];
+
+        kd.remember(dest_a, 1.0, [1u8; 32], public_key, None);
+        kd.remember(dest_b, 1.0, [2u8; 32], public_key, None);
+        kd.remember(dest_c, 1.0, [3u8; 32], other_public_key, None);
+
+        assert_eq!(kd.retain_identity(&id.hash), 2);
+        assert!(kd.get(&dest_a).unwrap().retained);
+        assert!(kd.get(&dest_b).unwrap().retained);
+        assert!(!kd.get(&dest_c).unwrap().retained);
     }
 
     #[test]

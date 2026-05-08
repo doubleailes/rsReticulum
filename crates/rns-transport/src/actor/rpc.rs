@@ -395,6 +395,9 @@ impl TransportActor {
             TransportQuery::RetainDestination { dest } => {
                 TransportQueryResponse::BoolResult(self.retain_destination(&dest))
             }
+            TransportQuery::RetainIdentity { identity_hash } => {
+                TransportQueryResponse::BoolResult(self.retain_identity(&identity_hash))
+            }
             TransportQuery::UseDestination { dest } => {
                 TransportQueryResponse::BoolResult(self.use_destination(&dest))
             }

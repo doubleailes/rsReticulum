@@ -295,6 +295,9 @@ fn transport_query_to_rpc_request(query: &TransportQuery) -> Option<crate::rpc::
         TransportQuery::RetainDestination { dest } => RpcRequest::RetainDestination {
             destination_hash: dest.to_vec(),
         },
+        TransportQuery::RetainIdentity { identity_hash } => RpcRequest::RetainIdentity {
+            identity_hash: identity_hash.to_vec(),
+        },
         TransportQuery::UseDestination { dest } => RpcRequest::UseDestination {
             destination_hash: dest.to_vec(),
         },

@@ -464,6 +464,9 @@ pub enum TransportQuery {
     RetainDestination {
         dest: [u8; 16],
     },
+    RetainIdentity {
+        identity_hash: [u8; 16],
+    },
     UseDestination {
         dest: [u8; 16],
     },

@@ -139,6 +139,12 @@ impl Identity {
         Ok(())
     }
 
+    /// Persist the raw 64-byte public key used by Python `rnid -x/-w`.
+    pub fn pub_to_file(&self, path: &Path) -> Result<(), IdentityError> {
+        persistence::atomic_write(path, &self.get_public_key())?;
+        Ok(())
+    }
+
     /// Return the 64-byte private key (`X25519_prv || Ed25519_seed`), zeroised on drop.
     pub fn get_private_key(&self) -> Option<Zeroizing<[u8; 64]>> {
         let prv = self.prv.as_ref()?;
@@ -422,6 +428,25 @@ mod tests {
         let id2 = Identity::from_file(&path).unwrap();
         assert_eq!(id1.hash, id2.hash);
         assert_eq!(id1.get_public_key(), id2.get_public_key());
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir(&dir);
+    }
+
+    #[test]
+    fn test_public_file_roundtrip() {
+        let dir = std::env::temp_dir().join("reticulum_identity_test_public");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("identity.pub");
+
+        let id1 = Identity::new();
+        id1.pub_to_file(&path).unwrap();
+        let data = std::fs::read(&path).unwrap();
+        let id2 = Identity::from_public_key(&data).unwrap();
+
+        assert_eq!(id1.hash, id2.hash);
+        assert_eq!(id1.get_public_key(), id2.get_public_key());
+        assert!(!id2.has_private_key());
 
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_dir(&dir);

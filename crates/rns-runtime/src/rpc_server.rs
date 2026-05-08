@@ -518,6 +518,19 @@ async fn process_rpc_request(
             }
             RpcResponse::BoolResult(false)
         }
+        RpcRequest::RetainIdentity { identity_hash } => {
+            if let Some(identity_hash) = hash_to_array(&identity_hash) {
+                if let Some(TransportQueryResponse::BoolResult(v)) = query_transport(
+                    transport_tx,
+                    TransportQuery::RetainIdentity { identity_hash },
+                )
+                .await
+                {
+                    return RpcResponse::BoolResult(v);
+                }
+            }
+            RpcResponse::BoolResult(false)
+        }
         RpcRequest::UnretainDestination { destination_hash } => {
             if let Some(dest) = hash_to_array(&destination_hash) {
                 if let Some(TransportQueryResponse::BoolResult(v)) =

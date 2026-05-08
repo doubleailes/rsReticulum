@@ -80,6 +80,9 @@ pub enum RpcRequest {
     RetainDestination {
         destination_hash: Vec<u8>,
     },
+    RetainIdentity {
+        identity_hash: Vec<u8>,
+    },
     UnretainDestination {
         destination_hash: Vec<u8>,
     },
@@ -280,6 +283,10 @@ fn request_to_py_value(req: &RpcRequest) -> PyValue {
             ("destination_data", PyValue::String("retain".to_string())),
             ("destination_hash", PyValue::Bytes(destination_hash.clone())),
         ]),
+        RpcRequest::RetainIdentity { identity_hash } => py_dict(vec![
+            ("identity_data", PyValue::String("retain".to_string())),
+            ("identity_hash", PyValue::Bytes(identity_hash.clone())),
+        ]),
         RpcRequest::UnretainDestination { destination_hash } => py_dict(vec![
             ("destination_data", PyValue::String("unretain".to_string())),
             ("destination_hash", PyValue::Bytes(destination_hash.clone())),
@@ -372,6 +379,16 @@ fn py_value_to_request(value: &PyValue) -> Result<RpcRequest, RpcError> {
             "unretain" => Ok(RpcRequest::UnretainDestination { destination_hash }),
             other => Err(RpcError::Deserialize(format!(
                 "unknown Python RPC destination_data operation: {other}"
+            ))),
+        };
+    }
+
+    if let Some(PyValue::String(operation)) = dict_get(entries, "identity_data") {
+        let identity_hash = dict_bytes(entries, "identity_hash")?;
+        return match operation.as_str() {
+            "retain" => Ok(RpcRequest::RetainIdentity { identity_hash }),
+            other => Err(RpcError::Deserialize(format!(
+                "unknown Python RPC identity_data operation: {other}"
             ))),
         };
     }
@@ -576,6 +593,7 @@ fn py_value_to_response_for_request(
         | RpcRequest::UnblackholeIdentity { .. } => Ok(RpcResponse::Ok),
         RpcRequest::UseDestination { .. }
         | RpcRequest::RetainDestination { .. }
+        | RpcRequest::RetainIdentity { .. }
         | RpcRequest::UnretainDestination { .. } => Ok(RpcResponse::BoolResult(match value {
             PyValue::Bool(v) => *v,
             PyValue::None => false,
@@ -1699,6 +1717,9 @@ mod tests {
             },
             RpcRequest::RetainDestination {
                 destination_hash: vec![0; 16],
+            },
+            RpcRequest::RetainIdentity {
+                identity_hash: vec![0; 16],
             },
             RpcRequest::UnretainDestination {
                 destination_hash: vec![0; 16],

@@ -1,6 +1,8 @@
 //! rnid-rs - identity create/inspect/sign/verify/encrypt/decrypt.
 //!
-//! Python reference: `RNS/Utilities/rnid.py` from Reticulum 1.2.2.
+//! Python reference: `RNS/Utilities/rnid.py` from Reticulum 1.2.4.
+
+mod rsg;
 
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -16,6 +18,7 @@ use clap::Subcommand;
 use clap::{CommandFactory, Parser};
 use rns_identity::destination::{DestType, Destination, Direction};
 use rns_identity::identity::Identity;
+use rns_identity::known_destinations::KnownDestinations;
 use rns_transport::messages::{
     OutboundRequest, TransportMessage, TransportQuery, TransportQueryResponse,
 };
@@ -23,17 +26,16 @@ use rns_transport::messages::{
 #[cfg(feature = "hardware")]
 mod hw_commands;
 
-const RETICULUM_COMPAT_VERSION: &str = "1.2.2";
+const RETICULUM_COMPAT_VERSION: &str = "1.2.4";
+const DEFAULT_ASPECTS: &str = "rns.id";
+const PUB_EXT: &str = "pub";
 const SIG_EXT: &str = "rsg";
 const ENCRYPT_EXT: &str = "rfe";
-const CHUNK_SIZE: usize = 16 * 1024 * 1024;
+const ENC_CHUNK: usize = 16 * 1024 * 1024;
+const DEC_CHUNK: usize = ENC_CHUNK + rns_crypto::TOKEN_OVERHEAD * 2;
 const BLOCK_SIZE: usize = 16;
-// Python rnid decrypts fixed 16 MiB ciphertext chunks. Cap plaintext so each
-// full encrypted token lands on that boundary after identity overhead + padding.
-const PYTHON_COMPAT_PLAINTEXT_CHUNK_SIZE: usize =
-    CHUNK_SIZE - rns_identity::identity::IDENTITY_OVERHEAD - BLOCK_SIZE;
 const FULL_CHUNK_TOKEN_SIZE: usize =
-    CHUNK_SIZE + rns_identity::identity::IDENTITY_OVERHEAD + BLOCK_SIZE;
+    ENC_CHUNK + rns_identity::identity::IDENTITY_OVERHEAD + BLOCK_SIZE;
 
 #[derive(Parser)]
 #[command(
@@ -54,13 +56,32 @@ struct Args {
     #[arg(short = 'g', long)]
     generate: Option<PathBuf>,
 
-    /// Import private Identity data in hex, base32 or base64 format.
-    #[arg(short = 'm', long = "import", value_name = "identity_data")]
-    import_str: Option<String>,
+    /// Import public Identity data in hex, base32 or base64 format, or from file.
+    #[arg(short = 'm', long = "import-pub", value_name = "identity_data")]
+    import_pub: Option<String>,
 
-    /// Export private Identity data in hex, base32 or base64 format.
-    #[arg(short = 'x', long)]
-    export: bool,
+    /// Import private Identity data in hex, base32 or base64 format, or from file.
+    #[arg(
+        short = 'M',
+        long = "import-prv",
+        alias = "import",
+        visible_alias = "import-private",
+        value_name = "identity_data"
+    )]
+    import_prv: Option<String>,
+
+    /// Export public Identity data in hex, base32 or base64 format.
+    #[arg(short = 'x', long = "export-pub")]
+    export_pub: bool,
+
+    /// Export private Identity data in hex, base32 or base64 format, or to file.
+    #[arg(
+        short = 'X',
+        long = "export-prv",
+        alias = "export",
+        visible_alias = "export-private"
+    )]
+    export_prv: bool,
 
     /// Increase verbosity.
     #[arg(short = 'v', long, action = clap::ArgAction::Count)]
@@ -71,7 +92,7 @@ struct Args {
     quiet: u8,
 
     /// Announce a destination based on this Identity.
-    #[arg(short = 'a', long)]
+    #[arg(short = 'a', long, num_args = 0..=1, default_missing_value = DEFAULT_ASPECTS)]
     announce: Option<String>,
 
     /// Show destination hash for aspects based on this Identity.
@@ -94,8 +115,12 @@ struct Args {
     #[arg(short = 'V', long = "validate")]
     validate: Option<PathBuf>,
 
-    /// Input file path.
-    #[arg(short = 'r', long)]
+    /// Sign raw input data instead of hashing first.
+    #[arg(long)]
+    raw: bool,
+
+    /// Legacy input file path override.
+    #[arg(short = 'r', long, hide = true)]
     read: Option<PathBuf>,
 
     /// Output file path.
@@ -109,6 +134,10 @@ struct Args {
     /// Request unknown Identities from the network.
     #[arg(short = 'R', long = "request")]
     request: bool,
+
+    /// Never use cached or network-sourced information.
+    #[arg(short = 'N', long = "no-cache")]
+    no_cache: bool,
 
     /// Identity request timeout before giving up.
     #[arg(short = 't', value_name = "seconds", default_value_t = rns_transport::constants::PATH_REQUEST_TIMEOUT)]
@@ -134,11 +163,11 @@ struct Args {
     #[arg(long)]
     version: bool,
 
-    /// Parsed for Python CLI parity; Reticulum 1.2.2 does not implement it.
+    /// Parsed for Python CLI parity.
     #[arg(short = 'I', long = "stdin", hide = true)]
     stdin: bool,
 
-    /// Parsed for Python CLI parity; Reticulum 1.2.2 does not implement it.
+    /// Parsed for Python CLI parity.
     #[arg(short = 'O', long = "stdout", hide = true)]
     stdout: bool,
 }
@@ -229,6 +258,23 @@ async fn run(mut args: Args) -> ExitCode {
         );
         return ExitCode::from(1);
     }
+    let identity_source_count = [
+        args.import_pub.is_some(),
+        args.import_prv.is_some(),
+        args.identity.is_some(),
+        args.generate.is_some(),
+    ]
+    .into_iter()
+    .filter(|source| *source)
+    .count();
+    if identity_source_count > 1 {
+        eprintln!("The -i, -g, -m and -M args are mutually exclusive");
+        return ExitCode::from(1);
+    }
+    if args.base64 && args.base32 {
+        eprintln!("The -b and -B args are mutually exclusive");
+        return ExitCode::from(1);
+    }
 
     if args.read.is_none() {
         args.read = args
@@ -238,70 +284,90 @@ async fn run(mut args: Args) -> ExitCode {
             .or_else(|| args.sign.clone());
     }
 
-    if let Some(import_str) = args.import_str.as_deref() {
-        return import_identity(&args, import_str);
-    }
+    let op_requires_identity = args.sign.is_some()
+        || args.encrypt.is_some()
+        || args.decrypt.is_some()
+        || args.announce.is_some()
+        || args.write.is_some()
+        || args.print_identity
+        || args.export_pub
+        || args.export_prv;
 
-    if let Some(path) = args.generate.as_ref() {
-        return generate_identity(path, args.force);
-    }
-
-    let Some(identity_arg) = args.identity.as_deref() else {
-        println!("\nNo identity provided, cannot continue\n");
-        let mut cmd = Args::command();
-        let _ = cmd.print_help();
-        println!("\n");
-        return ExitCode::from(2);
-    };
-
-    let identity = match resolve_identity(identity_arg, &args).await {
+    let identity = match get_operating_identity(&args, !op_requires_identity).await {
         Ok(identity) => identity,
         Err((code, msg)) => {
             eprintln!("{msg}");
             return ExitCode::from(code);
         }
     };
-
-    if let Some(aspects) = args.hash.as_deref() {
-        return hash_destination(&identity, aspects);
+    if op_requires_identity && identity.is_none() {
+        eprintln!("Could not get working identity");
+        return ExitCode::from(2);
     }
 
-    if let Some(aspects) = args.announce.as_deref() {
-        return announce_destination(&identity, aspects, &args).await;
-    }
-
+    let mut op = args.generate.is_some();
     if args.print_identity {
-        print_identity(&identity, &args);
-        return ExitCode::SUCCESS;
+        print_identity(identity.as_ref().expect("identity checked"), &args);
+        op = true;
     }
-
-    if args.export {
-        return export_identity(&identity, &args);
+    if args.export_pub {
+        let code = export_public_identity(identity.as_ref().expect("identity checked"), &args);
+        if code != ExitCode::SUCCESS {
+            return code;
+        }
+        op = true;
     }
-
+    if args.export_prv {
+        let code = export_private_identity(identity.as_ref().expect("identity checked"), &args);
+        if code != ExitCode::SUCCESS {
+            return code;
+        }
+        op = true;
+    }
+    if let Some(aspects) = args.hash.as_deref() {
+        let identity_ref = identity.as_ref();
+        let identity_hash_arg = args.identity.as_deref();
+        let code = hash_destination(identity_ref, identity_hash_arg, aspects);
+        if code != ExitCode::SUCCESS {
+            return code;
+        }
+        op = true;
+    }
+    if let Some(aspects) = args.announce.as_deref() {
+        return announce_destination(identity.as_ref().expect("identity checked"), aspects, &args)
+            .await;
+    }
     if args.validate.is_some() {
-        return validate_signature(&identity, &args);
+        return validate_signature(identity.as_ref(), args.identity.as_deref(), &args);
     }
-
     if args.sign.is_some() {
-        return sign_file(&identity, &args);
+        return sign_file(identity.as_ref().expect("identity checked"), &args);
     }
-
     if args.encrypt.is_some() {
-        return encrypt_file(&identity, &args);
+        return encrypt_file(identity.as_ref().expect("identity checked"), &args);
     }
-
     if args.decrypt.is_some() {
-        return decrypt_file(&identity, &args);
+        return decrypt_file(identity.as_ref().expect("identity checked"), &args);
+    }
+    if args.write.is_some() {
+        let code = write_identity(identity.as_ref().expect("identity checked"), &args);
+        if code != ExitCode::SUCCESS {
+            return code;
+        }
+        op = true;
     }
 
+    if !op {
+        let mut cmd = Args::command();
+        let _ = cmd.print_help();
+        println!();
+    }
     ExitCode::SUCCESS
 }
 
-fn generate_identity(path: &Path, force: bool) -> ExitCode {
+fn generate_identity(path: &Path, force: bool) -> Result<Identity, (u8, String)> {
     if let Err(e) = ensure_output_allowed(path, force) {
-        eprintln!("{e}");
-        return ExitCode::from(3);
+        return Err((11, e));
     }
     let identity = Identity::new();
     match identity.to_file(path) {
@@ -311,85 +377,184 @@ fn generate_identity(path: &Path, force: bool) -> ExitCode {
                 hex::encode(identity.hash),
                 path.display()
             );
-            ExitCode::SUCCESS
+            Ok(identity)
         }
-        Err(e) => {
-            eprintln!("An error occurred while saving the generated Identity: {e}");
-            ExitCode::from(4)
-        }
+        Err(e) => Err((
+            253,
+            format!("An error occurred while saving the generated Identity: {e}"),
+        )),
     }
 }
 
-fn import_identity(args: &Args, import_str: &str) -> ExitCode {
-    let identity_bytes = match decode_key_text(import_str, args) {
-        Ok(bytes) => bytes,
-        Err(e) => {
-            eprintln!("Invalid identity data specified for import: {e}");
-            return ExitCode::from(41);
-        }
-    };
-    let identity = match Identity::from_private_key(&identity_bytes) {
-        Ok(identity) => identity,
-        Err(e) => {
-            eprintln!("Could not create Reticulum identity from specified data: {e}");
-            return ExitCode::from(42);
-        }
-    };
-
-    println!("Identity imported");
-    print_identity(&identity, args);
-
-    if let Some(path) = args.write.as_ref() {
-        if path.is_file() && !args.force {
-            eprintln!("File {} already exists, not overwriting", path.display());
-            return ExitCode::from(43);
-        }
-        if let Err(e) = identity.to_file(path) {
-            eprintln!("Error while saving identity to {}", path.display());
-            eprintln!("The contained exception was: {e}");
-        }
-        println!("Wrote imported identity to {}", path.display());
+async fn get_operating_identity(
+    args: &Args,
+    allow_none: bool,
+) -> Result<Option<Identity>, (u8, String)> {
+    if let Some(path) = args.generate.as_ref() {
+        return generate_identity(path, args.force).map(Some);
     }
+    if let Some(import_pub) = args.import_pub.as_deref() {
+        return import_public_identity(import_pub).map(Some);
+    }
+    if let Some(import_prv) = args.import_prv.as_deref() {
+        return import_private_identity(import_prv).map(Some);
+    }
+    let Some(identity_arg) = args.identity.as_deref() else {
+        return Ok(None);
+    };
 
-    ExitCode::SUCCESS
-}
-
-async fn resolve_identity(identity_arg: &str, args: &Args) -> Result<Identity, (u8, String)> {
     let path = Path::new(identity_arg);
     if path.is_file() {
-        // Python rnid calls `RNS.Identity.from_file()`, which returns None
-        // for malformed files. The CLI does not check that None before
-        // falling through with exit 0, so preserve that compatibility quirk.
-        return load_identity_file(path).map_err(|e| (0, e));
+        let identity = load_identity_file(path).map_err(|e| (8, e))?;
+        return Ok(Some(identity));
+    }
+
+    if args.no_cache {
+        if allow_none {
+            return Ok(None);
+        }
+        return Err((2, "Could not resolve identity".to_string()));
     }
 
     if identity_arg.len() == 32 {
         let hash = parse_hash16(identity_arg)
-            .ok_or((7, "Invalid hexadecimal hash provided".to_string()))?;
+            .ok_or((8, "Invalid hexadecimal hash provided".to_string()))?;
         match recall_identity_from_python_known_destinations(hash, args) {
             Ok(Some(identity)) => {
-                println!("Recalled Identity {}", hex::encode(identity.hash));
-                return Ok(identity);
+                if identity.hash == hash {
+                    println!("Recalled Identity {}", pretty_hash(&identity.hash));
+                } else {
+                    println!(
+                        "Recalled Identity {} for destination {}",
+                        pretty_hash(&identity.hash),
+                        pretty_hash(&hash)
+                    );
+                }
+                retain_identity_hash(args, identity.hash).await;
+                return Ok(Some(identity));
             }
             Ok(None) => {}
-            Err(msg) => return Err((7, msg)),
+            Err(msg) => return Err((8, msg)),
+        }
+        if allow_none && !args.request {
+            return Ok(None);
         }
         if !args.request {
             return Err((
-                5,
+                2,
                 format!(
-                    "Could not recall Identity for {}. You can query the network for unknown Identities with the -R option.",
-                    hex::encode(hash)
+                    "Could not recall Identity for {}.\nYou can query the network for unknown Identities with the -R option.",
+                    pretty_hash(&hash)
                 ),
             ));
         }
-        return request_identity(hash, args).await;
+        let identity = request_identity(hash, args).await?;
+        retain_identity_hash(args, identity.hash).await;
+        return Ok(Some(identity));
     }
 
-    Err((8, "Specified Identity file not found".to_string()))
+    Err((2, "Could not get working identity".to_string()))
+}
+
+fn import_public_identity(input: &str) -> Result<Identity, (u8, String)> {
+    let identity_bytes = decode_import_identity_data(input, 64).ok_or((
+        8,
+        "Could not decode specified data to a valid public Reticulum Identity".to_string(),
+    ))?;
+    let identity = Identity::from_public_key(&identity_bytes).map_err(|e| {
+        (
+            8,
+            format!("Could not create Reticulum identity from specified data: {e}"),
+        )
+    })?;
+    println!("Reticulum Identity imported");
+    Ok(identity)
+}
+
+fn import_private_identity(input: &str) -> Result<Identity, (u8, String)> {
+    let identity_bytes = decode_import_identity_data(input, 64).ok_or((
+        8,
+        "Could not decode specified data to a valid private Reticulum Identity".to_string(),
+    ))?;
+    let identity = Identity::from_private_key(&identity_bytes).map_err(|e| {
+        (
+            8,
+            format!("Could not create Reticulum identity from specified data: {e}"),
+        )
+    })?;
+    println!("Reticulum Identity imported");
+    Ok(identity)
+}
+
+fn decode_import_identity_data(input: &str, expected_len: usize) -> Option<Vec<u8>> {
+    let path = Path::new(input);
+    if path.is_file() {
+        if let Ok(data) = std::fs::read(path) {
+            if data.len() == expected_len {
+                return Some(data);
+            }
+        }
+    }
+    if input.len() == expected_len * 2 {
+        if let Ok(data) = hex::decode(input) {
+            if data.len() == expected_len {
+                return Some(data);
+            }
+        }
+    }
+    if let Ok(data) = decode_base32(input) {
+        if data.len() == expected_len {
+            return Some(data);
+        }
+    }
+    if let Ok(data) = URL_SAFE.decode(input) {
+        if data.len() == expected_len {
+            return Some(data);
+        }
+    }
+    None
+}
+
+async fn retain_identity_hash(args: &Args, identity_hash: [u8; 16]) {
+    retain_identity_in_known_destinations_file(args, identity_hash);
+
+    let shutdown = rns_runtime::lifecycle::ShutdownSignal::new();
+    let foreground = Arc::new(AtomicBool::new(true));
+    let Ok(handle) =
+        rns_runtime::reticulum::init(args.config.as_deref(), None, shutdown.clone(), foreground)
+            .await
+    else {
+        return;
+    };
+    let _ = handle
+        .query_transport(TransportQuery::RetainIdentity { identity_hash })
+        .await;
+    shutdown.trigger();
+}
+
+fn retain_identity_in_known_destinations_file(args: &Args, identity_hash: [u8; 16]) {
+    let config_dir = rns_runtime::platform::resolve_config_dir(args.config.as_deref());
+    let path = config_dir.join("storage/known_destinations");
+    let Ok(mut known) = KnownDestinations::load(&path) else {
+        return;
+    };
+    if known.retain_identity(&identity_hash) > 0 {
+        let _ = known.save(&path);
+    }
 }
 
 fn load_identity_file(path: &Path) -> Result<Identity, String> {
+    if path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case(PUB_EXT))
+    {
+        let data = std::fs::read(path)
+            .map_err(|e| format!("Could not decode Identity from specified file: {e}"))?;
+        return Identity::from_public_key(&data)
+            .map_err(|e| format!("Could not decode public Identity from specified file: {e}"));
+    }
+
     match Identity::from_file(path) {
         Ok(identity) => Ok(identity),
         Err(private_err) => {
@@ -413,20 +578,39 @@ async fn request_identity(hash: [u8; 16], args: &Args) -> Result<Identity, (u8, 
             .await
             .map_err(|e| (1, format!("Failed to initialize Reticulum runtime: {e}")))?;
 
-    handle
-        .transport_tx
-        .send(TransportMessage::RequestPath {
-            destination_hash: hash,
-        })
-        .await
-        .map_err(|_| (1, "Transport closed while requesting path".to_string()))?;
+    let id_destination_hash =
+        Destination::hash_from_name_and_identity(DEFAULT_ASPECTS, Some(&hash));
+    for destination_hash in [hash, id_destination_hash] {
+        handle
+            .transport_tx
+            .send(TransportMessage::RequestPath { destination_hash })
+            .await
+            .map_err(|_| (1, "Transport closed while requesting path".to_string()))?;
+    }
 
     let timeout = Duration::from_secs_f64(args.timeout.max(0.0));
-    let _ = handle.await_path(hash, timeout).await;
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        if let Some(identity) = query_recent_announces_for_hash(&handle, hash).await {
+            shutdown.trigger();
+            println!(
+                "Received Identity {} for destination {} from the network",
+                pretty_hash(&identity.hash),
+                pretty_hash(&hash)
+            );
+            return Ok(identity);
+        }
+        if tokio::time::Instant::now() >= deadline {
+            break;
+        }
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let sleep_for = remaining.min(Duration::from_millis(100));
+        tokio::time::sleep(sleep_for).await;
+    }
 
     let identity = query_recent_announces_for_hash(&handle, hash).await;
     shutdown.trigger();
-    identity.ok_or((6, "Identity request timed out".to_string()))
+    identity.ok_or((2, "Identity request timed out".to_string()))
 }
 
 async fn query_recent_announces_for_hash(
@@ -514,28 +698,49 @@ fn hash16_from_slice(bytes: Vec<u8>) -> Option<[u8; 16]> {
     Some(out)
 }
 
-fn hash_destination(identity: &Identity, aspects: &str) -> ExitCode {
+fn hash_destination(
+    identity: Option<&Identity>,
+    identity_hash_arg: Option<&str>,
+    aspects: &str,
+) -> ExitCode {
     if aspects.trim().is_empty() {
         eprintln!("Invalid destination aspects specified");
-        return ExitCode::from(32);
+        return ExitCode::from(9);
     }
-    let hash = Destination::hash_from_name_and_identity(aspects, Some(&identity.hash));
+    let identity_hash = if let Some(identity) = identity {
+        identity.hash
+    } else if let Some(identity_hash_arg) = identity_hash_arg {
+        match parse_hash16(identity_hash_arg) {
+            Some(hash) => hash,
+            None => {
+                eprintln!("Invalid identity hash length");
+                return ExitCode::from(8);
+            }
+        }
+    } else {
+        eprintln!("Invalid identity");
+        return ExitCode::from(8);
+    };
+
+    let hash = Destination::hash_from_name_and_identity(aspects, Some(&identity_hash));
     println!(
         "The {aspects} destination for this Identity is {}",
         pretty_hash(&hash)
     );
-    println!(
-        "The full destination specifier is {}.{}",
-        aspects,
-        hex::encode(identity.hash)
-    );
+    if identity.is_some() {
+        println!(
+            "The full destination specifier is {}.{}",
+            aspects,
+            hex::encode(identity_hash)
+        );
+    }
     ExitCode::SUCCESS
 }
 
 async fn announce_destination(identity: &Identity, aspects: &str, args: &Args) -> ExitCode {
     if aspects.split('.').count() <= 1 {
         eprintln!("Invalid destination aspects specified");
-        return ExitCode::from(32);
+        return ExitCode::from(9);
     }
     if !identity.has_private_key() {
         let hash = Destination::hash_from_name_and_identity(aspects, Some(&identity.hash));
@@ -549,7 +754,7 @@ async fn announce_destination(identity: &Identity, aspects: &str, args: &Args) -
             hex::encode(identity.hash)
         );
         println!("Cannot announce this destination, since the private key is not held");
-        return ExitCode::from(33);
+        return ExitCode::from(4);
     }
 
     let shutdown = rns_runtime::lifecycle::ShutdownSignal::new();
@@ -603,26 +808,35 @@ async fn announce_destination(identity: &Identity, aspects: &str, args: &Args) -
 }
 
 fn print_identity(identity: &Identity, args: &Args) {
+    println!("Identity Hash : {}", pretty_hash(&identity.hash));
     println!(
-        "Public Key  : {}",
+        "Public Key    : {}",
         encode_key_text(&identity.get_public_key(), args)
     );
     if let Some(private_key) = identity.get_private_key() {
         if args.print_private {
-            println!("Private Key : {}", encode_key_text(&*private_key, args));
+            println!("Private Key   : {}", encode_key_text(&*private_key, args));
         } else {
-            println!("Private Key : Hidden");
+            println!("Private Key   : Hidden");
         }
     }
 }
 
-fn export_identity(identity: &Identity, args: &Args) -> ExitCode {
+fn export_public_identity(identity: &Identity, args: &Args) -> ExitCode {
+    println!(
+        "Public Identity Keys  : {}",
+        encode_key_text(&identity.get_public_key(), args)
+    );
+    ExitCode::SUCCESS
+}
+
+fn export_private_identity(identity: &Identity, args: &Args) -> ExitCode {
     let Some(private_key) = identity.get_private_key() else {
         eprintln!("Identity doesn't hold a private key, cannot export");
-        return ExitCode::from(50);
+        return ExitCode::from(4);
     };
     println!(
-        "Exported Identity : {}",
+        "Private Identity Keys : {}",
         encode_key_text(&*private_key, args)
     );
     ExitCode::SUCCESS
@@ -631,149 +845,218 @@ fn export_identity(identity: &Identity, args: &Args) -> ExitCode {
 fn sign_file(identity: &Identity, args: &Args) -> ExitCode {
     if !identity.has_private_key() {
         eprintln!("Specified Identity does not hold a private key. Cannot sign.");
-        return ExitCode::from(14);
+        return ExitCode::from(4);
     }
     let Some(input_path) = args.read.as_ref() else {
         eprintln!("Signing requested, but no input data specified");
-        return ExitCode::from(17);
+        return ExitCode::from(6);
     };
-    let data = match read_input(input_path, args.stdin) {
-        Ok(data) => data,
+    let input = match std::fs::File::open(input_path) {
+        Ok(file) => file,
         Err(e) => {
-            eprintln!("{e}");
-            return ExitCode::from(12);
+            eprintln!("The file \"{}\" does not exist: {e}", input_path.display());
+            return ExitCode::from(6);
         }
     };
     let Some(output_path) = args
         .write
         .clone()
-        .or_else(|| (!args.stdout).then(|| append_extension(input_path, SIG_EXT)))
+        .or_else(|| Some(append_extension(input_path, SIG_EXT)))
     else {
-        if !args.stdout {
-            eprintln!("Signing requested, but no output specified");
-        }
-        return ExitCode::from(18);
+        eprintln!("Signing requested, but no output specified");
+        return ExitCode::from(253);
     };
     if let Err(e) = ensure_output_allowed(&output_path, args.force) {
         eprintln!("{e}");
-        return ExitCode::from(15);
+        return ExitCode::from(11);
     }
 
-    let Some(signature) = identity.sign(&data) else {
-        eprintln!("Specified Identity does not hold a private key. Cannot sign.");
-        return ExitCode::from(16);
+    let signature = if args.raw {
+        match rsg::create_raw_signature(identity, input) {
+            Ok(signature) => signature.to_vec(),
+            Err(e) => {
+                eprintln!("Could not sign {}: {e}", input_path.display());
+                return ExitCode::from(254);
+            }
+        }
+    } else {
+        match rsg::create_rsg(identity, input) {
+            Ok(rsg) => rsg,
+            Err(e) => {
+                eprintln!("Could not sign {}: {e}", input_path.display());
+                return ExitCode::from(254);
+            }
+        }
     };
     if let Err(e) = write_output(&output_path, &signature, args.stdout) {
         eprintln!("{e}");
-        return ExitCode::from(18);
+        return ExitCode::from(253);
     }
 
     if !args.stdout {
         println!(
-            "File {} signed with {} to {}",
+            "Signed file {} with {} to {}",
             input_path.display(),
-            hex::encode(identity.hash),
+            pretty_hash(&identity.hash),
             output_path.display()
         );
     }
     ExitCode::SUCCESS
 }
 
-fn validate_signature(identity: &Identity, args: &Args) -> ExitCode {
-    let Some(sig_path) = args.validate.as_ref() else {
+fn validate_signature(
+    identity: Option<&Identity>,
+    identity_arg: Option<&str>,
+    args: &Args,
+) -> ExitCode {
+    let Some(validate_path) = args.validate.as_ref() else {
         return ExitCode::from(20);
     };
-    let input_path = args.read.clone().unwrap_or_else(|| {
-        let s = sig_path.to_string_lossy();
-        if let Some(stripped) = s.strip_suffix(&format!(".{SIG_EXT}")) {
-            PathBuf::from(stripped)
-        } else {
-            sig_path.clone()
-        }
-    });
 
-    let sig_bytes = match std::fs::read(sig_path) {
+    let validate_str = validate_path.to_string_lossy();
+    let path_is_sigfile = validate_str
+        .to_lowercase()
+        .ends_with(&format!(".{SIG_EXT}"));
+    let (sig_path, inferred_input_path) = if path_is_sigfile {
+        let stripped = &validate_str[..validate_str.len() - SIG_EXT.len() - 1];
+        (validate_path.clone(), PathBuf::from(stripped))
+    } else {
+        (
+            append_extension(validate_path, SIG_EXT),
+            validate_path.clone(),
+        )
+    };
+    let input_path = args.read.clone().unwrap_or(inferred_input_path);
+
+    let sig_bytes = match std::fs::read(&sig_path) {
         Ok(data) => data,
         Err(e) => {
             eprintln!(
                 "An error occurred while opening {}: {e}",
                 sig_path.display()
             );
-            return ExitCode::from(10);
+            return ExitCode::from(6);
         }
     };
-    let data = match read_input(&input_path, args.stdin) {
-        Ok(data) => data,
+    let input = match std::fs::File::open(&input_path) {
+        Ok(file) => file,
         Err(e) => {
-            eprintln!("{e}");
-            return ExitCode::from(11);
+            eprintln!(
+                "The validation target \"{}\" does not exist: {e}",
+                input_path.display()
+            );
+            return ExitCode::from(6);
         }
     };
-    if sig_bytes.len() != 64 {
-        eprintln!("Signature file {} is invalid", sig_path.display());
-        return ExitCode::from(22);
-    }
-    let mut signature = [0u8; 64];
-    signature.copy_from_slice(&sig_bytes);
-    if identity.verify(&data, &signature) {
-        println!(
-            "Signature {} for file {} made by Identity {} is valid",
-            sig_path.display(),
-            input_path.display(),
-            hex::encode(identity.hash)
-        );
-        ExitCode::SUCCESS
+
+    if rsg::is_legacy_format(&sig_bytes) {
+        let Some(identity) = identity else {
+            eprintln!(
+                "Cannot validate legacy rsg signatures without an explicit required identity"
+            );
+            return ExitCode::from(2);
+        };
+        match rsg::validate_legacy_signature(&sig_bytes, input, identity) {
+            Ok(()) => {
+                println!(
+                    "Signature is valid, the file {} was signed by {}",
+                    input_path.display(),
+                    pretty_hash(&identity.hash)
+                );
+                ExitCode::SUCCESS
+            }
+            Err(_) => {
+                eprintln!(
+                    "Invalid signature {} for file {}\nThis file was NOT signed by {}",
+                    sig_path.display(),
+                    input_path.display(),
+                    pretty_hash(&identity.hash)
+                );
+                ExitCode::from(10)
+            }
+        }
     } else {
-        eprintln!(
-            "Signature {} for file {} is invalid",
-            sig_path.display(),
-            input_path.display()
-        );
-        ExitCode::from(22)
+        let required = if let Some(identity) = identity {
+            Some(rsg::RequiredSigner::Identity(identity))
+        } else if let Some(identity_arg) = identity_arg {
+            match parse_hash16(identity_arg) {
+                Some(hash) => Some(rsg::RequiredSigner::Hash(hash)),
+                None => {
+                    eprintln!("Invalid identity hash length");
+                    return ExitCode::from(8);
+                }
+            }
+        } else {
+            None
+        };
+        match rsg::validate_rsg(&sig_bytes, input, required) {
+            Ok(validated) => {
+                let _ = (&validated.file_hash, &validated.public_key);
+                println!(
+                    "Signature is valid, the file {} was signed by {}",
+                    input_path.display(),
+                    pretty_hash(&validated.signer_hash)
+                );
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                let signer_description = required
+                    .map(|required| match required {
+                        rsg::RequiredSigner::Identity(identity) => pretty_hash(&identity.hash),
+                        rsg::RequiredSigner::Hash(hash) => pretty_hash(&hash),
+                    })
+                    .map(|s| format!("\nThis file was NOT signed by {s}"))
+                    .unwrap_or_default();
+                eprintln!(
+                    "Invalid signature {} for file {}{signer_description}: {e}",
+                    sig_path.display(),
+                    input_path.display()
+                );
+                ExitCode::from(10)
+            }
+        }
     }
 }
 
 fn encrypt_file(identity: &Identity, args: &Args) -> ExitCode {
     let Some(input_path) = args.read.as_ref() else {
         eprintln!("Encryption requested, but no input data specified");
-        return ExitCode::from(24);
+        return ExitCode::from(6);
     };
     let mut input: Box<dyn Read> = match std::fs::File::open(input_path) {
         Ok(file) => Box::new(file),
         Err(e) => {
             eprintln!("Input file {} not found: {e}", input_path.display());
-            return ExitCode::from(12);
+            return ExitCode::from(6);
         }
     };
     let Some(output_path) = args
         .write
         .clone()
-        .or_else(|| (!args.stdout).then(|| append_extension(input_path, ENCRYPT_EXT)))
+        .or_else(|| Some(append_extension(input_path, ENCRYPT_EXT)))
     else {
-        if !args.stdout {
-            eprintln!("Encryption requested, but no output specified");
-        }
-        return ExitCode::from(25);
+        eprintln!("Encryption requested, but no output specified");
+        return ExitCode::from(253);
     };
     if let Err(e) = ensure_output_allowed(&output_path, args.force) {
         eprintln!("{e}");
-        return ExitCode::from(15);
+        return ExitCode::from(11);
     };
     let mut output = match create_output(&output_path, args.stdout) {
         Ok(file) => file,
         Err(e) => {
             eprintln!("{e}");
-            return ExitCode::from(25);
+            return ExitCode::from(253);
         }
     };
 
-    let mut buffer = vec![0u8; PYTHON_COMPAT_PLAINTEXT_CHUNK_SIZE];
+    let mut buffer = vec![0u8; ENC_CHUNK];
     loop {
         let n = match input.read(&mut buffer) {
             Ok(n) => n,
             Err(e) => {
                 eprintln!("Could not read input file: {e}");
-                return ExitCode::from(24);
+                return ExitCode::from(252);
             }
         };
         if n == 0 {
@@ -783,12 +1066,12 @@ fn encrypt_file(identity: &Identity, args: &Args) -> ExitCode {
             Ok(ciphertext) => ciphertext,
             Err(e) => {
                 eprintln!("An error occurred while encrypting data: {e}");
-                return ExitCode::from(26);
+                return ExitCode::from(254);
             }
         };
         if let Err(e) = output.write_all(&ciphertext) {
             eprintln!("Could not write encrypted output: {e}");
-            return ExitCode::from(25);
+            return ExitCode::from(253);
         }
     }
 
@@ -796,7 +1079,7 @@ fn encrypt_file(identity: &Identity, args: &Args) -> ExitCode {
         println!(
             "File {} encrypted for {} to {}",
             input_path.display(),
-            hex::encode(identity.hash),
+            pretty_hash(&identity.hash),
             output_path.display()
         );
     }
@@ -806,53 +1089,60 @@ fn encrypt_file(identity: &Identity, args: &Args) -> ExitCode {
 fn decrypt_file(identity: &Identity, args: &Args) -> ExitCode {
     if !identity.has_private_key() {
         eprintln!("Specified Identity does not hold a private key. Cannot decrypt.");
-        return ExitCode::from(27);
+        return ExitCode::from(4);
     }
     let Some(input_path) = args.read.as_ref() else {
         eprintln!("Decryption requested, but no input data specified");
-        return ExitCode::from(28);
+        return ExitCode::from(6);
     };
+    if !input_path
+        .to_string_lossy()
+        .to_lowercase()
+        .ends_with(&format!(".{ENCRYPT_EXT}"))
+    {
+        eprintln!(
+            "The file {} does not appear to be a Reticulum encrypted file",
+            input_path.display()
+        );
+        return ExitCode::from(7);
+    }
     let ciphertext = match read_input(input_path, args.stdin) {
         Ok(data) => data,
         Err(e) => {
             eprintln!("{e}");
-            return ExitCode::from(28);
+            return ExitCode::from(6);
         }
     };
-    let Some(output_path) = args.write.clone().or_else(|| {
-        if args.stdout {
-            None
-        } else {
-            default_decrypt_output_path(input_path)
-        }
-    }) else {
-        if !args.stdout {
-            eprintln!("Decryption requested, but no output specified");
-        }
-        return ExitCode::from(29);
+    let Some(output_path) = args
+        .write
+        .clone()
+        .or_else(|| default_decrypt_output_path(input_path))
+    else {
+        eprintln!("Decryption requested, but no output specified");
+        return ExitCode::from(7);
     };
     if let Err(e) = ensure_output_allowed(&output_path, args.force) {
         eprintln!("{e}");
-        return ExitCode::from(15);
+        return ExitCode::from(11);
     }
 
     let plaintext = match decrypt_ciphertext(identity, &ciphertext) {
         Ok(plaintext) => plaintext,
         Err(()) => {
             eprintln!("Data could not be decrypted with the specified Identity");
-            return ExitCode::from(30);
+            return ExitCode::from(12);
         }
     };
 
     if let Err(e) = write_output(&output_path, &plaintext, args.stdout) {
         eprintln!("{e}");
-        return ExitCode::from(29);
+        return ExitCode::from(253);
     }
     if !args.stdout {
         println!(
             "File {} decrypted with {} to {}",
             input_path.display(),
-            hex::encode(identity.hash),
+            pretty_hash(&identity.hash),
             output_path.display()
         );
     }
@@ -868,13 +1158,16 @@ fn decrypt_ciphertext(identity: &Identity, ciphertext: &[u8]) -> Result<Vec<u8>,
         return Ok(plaintext);
     }
 
-    if ciphertext.len() > CHUNK_SIZE {
+    if ciphertext.len() > ENC_CHUNK {
+        if let Ok(plaintext) = decrypt_ciphertext_chunks(identity, ciphertext, DEC_CHUNK) {
+            return Ok(plaintext);
+        }
         if let Ok(plaintext) =
             decrypt_ciphertext_chunks(identity, ciphertext, FULL_CHUNK_TOKEN_SIZE)
         {
             return Ok(plaintext);
         }
-        if let Ok(plaintext) = decrypt_ciphertext_chunks(identity, ciphertext, CHUNK_SIZE) {
+        if let Ok(plaintext) = decrypt_ciphertext_chunks(identity, ciphertext, ENC_CHUNK) {
             return Ok(plaintext);
         }
     }
@@ -898,6 +1191,52 @@ fn decrypt_ciphertext_chunks(
         pos = end;
     }
     Ok(plaintext)
+}
+
+fn write_identity(identity: &Identity, args: &Args) -> ExitCode {
+    let Some(path) = args.write.as_ref() else {
+        return ExitCode::SUCCESS;
+    };
+    let mut path = path.clone();
+
+    if identity.has_private_key() && args.export_prv {
+        if let Err(e) = ensure_output_allowed(&path, args.force) {
+            eprintln!("{e}");
+            return ExitCode::from(11);
+        }
+        match identity.to_file(&path) {
+            Ok(()) => {
+                println!("Wrote private identity to {}", path.display());
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("Error while writing private identity to file: {e}");
+                ExitCode::from(253)
+            }
+        }
+    } else {
+        if !path
+            .to_string_lossy()
+            .to_lowercase()
+            .ends_with(&format!(".{PUB_EXT}"))
+        {
+            path = PathBuf::from(format!("{}.{}", path.to_string_lossy(), PUB_EXT));
+        }
+        if let Err(e) = ensure_output_allowed(&path, args.force) {
+            eprintln!("{e}");
+            return ExitCode::from(11);
+        }
+        match identity.pub_to_file(&path) {
+            Ok(()) => {
+                println!("Wrote public identity to {}", path.display());
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("Error while writing public identity to file: {e}");
+                ExitCode::from(253)
+            }
+        }
+    }
 }
 
 fn read_input(path: &Path, _use_stdin: bool) -> Result<Vec<u8>, String> {
@@ -950,16 +1289,6 @@ fn parse_hash16(s: &str) -> Option<[u8; 16]> {
     }
     let bytes = hex::decode(s).ok()?;
     hash16_from_slice(bytes)
-}
-
-fn decode_key_text(input: &str, args: &Args) -> Result<Vec<u8>, String> {
-    if args.base64 {
-        URL_SAFE.decode(input).map_err(|e| e.to_string())
-    } else if args.base32 {
-        decode_base32(input)
-    } else {
-        hex::decode(input).map_err(|e| e.to_string())
-    }
 }
 
 fn encode_key_text(bytes: &[u8], args: &Args) -> String {
@@ -1030,4 +1359,24 @@ fn now_epoch() -> f64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs_f64())
         .unwrap_or(0.0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn decrypt_accepts_pre_1_2_4_rnid_rs_chunking() {
+        let identity = Identity::new();
+        let legacy_plaintext_chunk =
+            ENC_CHUNK - rns_identity::identity::IDENTITY_OVERHEAD - BLOCK_SIZE;
+        let plaintext = vec![0xA5; legacy_plaintext_chunk + 1];
+        let mut ciphertext = Vec::new();
+        for chunk in plaintext.chunks(legacy_plaintext_chunk) {
+            ciphertext.extend(identity.encrypt(chunk, None).unwrap());
+        }
+
+        let decrypted = decrypt_ciphertext(&identity, &ciphertext).unwrap();
+        assert_eq!(decrypted, plaintext);
+    }
 }

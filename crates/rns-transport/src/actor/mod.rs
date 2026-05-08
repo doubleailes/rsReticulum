@@ -762,6 +762,26 @@ impl TransportActor {
         }
     }
 
+    /// Pin all cached announces made by `identity_hash`. Exposed via
+    /// `RetainIdentity` for Python 1.2.4 rnid parity.
+    pub(super) fn retain_identity(&mut self, identity_hash: &[u8; 16]) -> bool {
+        let mut retained = false;
+        for entry in self.recent_announces.values_mut() {
+            let Some(public_key) = entry.public_key else {
+                continue;
+            };
+            let computed_id_hash = rns_crypto::sha::truncated_hash(&public_key);
+            if &computed_id_hash == identity_hash {
+                entry.retained = true;
+                retained = true;
+            }
+        }
+        if retained {
+            self.state_dirty = true;
+        }
+        retained
+    }
+
     /// Mark a destination's cached metadata as used, matching Python's
     /// `_used_destination_data` refresh semantics for shared clients.
     pub(super) fn use_destination(&mut self, dest_hash: &[u8; 16]) -> bool {
@@ -2609,6 +2629,44 @@ mod tests {
         assert_eq!(cached.public_key, Some(other_public_key));
         assert_eq!(cached.raw_packet, vec![0xAA, 0xBB]);
         assert_eq!(cached.name_hash, [0xCC; 10]);
+    }
+
+    #[test]
+    fn retain_identity_marks_all_matching_recent_announces() {
+        let (mut actor, _tx) = TransportActor::new();
+        let identity = rns_identity::identity::Identity::new();
+        let public_key = identity.get_public_key();
+        let other_public_key = rns_identity::identity::Identity::new().get_public_key();
+        let dest_a = [0xA1; 16];
+        let dest_b = [0xB2; 16];
+        let dest_c = [0xC3; 16];
+
+        for (dest_hash, public_key) in [
+            (dest_a, Some(public_key)),
+            (dest_b, Some(public_key)),
+            (dest_c, Some(other_public_key)),
+        ] {
+            actor.recent_announces.insert(
+                dest_hash,
+                RecentAnnounce {
+                    dest_hash,
+                    hops: 1,
+                    app_data: None,
+                    timestamp: 1.0,
+                    public_key,
+                    ratchet: None,
+                    raw_packet: Vec::new(),
+                    retained: false,
+                    name_hash: [0; 10],
+                },
+            );
+        }
+
+        assert!(actor.retain_identity(&identity.hash));
+        assert!(actor.recent_announces[&dest_a].retained);
+        assert!(actor.recent_announces[&dest_b].retained);
+        assert!(!actor.recent_announces[&dest_c].retained);
+        assert!(actor.state_dirty);
     }
 
     #[test]
