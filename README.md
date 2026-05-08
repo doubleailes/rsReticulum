@@ -7,7 +7,7 @@
 
 [![License: AGPL-3.0-or-later](https://img.shields.io/badge/license-AGPL--3.0--or--later-blue.svg)](LICENSE)
 [![Rust 1.85+](https://img.shields.io/badge/rust-1.85%2B-orange.svg)](https://www.rust-lang.org)
-[![Reticulum 1.2.2](https://img.shields.io/badge/target-Reticulum%201.2.2-success.svg)](https://reticulum.network/)
+[![Reticulum 1.2.4](https://img.shields.io/badge/target-Reticulum%201.2.4-success.svg)](https://reticulum.network/)
 [![Status](https://img.shields.io/badge/status-experimental-yellow.svg)](#feature-status)
 
 [Reticulum Manual](https://reticulum.network/manual/) |
@@ -107,7 +107,7 @@ The `rns-tools` crate builds Rust-namespaced Reticulum utilities:
 | rnsd-rs | Shared Reticulum daemon. Owns interfaces and local control sockets. |
 | rnstatus-rs | Interface, announce, path, link, and aggregate status. |
 | rnpath-rs | Path lookup, path table inspection, rates, drops, and blackhole actions. |
-| rnid-rs | Identity generation, inspection, signing, verification, encryption, decryption, and export. |
+| rnid-rs | Identity generation, inspection, public/private import/export, hashing, signing, verification, encryption, and decryption. |
 | rnprobe-rs | Destination probe utility with loss and round-trip reporting. |
 | rncp-rs | File transfer utility with send, listen, and authenticated fetch modes. |
 | rnodeconf-rs | RNode inspection, safe configuration, EEPROM backup, and trust utility. |
@@ -124,7 +124,9 @@ rnstatus-rs [--all] [--sort rate|traffic|rx|tx|rxs|txs|announces|arx|atx|held]
 rnpath-rs   [--table|--rates] [destination_hash] [--max HOPS]
 rnpath-rs   <destination_hash>
 rnprobe-rs  [-s SIZE] [-n COUNT] [-t TIMEOUT] [-w WAIT] [--json] <destination_hash>
-rnid-rs     generate|show|sign|verify|encrypt|decrypt|export ...
+rnid-rs     [-i IDENTITY|-g FILE|-m PUB|-M PRV] [-p|-P] [-x|-X] [-H ASPECT]
+            [-a [ASPECT]] [-e FILE|-d FILE|-s FILE|-V FILE] [-w FILE] [-f]
+            [-R|-N] [-t SECONDS] [-b|-B] [--raw] [--version]
 rncp-rs     <file> <destination_hash>
 rncp-rs     -l [-b SECONDS] [-s DEST_DIR] [-a <allowed_hash>]...
 rncp-rs     -l -F [-j <jail_dir>] [-a <allowed_hash>|-n]...
@@ -142,6 +144,44 @@ intentional.
 
 `rnodeconf-rs` in the current build only covers safe inspection/device setting paths, EEPROM
 dump/backup, and trusted-key storage.
+
+`rnid-rs` tracks the Reticulum 1.2.4 identity utility surface for normal
+software identities: public/private import and export, destination hashing,
+`.pub` public identity files, and signed `.rsg` signature files. The
+hardware-backed `rnid-rs hw` path is a Rust extension behind the `hardware`
+feature and should still be treated as experimental.
+
+Common `rnid-rs` flows:
+
+```bash
+# Generate and inspect an identity.
+rnid-rs -g ~/.rsReticulum/identities/mgmt
+rnid-rs -i ~/.rsReticulum/identities/mgmt -p
+rnid-rs -i ~/.rsReticulum/identities/mgmt -H lxmf.delivery
+
+# Export text identity material. -x is public, -X is private.
+rnid-rs -i ~/.rsReticulum/identities/mgmt -x -b
+rnid-rs -i ~/.rsReticulum/identities/mgmt -X -B
+
+# Write identity files. Without -X, -w writes a public .pub file.
+rnid-rs -i ~/.rsReticulum/identities/mgmt -w mgmt.pub
+rnid-rs -i ~/.rsReticulum/identities/mgmt -X -w mgmt.rid
+rnid-rs -m <public_identity_data> -w peer.pub
+rnid-rs -M <private_identity_data> -X -w restored_identity
+
+# Sign and validate. New signatures are Reticulum 1.2.4 .rsg envelopes.
+rnid-rs -i ~/.rsReticulum/identities/mgmt -s message.txt
+rnid-rs -V message.txt.rsg
+rnid-rs -i <signer_hash> -N -V message.txt.rsg
+
+# Encrypt to a public identity, decrypt with the matching private identity.
+rnid-rs -i mgmt.pub -e message.txt
+rnid-rs -i ~/.rsReticulum/identities/mgmt -d message.txt.rfe
+```
+
+Use `--raw -s <file>` only when a workflow intentionally needs the legacy raw
+64-byte signature form. Normal `rnid-rs -s <file>` produces a `.rsg` file that
+embeds the signer metadata needed for 1.2.4 validation.
 
 ## Configuration
 
@@ -215,6 +255,10 @@ instance_control_port = 37433
 Most daemon and utility flows are implemented for the public `*-rs` tools:
 `rnsd-rs`, `rnstatus-rs`, `rnpath-rs`, `rnid-rs`, `rnprobe-rs`, `rncp-rs`,
 `rnsh-rs`, and `rnodeconf-rs`.
+
+The current compatibility target is Reticulum 1.2.4 where the matching Rust
+surface is implemented and tested. `rnid-rs` has explicit 1.2.4 coverage for
+the normal identity utility flow.
 
 Known gaps and intentional limits:
 
