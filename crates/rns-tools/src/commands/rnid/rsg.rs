@@ -294,6 +294,51 @@ mod tests {
         b"Reticulum 1.2.4 rsg test payload"
     }
 
+    fn pack_value(value: Value) -> Vec<u8> {
+        let mut out = Vec::new();
+        rmpv::encode::write_value(&mut out, &value).unwrap();
+        out
+    }
+
+    fn envelope_value(
+        hashtype: Option<Value>,
+        file_hash: Option<Value>,
+        meta: Option<Value>,
+    ) -> Value {
+        let mut entries = Vec::new();
+        if let Some(v) = hashtype {
+            entries.push((Value::from("hashtype"), v));
+        }
+        if let Some(v) = file_hash {
+            entries.push((Value::from("hash"), v));
+        }
+        if let Some(v) = meta {
+            entries.push((Value::from("meta"), v));
+        }
+        Value::Map(entries)
+    }
+
+    fn meta_value(signer: Option<Value>, pubkey: Option<Value>, note: Option<Value>) -> Value {
+        let mut entries = Vec::new();
+        if let Some(v) = signer {
+            entries.push((Value::from("signer"), v));
+        }
+        if let Some(v) = pubkey {
+            entries.push((Value::from("pubkey"), v));
+        }
+        if let Some(v) = note {
+            entries.push((Value::from("note"), v));
+        }
+        Value::Map(entries)
+    }
+
+    fn signed_rsg(signer: &Identity, envelope: Vec<u8>) -> Vec<u8> {
+        let signature = signer.sign(&envelope).unwrap();
+        let mut out = signature.to_vec();
+        out.extend(envelope);
+        out
+    }
+
     #[test]
     fn validates_new_rsg_with_embedded_signer() {
         let identity = Identity::new();
@@ -350,5 +395,133 @@ mod tests {
         let err =
             validate_rsg(&sig, message(), Some(RequiredSigner::Identity(&identity))).unwrap_err();
         assert!(matches!(err, RsgError::LegacyFormat));
+    }
+
+    #[test]
+    fn rejects_truncated_rsg() {
+        let err = validate_rsg(&[0u8; SIG_LEN - 1], message(), None).unwrap_err();
+        assert!(matches!(err, RsgError::InvalidLength));
+    }
+
+    #[test]
+    fn rejects_bad_msgpack_envelope() {
+        let mut rsg = vec![0u8; SIG_LEN];
+        rsg.extend_from_slice(&[0xd9, 0x20]);
+        let err = validate_rsg(&rsg, message(), None).unwrap_err();
+        assert!(matches!(err, RsgError::Msgpack(_)));
+    }
+
+    #[test]
+    fn rejects_missing_required_envelope_fields() {
+        let identity = Identity::new();
+        let file_hash = Value::Binary(rns_crypto::sha::sha256(message()).to_vec());
+        let meta = meta_value(
+            Some(Value::Binary(identity.hash.to_vec())),
+            Some(Value::Binary(identity.get_public_key().to_vec())),
+            Some(Value::Nil),
+        );
+
+        let missing_hashtype = signed_rsg(
+            &identity,
+            pack_value(envelope_value(
+                None,
+                Some(file_hash.clone()),
+                Some(meta.clone()),
+            )),
+        );
+        let err = validate_rsg(&missing_hashtype, message(), None).unwrap_err();
+        assert!(matches!(err, RsgError::InvalidEnvelope("missing hashtype")));
+
+        let missing_signer = signed_rsg(
+            &identity,
+            pack_value(envelope_value(
+                Some(Value::from(HASH_TYPE_SHA256)),
+                Some(file_hash.clone()),
+                Some(meta_value(
+                    None,
+                    Some(Value::Binary(identity.get_public_key().to_vec())),
+                    Some(Value::Nil),
+                )),
+            )),
+        );
+        let err = validate_rsg(&missing_signer, message(), None).unwrap_err();
+        assert!(matches!(
+            err,
+            RsgError::InvalidEnvelope("missing or invalid meta.signer")
+        ));
+
+        let missing_pubkey = signed_rsg(
+            &identity,
+            pack_value(envelope_value(
+                Some(Value::from(HASH_TYPE_SHA256)),
+                Some(file_hash),
+                Some(meta_value(
+                    Some(Value::Binary(identity.hash.to_vec())),
+                    None,
+                    Some(Value::Nil),
+                )),
+            )),
+        );
+        let err = validate_rsg(&missing_pubkey, message(), None).unwrap_err();
+        assert!(matches!(
+            err,
+            RsgError::InvalidEnvelope("missing or invalid meta.pubkey")
+        ));
+    }
+
+    #[test]
+    fn rejects_unsupported_hash_type() {
+        let identity = Identity::new();
+        let envelope = pack_value(envelope_value(
+            Some(Value::from("sha512")),
+            Some(Value::Binary(rns_crypto::sha::sha256(message()).to_vec())),
+            Some(meta_value(
+                Some(Value::Binary(identity.hash.to_vec())),
+                Some(Value::Binary(identity.get_public_key().to_vec())),
+                Some(Value::Nil),
+            )),
+        ));
+        let rsg = signed_rsg(&identity, envelope);
+
+        let err = validate_rsg(&rsg, message(), None).unwrap_err();
+        assert!(matches!(err, RsgError::UnsupportedHashType(t) if t == "sha512"));
+    }
+
+    #[test]
+    fn rejects_signer_hash_pubkey_mismatch() {
+        let identity = Identity::new();
+        let other = Identity::new();
+        let envelope = pack_value(envelope_value(
+            Some(Value::from(HASH_TYPE_SHA256)),
+            Some(Value::Binary(rns_crypto::sha::sha256(message()).to_vec())),
+            Some(meta_value(
+                Some(Value::Binary(identity.hash.to_vec())),
+                Some(Value::Binary(other.get_public_key().to_vec())),
+                Some(Value::Nil),
+            )),
+        ));
+        let rsg = signed_rsg(&identity, envelope);
+
+        let err = validate_rsg(&rsg, message(), None).unwrap_err();
+        assert!(matches!(err, RsgError::SignerMetadataMismatch));
+    }
+
+    #[test]
+    fn rejects_invalid_signature_over_valid_envelope() {
+        let identity = Identity::new();
+        let other = Identity::new();
+        let envelope = pack_value(envelope_value(
+            Some(Value::from(HASH_TYPE_SHA256)),
+            Some(Value::Binary(rns_crypto::sha::sha256(message()).to_vec())),
+            Some(meta_value(
+                Some(Value::Binary(identity.hash.to_vec())),
+                Some(Value::Binary(identity.get_public_key().to_vec())),
+                Some(Value::Nil),
+            )),
+        ));
+        let rsg = signed_rsg(&other, envelope);
+
+        let err = validate_rsg(&rsg, message(), None).unwrap_err();
+        assert!(matches!(err, RsgError::SignatureInvalid));
     }
 }
