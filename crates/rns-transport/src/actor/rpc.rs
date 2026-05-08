@@ -213,7 +213,11 @@ impl TransportActor {
                         let entry = self.recent_announces.get(&dest_bytes)?;
                         let public_key = entry.public_key?;
                         let owner = rns_crypto::sha::truncated_hash(&public_key);
-                        if owner == hash { Some(dest_bytes) } else { None }
+                        if owner == hash {
+                            Some(dest_bytes)
+                        } else {
+                            None
+                        }
                     })
                     .collect();
                 for dest in dropped {
@@ -458,7 +462,9 @@ impl TransportActor {
                 }
                 // Fall back to treating input as an identity hash already.
                 for entry in self.recent_announces.values() {
-                    let Some(public_key) = entry.public_key else { continue; };
+                    let Some(public_key) = entry.public_key else {
+                        continue;
+                    };
                     let id_hash = rns_crypto::sha::truncated_hash(&public_key);
                     if id_hash == input {
                         return TransportQueryResponse::HashResult(Some(input));
@@ -469,8 +475,12 @@ impl TransportActor {
             TransportQuery::FilterBlackholedDests { dests } => {
                 let mut hits = Vec::new();
                 for dest in &dests {
-                    let Some(entry) = self.recent_announces.get(dest) else { continue; };
-                    let Some(public_key) = entry.public_key else { continue; };
+                    let Some(entry) = self.recent_announces.get(dest) else {
+                        continue;
+                    };
+                    let Some(public_key) = entry.public_key else {
+                        continue;
+                    };
                     let id_hash = rns_crypto::sha::truncated_hash(&public_key);
                     if self.blackhole_table.is_blackholed(&id_hash) {
                         hits.push(*dest);
@@ -492,7 +502,11 @@ impl TransportActor {
                             return None;
                         }
                         let bytes = id.into_bytes();
-                        if verified_ids.contains(&bytes) { None } else { Some(bytes) }
+                        if verified_ids.contains(&bytes) {
+                            None
+                        } else {
+                            Some(bytes)
+                        }
                     })
                     .collect();
                 let purged = unverified.len();

@@ -4222,7 +4222,11 @@ mod tests {
             other => panic!("expected IntResult, got {other:?}"),
         };
         assert_eq!(applied, 1);
-        assert!(subscriber.blackhole_table.is_blackholed(&manual_identity.hash));
+        assert!(
+            subscriber
+                .blackhole_table
+                .is_blackholed(&manual_identity.hash)
+        );
     }
 
     #[test]
@@ -6011,7 +6015,11 @@ mod tests {
                 other => panic!("expected Data manifest, got {other:?}"),
             };
         let decoded = crate::discovery::decode_manifest(&payload).unwrap();
-        assert_eq!(decoded.len(), 1, "only the verified entry should be published");
+        assert_eq!(
+            decoded.len(),
+            1,
+            "only the verified entry should be published"
+        );
         assert_eq!(decoded[0].0, verified.hash);
     }
 
@@ -6023,12 +6031,11 @@ mod tests {
         actor.blackhole_table.add(known.hash, None);
         actor.blackhole_table.add([0xFE; 16], None);
 
-        let entries = match actor
-            .handle_query(crate::messages::TransportQuery::GetBlackholedIdentities)
-        {
-            crate::messages::TransportQueryResponse::BlackholeList(v) => v,
-            other => panic!("expected BlackholeList, got {other:?}"),
-        };
+        let entries =
+            match actor.handle_query(crate::messages::TransportQuery::GetBlackholedIdentities) {
+                crate::messages::TransportQueryResponse::BlackholeList(v) => v,
+                other => panic!("expected BlackholeList, got {other:?}"),
+            };
         assert_eq!(entries.len(), 2);
         for e in entries {
             if e.identity_hash == known.hash {
@@ -6062,8 +6069,7 @@ mod tests {
             crate::blackhole::BlackholeReason::RateLimit,
         );
 
-        let resp =
-            actor.handle_query(crate::messages::TransportQuery::PurgeUnverifiedBlackholes);
+        let resp = actor.handle_query(crate::messages::TransportQuery::PurgeUnverifiedBlackholes);
         let purged = match resp {
             crate::messages::TransportQueryResponse::IntResult(n) => n,
             other => panic!("expected IntResult, got {other:?}"),
