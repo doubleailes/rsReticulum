@@ -476,6 +476,24 @@ pub enum TransportQuery {
     /// Immediate cleanup trigger. Returns `IntResult(entries_remaining)`.
     /// The actor tick runs cleanup every 5 minutes regardless.
     CleanKnownDestinations,
+    /// Resolve a 16-byte hex blob — which may be either a destination hash or
+    /// an identity hash — to a canonical identity hash via `recent_announces`.
+    /// Returns `HashResult(Some(_))` on hit, `HashResult(None)` when the input
+    /// is neither a known destination nor a known identity. Read-only.
+    ResolveIdentityHash {
+        input: [u8; 16],
+    },
+    /// Batch lookup answering "which of these destinations belong to a
+    /// currently-blackholed identity?". Composes `recent_announces` and the
+    /// blackhole table inside the actor so callers never juggle hash types.
+    /// Response: `BlackholedDests(Vec<dest_hash>)`.
+    FilterBlackholedDests {
+        dests: Vec<[u8; 16]>,
+    },
+    /// Drop every Manual blackhole entry whose identity is not currently in
+    /// `recent_announces`. Returns `IntResult(count_purged)`. Use sparingly —
+    /// this can drop legit-but-unseen entries.
+    PurgeUnverifiedBlackholes,
 }
 
 #[derive(Debug)]
@@ -491,6 +509,9 @@ pub enum TransportQueryResponse {
     BoolResult(bool),
     PathStateResult(crate::constants::PathState),
     BlackholeList(Vec<BlackholeRpcEntry>),
+    /// Subset of dest hashes supplied to `FilterBlackholedDests` whose
+    /// announcer identity is currently blackholed.
+    BlackholedDests(Vec<[u8; 16]>),
     /// Pre-serialized binary payload (msgpack for remote-* RPCs).
     Data(Vec<u8>),
     Ok,
@@ -565,6 +586,11 @@ pub struct BlackholeRpcEntry {
     pub ttl: Option<f64>,
     pub reason: crate::blackhole::BlackholeReason,
     pub reason_label: Option<String>,
+    /// True if `recent_announces` currently contains an announce whose public
+    /// key hashes to `identity_hash`. False means we cannot confirm this entry
+    /// is a real identity — it may be garbage from a pre-fix caller, or a real
+    /// identity whose announce we have not yet received / has been pruned.
+    pub verified: bool,
 }
 
 impl std::fmt::Debug for TransportMessage {

@@ -74,14 +74,27 @@ pub enum ManifestError {
 ///
 /// `our_identity_hash` is injected into every entry's `source` field so
 /// subscribers can correctly key entries by publisher.
+///
+/// `verified_ids`, when `Some(_)`, restricts the published entries to those
+/// whose identity hash is in the set — typically the set of identity hashes
+/// derivable from current `recent_announces` public keys. This refuses to
+/// republish unverifiable entries (e.g., garbage from a buggy caller, or
+/// identities whose announces have been pruned). When `None`, no filtering
+/// is applied — used by tests that want to inspect the raw round-trip.
 pub fn build_local_manifest(
     table: &BlackholeTable,
     our_identity_hash: IdentityHash,
+    verified_ids: Option<&std::collections::HashSet<[u8; 16]>>,
 ) -> Result<Vec<u8>, ManifestError> {
     let mut map: Vec<(Value, Value)> = Vec::new();
 
     for (hash, entry) in table.iter_entries() {
         if entry.source.is_some() {
+            continue;
+        }
+        if let Some(set) = verified_ids
+            && !set.contains(hash.as_bytes())
+        {
             continue;
         }
         let until = entry.ttl.map(|ttl| entry.created + ttl);
@@ -262,7 +275,7 @@ mod tests {
     #[test]
     fn empty_table_produces_empty_map() {
         let table = BlackholeTable::new();
-        let bytes = build_local_manifest(&table, our_id()).unwrap();
+        let bytes = build_local_manifest(&table, our_id(), None).unwrap();
         let decoded = decode_manifest(&bytes).unwrap();
         assert!(decoded.is_empty());
     }
@@ -279,7 +292,7 @@ mod tests {
             1000.0,
         );
 
-        let bytes = build_local_manifest(&table, our_id()).unwrap();
+        let bytes = build_local_manifest(&table, our_id(), None).unwrap();
         let manifest = decode_manifest(&bytes).unwrap();
 
         assert_eq!(manifest.len(), 1);
@@ -295,7 +308,7 @@ mod tests {
         let now_at_add = now_seconds();
         table.add_with_reason([0xCC; 16], Some(600.0), BlackholeReason::Malformed);
 
-        let bytes = build_local_manifest(&table, our_id()).unwrap();
+        let bytes = build_local_manifest(&table, our_id(), None).unwrap();
         let manifest = decode_manifest(&bytes).unwrap();
 
         assert_eq!(manifest.len(), 1);

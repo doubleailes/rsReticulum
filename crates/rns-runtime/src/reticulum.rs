@@ -402,6 +402,11 @@ fn rpc_response_to_transport_response(
                             .map(rns_transport::blackhole::BlackholeReason::parse)
                             .unwrap_or_default(),
                         reason_label: entry.reason,
+                        // Verification is computed against the *local* actor's
+                        // recent_announces, which a remote-RPC bridge cannot
+                        // see. Default to false; the local-actor path sets it
+                        // correctly.
+                        verified: false,
                     })
                 })
                 .collect();

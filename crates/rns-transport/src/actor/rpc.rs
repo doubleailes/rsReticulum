@@ -164,19 +164,30 @@ impl TransportActor {
                 TransportQueryResponse::Ok
             }
             TransportQuery::GetBlackholedIdentities => {
+                // Snapshot of identity hashes we have a current announce for —
+                // used to decorate each entry with `verified`.
+                let verified_ids: std::collections::HashSet<[u8; 16]> = self
+                    .recent_announces
+                    .values()
+                    .filter_map(|e| e.public_key.map(|pk| rns_crypto::sha::truncated_hash(&pk)))
+                    .collect();
                 let entries: Vec<BlackholeRpcEntry> = self
                     .blackhole_table
                     .iter_entries()
-                    .map(|(hash, entry)| BlackholeRpcEntry {
-                        identity_hash: hash.into_bytes(),
-                        source: entry
-                            .source
-                            .map(|source| source.into_bytes())
-                            .or(self.transport_identity_hash),
-                        created: entry.created,
-                        ttl: entry.ttl,
-                        reason: entry.reason,
-                        reason_label: entry.reason_label.clone(),
+                    .map(|(hash, entry)| {
+                        let id_bytes = hash.into_bytes();
+                        BlackholeRpcEntry {
+                            identity_hash: id_bytes,
+                            source: entry
+                                .source
+                                .map(|source| source.into_bytes())
+                                .or(self.transport_identity_hash),
+                            created: entry.created,
+                            ttl: entry.ttl,
+                            reason: entry.reason,
+                            reason_label: entry.reason_label.clone(),
+                            verified: verified_ids.contains(&id_bytes),
+                        }
                     })
                     .collect();
                 TransportQueryResponse::BlackholeList(entries)
@@ -189,6 +200,25 @@ impl TransportActor {
             } => {
                 self.blackhole_table
                     .add_with_reason_label(hash, ttl, reason, reason_label);
+                // Mirror Python `Transport.remove_blackholed_paths`: walk the
+                // path table and drop any entry whose destination is owned by
+                // the freshly blackholed identity. Without this, existing
+                // paths stay valid until the standard expiry window so the
+                // blackholed peer's data packets keep arriving for ~15 min.
+                let dropped: Vec<[u8; 16]> = self
+                    .path_table
+                    .iter()
+                    .filter_map(|(dest, _)| {
+                        let dest_bytes = dest.into_bytes();
+                        let entry = self.recent_announces.get(&dest_bytes)?;
+                        let public_key = entry.public_key?;
+                        let owner = rns_crypto::sha::truncated_hash(&public_key);
+                        if owner == hash { Some(dest_bytes) } else { None }
+                    })
+                    .collect();
+                for dest in dropped {
+                    self.path_table.remove(&dest);
+                }
                 self.state_dirty = true;
                 TransportQueryResponse::Ok
             }
@@ -210,9 +240,19 @@ impl TransportActor {
                 TransportQueryResponse::IntResult(cleared as i64)
             }
             TransportQuery::BuildBlackholeManifest { publisher } => {
+                // Quarantine unverifiable entries from publication. Pre-fix
+                // garbage (LXMF-dest-as-identity bytes) and identities whose
+                // announce has been pruned both fail this check; we refuse to
+                // republish either.
+                let verified_ids: std::collections::HashSet<[u8; 16]> = self
+                    .recent_announces
+                    .values()
+                    .filter_map(|e| e.public_key.map(|pk| rns_crypto::sha::truncated_hash(&pk)))
+                    .collect();
                 match crate::discovery::build_local_manifest(
                     &self.blackhole_table,
                     publisher.into(),
+                    Some(&verified_ids),
                 ) {
                     Ok(payload) => TransportQueryResponse::Data(payload),
                     Err(e) => TransportQueryResponse::Error(e.to_string()),
@@ -407,6 +447,62 @@ impl TransportActor {
             TransportQuery::CleanKnownDestinations => {
                 self.cleanup_known_destinations(crate::actor::now_f64());
                 TransportQueryResponse::IntResult(self.recent_announces.len() as i64)
+            }
+            TransportQuery::ResolveIdentityHash { input } => {
+                // First treat input as a destination hash.
+                if let Some(entry) = self.recent_announces.get(&input)
+                    && let Some(public_key) = entry.public_key
+                {
+                    let id_hash = rns_crypto::sha::truncated_hash(&public_key);
+                    return TransportQueryResponse::HashResult(Some(id_hash));
+                }
+                // Fall back to treating input as an identity hash already.
+                for entry in self.recent_announces.values() {
+                    let Some(public_key) = entry.public_key else { continue; };
+                    let id_hash = rns_crypto::sha::truncated_hash(&public_key);
+                    if id_hash == input {
+                        return TransportQueryResponse::HashResult(Some(input));
+                    }
+                }
+                TransportQueryResponse::HashResult(None)
+            }
+            TransportQuery::FilterBlackholedDests { dests } => {
+                let mut hits = Vec::new();
+                for dest in &dests {
+                    let Some(entry) = self.recent_announces.get(dest) else { continue; };
+                    let Some(public_key) = entry.public_key else { continue; };
+                    let id_hash = rns_crypto::sha::truncated_hash(&public_key);
+                    if self.blackhole_table.is_blackholed(&id_hash) {
+                        hits.push(*dest);
+                    }
+                }
+                TransportQueryResponse::BlackholedDests(hits)
+            }
+            TransportQuery::PurgeUnverifiedBlackholes => {
+                let verified_ids: std::collections::HashSet<[u8; 16]> = self
+                    .recent_announces
+                    .values()
+                    .filter_map(|e| e.public_key.map(|pk| rns_crypto::sha::truncated_hash(&pk)))
+                    .collect();
+                let unverified: Vec<[u8; 16]> = self
+                    .blackhole_table
+                    .iter_entries()
+                    .filter_map(|(id, entry)| {
+                        if entry.reason != crate::blackhole::BlackholeReason::Manual {
+                            return None;
+                        }
+                        let bytes = id.into_bytes();
+                        if verified_ids.contains(&bytes) { None } else { Some(bytes) }
+                    })
+                    .collect();
+                let purged = unverified.len();
+                for id in unverified {
+                    self.blackhole_table.remove(&id);
+                }
+                if purged > 0 {
+                    self.state_dirty = true;
+                }
+                TransportQueryResponse::IntResult(purged as i64)
             }
         }
     }

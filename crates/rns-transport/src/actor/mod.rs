@@ -4163,9 +4163,27 @@ mod tests {
         ));
 
         // ClearSystemBlackholes drops Malformed/RateLimit/ProtocolViolation but
-        // leaves Manual entries intact.
+        // leaves Manual entries intact. We use a real identity for the Manual
+        // entry so it survives the manifest publication filter (Stage 3) which
+        // refuses to republish identities not backed by a known announce.
+        let manual_identity = rns_identity::identity::Identity::new();
+        let manual_public_key = manual_identity.get_public_key();
+        actor.recent_announces.insert(
+            [0xD0; 16],
+            RecentAnnounce {
+                dest_hash: [0xD0; 16],
+                hops: 1,
+                app_data: None,
+                timestamp: 1.0,
+                public_key: Some(manual_public_key),
+                ratchet: None,
+                raw_packet: Vec::new(),
+                retained: false,
+                name_hash: [0; 10],
+            },
+        );
         actor.blackhole_table.add_with_reason(
-            [0xDD; 16],
+            manual_identity.hash,
             None,
             crate::blackhole::BlackholeReason::Manual,
         );
@@ -4180,7 +4198,7 @@ mod tests {
             other => panic!("expected IntResult, got {other:?}"),
         };
         assert_eq!(cleared, 2);
-        assert!(actor.blackhole_table.is_blackholed(&[0xDD; 16]));
+        assert!(actor.blackhole_table.is_blackholed(&manual_identity.hash));
         assert!(!actor.blackhole_table.is_blackholed(&[0xBB; 16]));
         assert!(!actor.blackhole_table.is_blackholed(&[0xEE; 16]));
 
@@ -4193,7 +4211,7 @@ mod tests {
             };
         let decoded = crate::discovery::decode_manifest(&payload).unwrap();
         assert_eq!(decoded.len(), 1);
-        assert_eq!(decoded[0].0, [0xDD; 16]);
+        assert_eq!(decoded[0].0, manual_identity.hash);
         assert_eq!(decoded[0].1.source.as_bytes(), &[0x99; 16]);
 
         let (mut subscriber, _tx) = TransportActor::new();
@@ -4204,7 +4222,7 @@ mod tests {
             other => panic!("expected IntResult, got {other:?}"),
         };
         assert_eq!(applied, 1);
-        assert!(subscriber.blackhole_table.is_blackholed(&[0xDD; 16]));
+        assert!(subscriber.blackhole_table.is_blackholed(&manual_identity.hash));
     }
 
     #[test]
@@ -5833,5 +5851,226 @@ mod tests {
             rns_identity::name_hash::name_hash("lxmf.delivery"),
             "RecentAnnounce.name_hash must match SHA-256(app_name)[:10]"
         );
+    }
+
+    /// Helper: insert a synthetic recent_announce for `(dest_hash, identity)`.
+    fn insert_announce_for(
+        actor: &mut TransportActor,
+        dest_hash: [u8; 16],
+        identity: &rns_identity::identity::Identity,
+    ) {
+        actor.recent_announces.insert(
+            dest_hash,
+            RecentAnnounce {
+                dest_hash,
+                hops: 1,
+                app_data: None,
+                timestamp: 1.0,
+                public_key: Some(identity.get_public_key()),
+                ratchet: None,
+                raw_packet: Vec::new(),
+                retained: false,
+                name_hash: [0; 10],
+            },
+        );
+    }
+
+    #[test]
+    fn resolve_identity_hash_dest_branch() {
+        let (mut actor, _tx) = TransportActor::new();
+        let identity = rns_identity::identity::Identity::new();
+        let dest_hash = [0xA1; 16];
+        insert_announce_for(&mut actor, dest_hash, &identity);
+
+        let resp = actor.handle_query(crate::messages::TransportQuery::ResolveIdentityHash {
+            input: dest_hash,
+        });
+        match resp {
+            crate::messages::TransportQueryResponse::HashResult(Some(h)) => {
+                assert_eq!(h, identity.hash);
+            }
+            other => panic!("expected HashResult(Some(_)), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_identity_hash_identity_branch() {
+        let (mut actor, _tx) = TransportActor::new();
+        let identity = rns_identity::identity::Identity::new();
+        insert_announce_for(&mut actor, [0xB2; 16], &identity);
+
+        // Input IS already the identity hash.
+        let resp = actor.handle_query(crate::messages::TransportQuery::ResolveIdentityHash {
+            input: identity.hash,
+        });
+        match resp {
+            crate::messages::TransportQueryResponse::HashResult(Some(h)) => {
+                assert_eq!(h, identity.hash);
+            }
+            other => panic!("expected HashResult(Some(_)), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_identity_hash_unknown() {
+        let (mut actor, _tx) = TransportActor::new();
+        let resp = actor.handle_query(crate::messages::TransportQuery::ResolveIdentityHash {
+            input: [0xCC; 16],
+        });
+        assert!(matches!(
+            resp,
+            crate::messages::TransportQueryResponse::HashResult(None)
+        ));
+    }
+
+    #[test]
+    fn filter_blackholed_dests_returns_only_blackholed() {
+        let (mut actor, _tx) = TransportActor::new();
+        let blocked = rns_identity::identity::Identity::new();
+        let allowed = rns_identity::identity::Identity::new();
+        let dest_blocked = [0xA1; 16];
+        let dest_allowed = [0xA2; 16];
+        let dest_unknown = [0xA3; 16];
+        insert_announce_for(&mut actor, dest_blocked, &blocked);
+        insert_announce_for(&mut actor, dest_allowed, &allowed);
+        actor.blackhole_table.add(blocked.hash, None);
+
+        let resp = actor.handle_query(crate::messages::TransportQuery::FilterBlackholedDests {
+            dests: vec![dest_blocked, dest_allowed, dest_unknown],
+        });
+        match resp {
+            crate::messages::TransportQueryResponse::BlackholedDests(v) => {
+                assert_eq!(v, vec![dest_blocked]);
+            }
+            other => panic!("expected BlackholedDests, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn blackhole_identity_scrubs_path_table() {
+        let (mut actor, _tx) = TransportActor::new();
+        let identity = rns_identity::identity::Identity::new();
+        let other = rns_identity::identity::Identity::new();
+        let (raw_a, dest_a) = make_announce_for(&identity, "lxmf.delivery", 2);
+        let (raw_b, dest_b) = make_announce_for(&identity, "lxmf.propagation", 2);
+        let (raw_c, dest_c) = make_announce_for(&other, "lxmf.delivery", 2);
+
+        actor.is_transport_enabled = true;
+        let (entry, _rx) = make_test_interface("scrub_iface");
+        actor.interfaces.insert(1, entry);
+
+        for raw in [raw_a, raw_b, raw_c] {
+            actor.on_inbound(crate::messages::InboundPacket {
+                raw,
+                interface_id: 1,
+                rssi: None,
+                snr: None,
+                q: None,
+            });
+        }
+        assert!(actor.path_table.has_path(&dest_a));
+        assert!(actor.path_table.has_path(&dest_b));
+        assert!(actor.path_table.has_path(&dest_c));
+
+        let resp = actor.handle_query(crate::messages::TransportQuery::BlackholeIdentity {
+            hash: identity.hash,
+            ttl: None,
+            reason: crate::blackhole::BlackholeReason::Manual,
+            reason_label: None,
+        });
+        assert!(matches!(resp, crate::messages::TransportQueryResponse::Ok));
+
+        // Both destinations belonging to `identity` are scrubbed; `other` survives.
+        assert!(!actor.path_table.has_path(&dest_a));
+        assert!(!actor.path_table.has_path(&dest_b));
+        assert!(actor.path_table.has_path(&dest_c));
+    }
+
+    #[test]
+    fn manifest_publication_skips_unverified_entries() {
+        let (mut actor, _tx) = TransportActor::new();
+        let verified = rns_identity::identity::Identity::new();
+        let unverified_id = [0xFE; 16]; // no matching announce
+        insert_announce_for(&mut actor, [0xA1; 16], &verified);
+        actor.blackhole_table.add_with_reason(
+            verified.hash,
+            None,
+            crate::blackhole::BlackholeReason::Manual,
+        );
+        actor.blackhole_table.add_with_reason(
+            unverified_id,
+            None,
+            crate::blackhole::BlackholeReason::Manual,
+        );
+
+        let payload =
+            match actor.handle_query(crate::messages::TransportQuery::BuildBlackholeManifest {
+                publisher: [0x99; 16],
+            }) {
+                crate::messages::TransportQueryResponse::Data(p) => p,
+                other => panic!("expected Data manifest, got {other:?}"),
+            };
+        let decoded = crate::discovery::decode_manifest(&payload).unwrap();
+        assert_eq!(decoded.len(), 1, "only the verified entry should be published");
+        assert_eq!(decoded[0].0, verified.hash);
+    }
+
+    #[test]
+    fn get_blackholed_identities_decorates_verified_flag() {
+        let (mut actor, _tx) = TransportActor::new();
+        let known = rns_identity::identity::Identity::new();
+        insert_announce_for(&mut actor, [0xA1; 16], &known);
+        actor.blackhole_table.add(known.hash, None);
+        actor.blackhole_table.add([0xFE; 16], None);
+
+        let entries = match actor
+            .handle_query(crate::messages::TransportQuery::GetBlackholedIdentities)
+        {
+            crate::messages::TransportQueryResponse::BlackholeList(v) => v,
+            other => panic!("expected BlackholeList, got {other:?}"),
+        };
+        assert_eq!(entries.len(), 2);
+        for e in entries {
+            if e.identity_hash == known.hash {
+                assert!(e.verified, "known identity should be verified");
+            } else {
+                assert!(!e.verified, "unknown identity must not be verified");
+            }
+        }
+    }
+
+    #[test]
+    fn purge_unverified_blackholes_drops_only_unverified() {
+        let (mut actor, _tx) = TransportActor::new();
+        let known = rns_identity::identity::Identity::new();
+        insert_announce_for(&mut actor, [0xA1; 16], &known);
+        actor.blackhole_table.add_with_reason(
+            known.hash,
+            None,
+            crate::blackhole::BlackholeReason::Manual,
+        );
+        actor.blackhole_table.add_with_reason(
+            [0xFE; 16],
+            None,
+            crate::blackhole::BlackholeReason::Manual,
+        );
+        // Non-Manual entries are not affected by PurgeUnverifiedBlackholes regardless
+        // of verification state — they're managed by ClearSystemBlackholes.
+        actor.blackhole_table.add_with_reason(
+            [0xFD; 16],
+            None,
+            crate::blackhole::BlackholeReason::RateLimit,
+        );
+
+        let resp =
+            actor.handle_query(crate::messages::TransportQuery::PurgeUnverifiedBlackholes);
+        let purged = match resp {
+            crate::messages::TransportQueryResponse::IntResult(n) => n,
+            other => panic!("expected IntResult, got {other:?}"),
+        };
+        assert_eq!(purged, 1);
+        assert!(actor.blackhole_table.is_blackholed(&known.hash));
+        assert!(!actor.blackhole_table.is_blackholed(&[0xFE; 16]));
+        assert!(actor.blackhole_table.is_blackholed(&[0xFD; 16]));
     }
 }
