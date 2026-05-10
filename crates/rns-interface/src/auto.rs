@@ -237,14 +237,38 @@ impl Default for AutoInterfaceConfig {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct PeerKey {
+    ip: Ipv6Addr,
+    scope_id: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PeerScopeSource {
+    Received,
+    LocalCandidate,
+    UnscopedNonLinkLocal,
+}
+
+#[derive(Debug, Clone)]
+struct PeerScopeCandidate {
+    ifname: String,
+    scope_id: u32,
+    source: PeerScopeSource,
+}
+
 #[derive(Debug, Clone)]
 struct Peer {
+    ip: Ipv6Addr,
+    ifname: String,
+    scope_id: u32,
+    scope_source: PeerScopeSource,
     addr: SocketAddrV6,
     last_seen: Instant,
     last_reverse: Instant,
 }
 
-type PeerTable = Arc<Mutex<HashMap<Ipv6Addr, Peer>>>;
+type PeerTable = Arc<Mutex<HashMap<PeerKey, Peer>>>;
 
 #[derive(Debug, Clone)]
 struct DeduplicateEntry {
@@ -332,6 +356,111 @@ fn normalize_link_local_addr(addr: Ipv6Addr) -> Ipv6Addr {
         segments[6],
         segments[7],
     )
+}
+
+fn is_link_local_v6(addr: Ipv6Addr) -> bool {
+    (addr.segments()[0] & 0xffc0) == 0xfe80
+}
+
+fn peer_scope_candidates(
+    peer_ip: Ipv6Addr,
+    received_scope: u32,
+    link_locals: &[(String, Ipv6Addr, u32)],
+) -> Vec<PeerScopeCandidate> {
+    // Python Reticulum associates AutoInterface peers with the receiving
+    // ifname and sends to fe80::peer%ifindex. Some platforms report scope 0
+    // from a wildcard-bound socket, so expand link-local peers to scoped local
+    // candidates instead of storing an unusable fe80::peer%0 address.
+    if received_scope != 0 {
+        let ifname = link_locals
+            .iter()
+            .find(|(_, _, scope_id)| *scope_id == received_scope)
+            .map(|(name, _, _)| name.clone())
+            .unwrap_or_else(|| format!("ifindex:{received_scope}"));
+        return vec![PeerScopeCandidate {
+            ifname,
+            scope_id: received_scope,
+            source: PeerScopeSource::Received,
+        }];
+    }
+
+    if !is_link_local_v6(peer_ip) {
+        return vec![PeerScopeCandidate {
+            ifname: String::new(),
+            scope_id: 0,
+            source: PeerScopeSource::UnscopedNonLinkLocal,
+        }];
+    }
+
+    let mut candidates = Vec::new();
+    for (ifname, _, scope_id) in link_locals {
+        if *scope_id == 0
+            || candidates
+                .iter()
+                .any(|c: &PeerScopeCandidate| c.scope_id == *scope_id)
+        {
+            continue;
+        }
+        candidates.push(PeerScopeCandidate {
+            ifname: ifname.clone(),
+            scope_id: *scope_id,
+            source: PeerScopeSource::LocalCandidate,
+        });
+    }
+    candidates
+}
+
+fn upsert_peer_candidates(
+    table: &mut HashMap<PeerKey, Peer>,
+    peer_ip: Ipv6Addr,
+    data_port: u16,
+    received_scope: u32,
+    link_locals: &[(String, Ipv6Addr, u32)],
+    now: Instant,
+    source: &'static str,
+) -> usize {
+    let candidates = peer_scope_candidates(peer_ip, received_scope, link_locals);
+    if candidates.is_empty() {
+        tracing::warn!(
+            peer = %peer_ip,
+            received_scope,
+            local_candidates = link_locals.len(),
+            source,
+            "auto: discovered link-local peer but no usable scope candidates are available"
+        );
+        return 0;
+    }
+
+    let mut inserted = 0usize;
+    for candidate in candidates {
+        let key = PeerKey {
+            ip: peer_ip,
+            scope_id: candidate.scope_id,
+        };
+        let data_addr = SocketAddrV6::new(peer_ip, data_port, 0, candidate.scope_id);
+        table
+            .entry(key)
+            .and_modify(|p| {
+                p.ifname = candidate.ifname.clone();
+                p.scope_id = candidate.scope_id;
+                p.scope_source = candidate.source;
+                p.addr = data_addr;
+                p.last_seen = now;
+            })
+            .or_insert_with(|| {
+                inserted += 1;
+                Peer {
+                    ip: peer_ip,
+                    ifname: candidate.ifname,
+                    scope_id: candidate.scope_id,
+                    scope_source: candidate.source,
+                    addr: data_addr,
+                    last_seen: now,
+                    last_reverse: now,
+                }
+            });
+    }
+    inserted
 }
 
 /// Derive `ff_T_S_:0:XXXX:XXXX:XXXX:XXXX:XXXX:XXXX` from address-type nibble,
@@ -779,9 +908,19 @@ fn get_link_local_addrs_android(
 }
 
 fn iface_scope_id(iface: &if_addrs::Interface) -> u32 {
-    iface
-        .index
-        .unwrap_or_else(|| iface_name_to_scope_id(&iface.name))
+    if let Some(index) = iface.index {
+        return index;
+    }
+
+    #[cfg(windows)]
+    {
+        let adapter_index = iface_name_to_scope_id(&iface.adapter_name);
+        if adapter_index != 0 {
+            return adapter_index;
+        }
+    }
+
+    iface_name_to_scope_id(&iface.name)
 }
 
 /// Convert interface name to scope ID via POSIX/Windows `if_nametoindex`.
@@ -839,6 +978,11 @@ fn bind_one(port: u16) -> std::io::Result<UdpSocket> {
     let addr: SocketAddr = SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, port, 0, 0).into();
     sock.bind(&addr.into())?;
     UdpSocket::from_std(sock.into())
+}
+
+fn set_multicast_if_v6(sock: &UdpSocket, scope_id: u32) -> std::io::Result<()> {
+    let sock_ref = socket2::SockRef::from(sock);
+    sock_ref.set_multicast_if_v6(scope_id)
 }
 
 /// Diagnostic: probe alternate ports to localize bind failures.
@@ -927,6 +1071,15 @@ pub async fn spawn_auto_interface(
     tracing::info!(name = %config.name, port = config.discovery_port, "auto discovery socket bound");
 
     for (iface_name, _ll_addr, scope_id) in &initial_link_locals {
+        if let Err(e) = set_multicast_if_v6(disc_sock.as_ref(), *scope_id) {
+            tracing::warn!(
+                iface = %iface_name,
+                scope_id,
+                error = %e,
+                raw_os_error = ?e.raw_os_error(),
+                "failed to set IPv6 multicast outbound interface"
+            );
+        }
         if let Err(e) = disc_sock.join_multicast_v6(&mcast_group, *scope_id) {
             // EPERM/EACCES on Apple is the canonical signal that the
             // multicast networking entitlement isn't provisioned (e.g. iOS
@@ -1001,16 +1154,38 @@ pub async fn spawn_auto_interface(
             for (_name, ll_addr, scope_id) in &snapshot {
                 let beacon = make_beacon(&group_id, ll_addr);
                 let dest = SocketAddrV6::new(mcast_group, disc_port, 0, *scope_id);
+                if let Err(e) = set_multicast_if_v6(disc_sock_send.as_ref(), *scope_id) {
+                    tracing::warn!(
+                        iface = %_name,
+                        ll = %ll_addr,
+                        scope_id,
+                        error = %e,
+                        raw_os_error = ?e.raw_os_error(),
+                        "auto: failed to select multicast outbound interface"
+                    );
+                }
                 let res = disc_sock_send.send_to(&beacon, dest).await;
-                tracing::debug!(
-                    iface = %_name,
-                    ll = %ll_addr,
-                    scope_id,
-                    dst = %dest,
-                    hash = %hex32(&beacon),
-                    sent = res.is_ok(),
-                    "auto-instr beacon TX"
-                );
+                match res {
+                    Ok(n) => tracing::debug!(
+                        iface = %_name,
+                        ll = %ll_addr,
+                        scope_id,
+                        dst = %dest,
+                        hash = %hex32(&beacon),
+                        sent_bytes = n,
+                        "auto-instr beacon TX"
+                    ),
+                    Err(e) => tracing::warn!(
+                        iface = %_name,
+                        ll = %ll_addr,
+                        scope_id,
+                        dst = %dest,
+                        hash = %hex32(&beacon),
+                        error = %e,
+                        raw_os_error = ?e.raw_os_error(),
+                        "auto: beacon TX failed"
+                    ),
+                }
             }
         }
     });
@@ -1037,8 +1212,8 @@ pub async fn spawn_auto_interface(
                     if let SocketAddr::V6(src_v6) = src {
                         let peer_ip = *src_v6.ip();
                         // Match source LL against ours — non-empty means self-echo.
+                        let snapshot = { disc_link_locals.lock().await.clone() };
                         let self_iface = {
-                            let snapshot = disc_link_locals.lock().await;
                             snapshot
                                 .iter()
                                 .find(|(_, ll, _)| *ll == peer_ip)
@@ -1068,19 +1243,25 @@ pub async fn spawn_auto_interface(
                         if !match_ok {
                             continue;
                         }
-                        let scope = src_v6.scope_id();
-                        let data_addr = SocketAddrV6::new(peer_ip, data_port, 0, scope);
+                        let received_scope = src_v6.scope_id();
                         let now = Instant::now();
                         let mut table = peers_disc.lock().await;
-                        table
-                            .entry(peer_ip)
-                            .and_modify(|p| p.last_seen = now)
-                            .or_insert(Peer {
-                                addr: data_addr,
-                                last_seen: now,
-                                last_reverse: now,
-                            });
-                        tracing::debug!(peer = %peer_ip, "auto: peer discovered/refreshed");
+                        let inserted = upsert_peer_candidates(
+                            &mut table,
+                            peer_ip,
+                            data_port,
+                            received_scope,
+                            &snapshot,
+                            now,
+                            "multicast",
+                        );
+                        tracing::debug!(
+                            peer = %peer_ip,
+                            received_scope,
+                            inserted,
+                            peer_records = table.len(),
+                            "auto: peer discovered/refreshed"
+                        );
                     } else {
                         tracing::debug!(src = %src, "auto-instr mcast RX non-v6 source");
                     }
@@ -1099,16 +1280,19 @@ pub async fn spawn_auto_interface(
     let unicast_group_id = config.group_id.clone();
     let unicast_link_locals = link_locals.clone();
     let unicast_disc_port = config.discovery_port + 1;
-    if let Ok(unicast_sock) = UdpSocket::bind(SocketAddrV6::new(
-        Ipv6Addr::UNSPECIFIED,
-        unicast_disc_port,
-        0,
-        0,
-    ))
-    .await
-    {
-        let unicast_sock = Arc::new(unicast_sock);
-
+    let unicast_sock = match bind_reusable_udp_v6(unicast_disc_port) {
+        Ok(sock) => Some(Arc::new(sock)),
+        Err(e) => {
+            tracing::debug!(
+                port = unicast_disc_port,
+                error = %e,
+                raw_os_error = ?e.raw_os_error(),
+                "auto: could not bind unicast discovery port"
+            );
+            None
+        }
+    };
+    if let Some(unicast_sock) = unicast_sock {
         let urecv_sock = unicast_sock.clone();
         let urecv_peers = peers_unicast.clone();
         let urecv_online = online_u.clone();
@@ -1127,29 +1311,33 @@ pub async fn spawn_auto_interface(
                         }
                         if let SocketAddr::V6(src_v6) = src {
                             let peer_ip = *src_v6.ip();
-                            let is_self = {
-                                let snapshot = urecv_link_locals.lock().await;
-                                snapshot.iter().any(|(_, ll, _)| *ll == peer_ip)
-                            };
+                            let snapshot = { urecv_link_locals.lock().await.clone() };
+                            let is_self = { snapshot.iter().any(|(_, ll, _)| *ll == peer_ip) };
                             if is_self {
                                 continue;
                             }
                             if !verify_beacon(&buf[..n], &urecv_group_id, &peer_ip) {
                                 continue;
                             }
-                            let scope = src_v6.scope_id();
-                            let data_addr = SocketAddrV6::new(peer_ip, data_port, 0, scope);
+                            let received_scope = src_v6.scope_id();
                             let now = Instant::now();
                             let mut table = urecv_peers.lock().await;
-                            table
-                                .entry(peer_ip)
-                                .and_modify(|p| p.last_seen = now)
-                                .or_insert(Peer {
-                                    addr: data_addr,
-                                    last_seen: now,
-                                    last_reverse: now,
-                                });
-                            tracing::debug!(peer = %peer_ip, "auto: unicast peer discovered");
+                            let inserted = upsert_peer_candidates(
+                                &mut table,
+                                peer_ip,
+                                data_port,
+                                received_scope,
+                                &snapshot,
+                                now,
+                                "unicast",
+                            );
+                            tracing::debug!(
+                                peer = %peer_ip,
+                                received_scope,
+                                inserted,
+                                peer_records = table.len(),
+                                "auto: unicast peer discovered"
+                            );
                         }
                     }
                     Err(e) => {
@@ -1194,26 +1382,42 @@ pub async fn spawn_auto_interface(
                 let snapshot = { rev_link_locals.lock().await.clone() };
                 let now = Instant::now();
                 let mut table = rev_peers.lock().await;
-                for (_ip, peer) in table.iter_mut() {
+                for (_key, peer) in table.iter_mut() {
                     if now.duration_since(peer.last_reverse).as_secs_f64()
                         >= REVERSE_PEERING_INTERVAL
                     {
-                        for (_name, ll_addr, scope_id) in &snapshot {
+                        let mut targets: Vec<_> = snapshot
+                            .iter()
+                            .filter(|(_, _, scope_id)| {
+                                peer.scope_id == 0 || *scope_id == peer.scope_id
+                            })
+                            .collect();
+                        if targets.is_empty() {
+                            targets = snapshot.iter().collect();
+                        }
+                        for (_name, ll_addr, scope_id) in targets {
                             let beacon = make_beacon(&rev_group_id, ll_addr);
                             let dest =
                                 SocketAddrV6::new(*peer.addr.ip(), unicast_disc_port, 0, *scope_id);
-                            let _ = unicast_sock.send_to(&beacon, dest).await;
+                            if let Err(e) = unicast_sock.send_to(&beacon, dest).await {
+                                tracing::debug!(
+                                    peer = %peer.ip,
+                                    peer_ifname = %peer.ifname,
+                                    peer_scope_id = peer.scope_id,
+                                    local_iface = %_name,
+                                    local_scope_id = scope_id,
+                                    dst = %dest,
+                                    error = %e,
+                                    raw_os_error = ?e.raw_os_error(),
+                                    "auto: reverse peering TX failed"
+                                );
+                            }
                         }
                         peer.last_reverse = now;
                     }
                 }
             }
         });
-    } else {
-        tracing::debug!(
-            "auto: could not bind unicast discovery port {}",
-            unicast_disc_port
-        );
     }
 
     // Periodic jobs: NIC re-enum, peer aging, carrier detection (every PEER_JOB_INTERVAL).
@@ -1273,6 +1477,17 @@ pub async fn spawn_auto_interface(
                 );
             }
             for (ifname, addr, scope_id) in &added {
+                if let Err(e) = set_multicast_if_v6(jobs_disc_sock.as_ref(), *scope_id) {
+                    tracing::warn!(
+                        iface = %jobs_iface_name,
+                        nic = %ifname,
+                        addr = %addr,
+                        scope_id,
+                        error = %e,
+                        raw_os_error = ?e.raw_os_error(),
+                        "AutoInterface failed to set multicast interface for new NIC"
+                    );
+                }
                 match jobs_disc_sock.join_multicast_v6(&jobs_mcast, *scope_id) {
                     Ok(()) => tracing::info!(
                         iface = %jobs_iface_name,
@@ -1360,18 +1575,46 @@ pub async fn spawn_auto_interface(
             let prefix = hex_prefix(&data, 16);
             let table = peers_write.lock().await;
             let peer_count = table.len();
-            for (_ip, peer) in table.iter() {
-                let res = data_sock_w.send_to(&data, peer.addr).await;
+            if peer_count == 0 {
                 tracing::debug!(
-                    dst = %peer.addr,
                     len,
                     prefix = %prefix,
-                    peer_count,
-                    sent = res.is_ok(),
-                    "auto-instr data TX"
+                    "auto-instr data TX skipped: no discovered peers"
                 );
-                if res.is_ok() {
-                    task_txb.fetch_add(len as u64, Ordering::Relaxed);
+            }
+            for (_key, peer) in table.iter() {
+                let res = data_sock_w.send_to(&data, peer.addr).await;
+                match res {
+                    Ok(n) => {
+                        tracing::debug!(
+                            peer = %peer.ip,
+                            ifname = %peer.ifname,
+                            scope_id = peer.scope_id,
+                            scope_source = ?peer.scope_source,
+                            dst = %peer.addr,
+                            len,
+                            sent_bytes = n,
+                            prefix = %prefix,
+                            peer_count,
+                            "auto-instr data TX"
+                        );
+                        task_txb.fetch_add(len as u64, Ordering::Relaxed);
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            peer = %peer.ip,
+                            ifname = %peer.ifname,
+                            scope_id = peer.scope_id,
+                            scope_source = ?peer.scope_source,
+                            dst = %peer.addr,
+                            len,
+                            prefix = %prefix,
+                            peer_count,
+                            error = %e,
+                            raw_os_error = ?e.raw_os_error(),
+                            "auto: data TX failed"
+                        );
+                    }
                 }
             }
         }
@@ -1557,6 +1800,83 @@ mod tests {
         let other_addr = Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 2);
         assert!(!verify_beacon(&beacon, "reticulum", &other_addr));
         assert!(!verify_beacon(&beacon[..16], "reticulum", &addr));
+    }
+
+    #[test]
+    fn peer_scope_candidates_preserves_received_scope() {
+        let peer = Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 2);
+        let locals = vec![
+            ("en0".to_string(), Ipv6Addr::LOCALHOST, 11),
+            ("eth0".to_string(), Ipv6Addr::LOCALHOST, 22),
+        ];
+
+        let candidates = peer_scope_candidates(peer, 22, &locals);
+
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].ifname, "eth0");
+        assert_eq!(candidates[0].scope_id, 22);
+        assert_eq!(candidates[0].source, PeerScopeSource::Received);
+    }
+
+    #[test]
+    fn peer_scope_candidates_expands_zero_scope_for_link_local() {
+        let peer = Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 2);
+        let locals = vec![
+            ("en0".to_string(), Ipv6Addr::LOCALHOST, 11),
+            ("eth0".to_string(), Ipv6Addr::LOCALHOST, 22),
+            ("duplicate".to_string(), Ipv6Addr::LOCALHOST, 22),
+        ];
+
+        let candidates = peer_scope_candidates(peer, 0, &locals);
+
+        assert_eq!(candidates.len(), 2);
+        assert_eq!(candidates[0].ifname, "en0");
+        assert_eq!(candidates[0].scope_id, 11);
+        assert_eq!(candidates[0].source, PeerScopeSource::LocalCandidate);
+        assert_eq!(candidates[1].ifname, "eth0");
+        assert_eq!(candidates[1].scope_id, 22);
+    }
+
+    #[test]
+    fn upsert_peer_candidates_keys_same_ip_by_scope() {
+        let peer = Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 2);
+        let locals = vec![
+            ("en0".to_string(), Ipv6Addr::LOCALHOST, 11),
+            ("eth0".to_string(), Ipv6Addr::LOCALHOST, 22),
+        ];
+        let mut table = HashMap::new();
+
+        let inserted = upsert_peer_candidates(
+            &mut table,
+            peer,
+            DATA_PORT,
+            0,
+            &locals,
+            Instant::now(),
+            "test",
+        );
+
+        assert_eq!(inserted, 2);
+        assert_eq!(table.len(), 2);
+        assert!(table.contains_key(&PeerKey {
+            ip: peer,
+            scope_id: 11,
+        }));
+        assert!(table.contains_key(&PeerKey {
+            ip: peer,
+            scope_id: 22,
+        }));
+        assert_eq!(
+            table
+                .get(&PeerKey {
+                    ip: peer,
+                    scope_id: 11,
+                })
+                .unwrap()
+                .addr
+                .scope_id(),
+            11
+        );
     }
 
     #[test]
