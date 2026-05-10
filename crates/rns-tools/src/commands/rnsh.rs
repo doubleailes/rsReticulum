@@ -23,7 +23,7 @@ use rns_runtime::rnsh::{
 };
 use tokio::sync::mpsc;
 
-const RNS_VERSION: &str = "1.2.2";
+const RNS_VERSION: &str = "1.2.4";
 const RNSH_PROTOCOL_VERSION: &str = "0.2.0";
 const APP_NAME: &str = "rnsh";
 const DEFAULT_SERVICE_NAME: &str = "default";
@@ -872,7 +872,7 @@ mod tests {
     fn version_string_uses_rust_command_name() {
         assert_eq!(
             format!("rnsh-rs {RNS_VERSION} (protocol {RNSH_PROTOCOL_VERSION})"),
-            "rnsh-rs 1.2.2 (protocol 0.2.0)"
+            "rnsh-rs 1.2.4 (protocol 0.2.0)"
         );
     }
 

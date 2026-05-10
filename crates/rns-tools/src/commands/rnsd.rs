@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use clap::Parser;
 use tracing_subscriber::fmt::MakeWriter;
 
-const RETICULUM_COMPAT_VERSION: &str = "1.2.2";
+const RETICULUM_COMPAT_VERSION: &str = "1.2.4";
 const LOG_ROTATE_BYTES: u64 = 5 * 1024 * 1024;
 const RNSD_EXAMPLE_CONFIG: &str = r#"# This is an example Reticulum config file.
 
