@@ -1886,6 +1886,29 @@ mod tests {
         assert_eq!(iface_scope_id(&iface), 1234);
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn if_addrs_link_local_feature_is_enabled() {
+        let proc_addrs = std::fs::read_to_string("/proc/net/if_inet6").unwrap_or_default();
+        let host_has_link_local = proc_addrs.lines().any(|line| {
+            line.split_whitespace()
+                .nth(3)
+                .is_some_and(|scope| scope.eq_ignore_ascii_case("20"))
+        });
+        if !host_has_link_local {
+            return;
+        }
+
+        let addrs = if_addrs::get_if_addrs().expect("list network interfaces");
+        assert!(
+            addrs.iter().any(|iface| {
+                matches!(&iface.addr, if_addrs::IfAddr::V6(addr) if addr.is_link_local())
+            }),
+            "Linux has link-local IPv6 addresses in /proc/net/if_inet6, but if-addrs returned none; \
+             keep the workspace if-addrs dependency feature `link-local` enabled"
+        );
+    }
+
     fn test_interface(name: &str, ip: Ipv6Addr, index: Option<u32>) -> if_addrs::Interface {
         let addr = if_addrs::IfAddr::V6(if_addrs::Ifv6Addr {
             ip,

@@ -14,7 +14,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.9.3-autoif.1"
+version = "0.9.3-autoif.2"
 edition = "2024"
 license = "AGPL-3.0-or-later"
 rust-version = "1.85"
@@ -55,7 +55,9 @@ serialport = "4"
 btleplug = "0.11"
 
 # Networking
-if-addrs = "0.13"
+# AutoInterface requires fe80::/10 discovery addresses. if-addrs filters them
+# unless this feature is enabled, which leaves Linux/Windows with no adopted NICs.
+if-addrs = { version = "0.13", features = ["link-local"] }
 socket2 = { version = "0.5", features = ["all"] }
 
 # CLI
