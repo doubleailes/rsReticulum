@@ -5855,6 +5855,21 @@ mod tests {
             rns_identity::name_hash::name_hash("lxmf.delivery"),
             "RecentAnnounce.name_hash must match SHA-256(app_name)[:10]"
         );
+
+        match actor.handle_query(crate::messages::TransportQuery::GetRecentAnnounces) {
+            crate::messages::TransportQueryResponse::Announces(entries) => {
+                let rpc_entry = entries
+                    .iter()
+                    .find(|entry| entry.dest_hash == dh)
+                    .expect("announce must be exposed over RPC");
+                assert_eq!(
+                    rpc_entry.name_hash,
+                    rns_identity::name_hash::name_hash("lxmf.delivery"),
+                    "AnnounceRpcEntry.name_hash must preserve the cached aspect hash"
+                );
+            }
+            other => panic!("expected Announces response, got {other:?}"),
+        }
     }
 
     /// Helper: insert a synthetic recent_announce for `(dest_hash, identity)`.

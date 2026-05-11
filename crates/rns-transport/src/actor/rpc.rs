@@ -108,6 +108,7 @@ impl TransportActor {
                         timestamp: a.timestamp,
                         public_key: a.public_key,
                         ratchet: a.ratchet,
+                        name_hash: a.name_hash,
                         retained: a.retained,
                     })
                     .collect();

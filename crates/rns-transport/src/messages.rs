@@ -572,6 +572,8 @@ pub struct AnnounceRpcEntry {
     pub timestamp: f64,
     pub public_key: Option<[u8; 64]>,
     pub ratchet: Option<[u8; 32]>,
+    /// `SHA-256(app_name)[:10]` for the announced aspect.
+    pub name_hash: [u8; 10],
     /// Pinned via `RetainDestination`; the maintenance sweep skips the
     /// entry regardless of age while this is `true`.
     pub retained: bool,
