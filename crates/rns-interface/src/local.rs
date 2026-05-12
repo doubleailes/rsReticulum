@@ -265,6 +265,7 @@ mod platform {
 
                         let handle = InterfaceHandle {
                             id: client_id,
+                            parent_id: Some(0),
                             name: client_name,
                             mode: InterfaceMode::Full,
                             direction: InterfaceDirection {
@@ -300,6 +301,7 @@ mod platform {
 
         Ok(InterfaceHandle {
             id: 0,
+            parent_id: None,
             name,
             mode: InterfaceMode::Full,
             direction: InterfaceDirection {
@@ -345,6 +347,7 @@ mod platform {
 
         Ok(InterfaceHandle {
             id,
+            parent_id: None,
             name,
             mode: InterfaceMode::Full,
             direction: InterfaceDirection {
@@ -431,6 +434,7 @@ mod platform {
 
                         let handle = InterfaceHandle {
                             id: client_id,
+                            parent_id: Some(0),
                             name: client_name,
                             mode: InterfaceMode::Full,
                             direction: InterfaceDirection {
@@ -466,6 +470,7 @@ mod platform {
 
         Ok(InterfaceHandle {
             id: 0,
+            parent_id: None,
             name,
             mode: InterfaceMode::Full,
             direction: InterfaceDirection {
@@ -512,6 +517,7 @@ mod platform {
 
         Ok(InterfaceHandle {
             id,
+            parent_id: None,
             name,
             mode: InterfaceMode::Full,
             direction: InterfaceDirection {

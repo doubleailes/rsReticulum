@@ -283,6 +283,10 @@ impl TransportActor {
             return;
         };
 
+        if let Some(entry) = self.interfaces.get_mut(&interface_id) {
+            entry.ingress.received_path_request();
+        }
+
         let now = now_f64();
         let mut unique_tag = Vec::with_capacity(32);
         unique_tag.extend_from_slice(&requested_dest);
@@ -424,29 +428,39 @@ impl TransportActor {
             );
             self.forward_path_request(requested_dest, Some(interface_id), tag_bytes, false);
         } else if self.is_transport_enabled && should_search_unknown {
-            let should_forward = match self.discovery_path_requests.entry(requested_dest) {
-                std::collections::hash_map::Entry::Occupied(_) => {
-                    debug!(
-                        dest = %hex::encode(requested_dest),
-                        "not forwarding path request — discovery request is already waiting"
-                    );
-                    false
-                }
-                std::collections::hash_map::Entry::Vacant(entry) => {
-                    debug!(
-                        dest = %hex::encode(requested_dest),
-                        "forwarding path request on other interfaces"
-                    );
-                    entry.insert(DiscoveryPathRequest {
-                        requesting_interface: interface_id,
-                        timeout: now + PATH_REQUEST_TIMEOUT,
-                    });
-                    true
-                }
-            };
-            if should_forward {
-                self.forward_path_request(requested_dest, Some(interface_id), tag_bytes, true);
+            if self.discovery_path_requests.contains_key(&requested_dest) {
+                debug!(
+                    dest = %hex::encode(requested_dest),
+                    "not forwarding path request — discovery request is already waiting"
+                );
+                return;
             }
+
+            let ingress_limited = self
+                .interfaces
+                .get_mut(&interface_id)
+                .is_some_and(|iface| iface.ingress.should_ingress_limit_pr());
+            if ingress_limited {
+                debug!(
+                    dest = %hex::encode(requested_dest),
+                    interface_id,
+                    "not forwarding recursive path request — ingress PR burst active"
+                );
+                return;
+            }
+
+            debug!(
+                dest = %hex::encode(requested_dest),
+                "forwarding path request on other interfaces"
+            );
+            self.discovery_path_requests.insert(
+                requested_dest,
+                DiscoveryPathRequest {
+                    requesting_interface: interface_id,
+                    timeout: now + PATH_REQUEST_TIMEOUT,
+                },
+            );
+            self.forward_path_request(requested_dest, Some(interface_id), tag_bytes, true);
         } else if self.has_local_client_interfaces() {
             debug!(
                 dest = %hex::encode(requested_dest),
@@ -501,16 +515,61 @@ impl TransportActor {
         raw
     }
 
-    fn send_path_request(
+    pub(super) fn send_path_request(
         &mut self,
         destination_hash: [u8; 16],
         interface_id: InterfaceId,
         tag: Option<&[u8]>,
-        _recursive: bool,
+        recursive: bool,
     ) {
         let raw = self.build_path_request_packet(destination_hash, tag);
+        let now = now_f64();
+        {
+            let Some(entry) = self.interfaces.get_mut(&interface_id) else {
+                return;
+            };
+            if !entry.direction.outbound {
+                return;
+            }
+
+            if recursive {
+                if entry.ingress.should_egress_limit_pr() {
+                    trace!(
+                        dest = %hex::encode(destination_hash),
+                        interface_id,
+                        "skipping recursive path request — egress PR limit active"
+                    );
+                    return;
+                }
+                if !entry.announce_queue.is_empty() {
+                    trace!(
+                        dest = %hex::encode(destination_hash),
+                        interface_id,
+                        "skipping recursive path request — announce queue is not empty"
+                    );
+                    return;
+                }
+                if now < entry.announce_allowed_at {
+                    trace!(
+                        dest = %hex::encode(destination_hash),
+                        interface_id,
+                        "skipping recursive path request — announce cap window active"
+                    );
+                    return;
+                }
+
+                let bitrate = entry.bitrate.max(1) as f64;
+                let tx_time = (raw.len() as f64 * 8.0) / bitrate;
+                let wait_time = tx_time / entry.announce_cap.max(0.001);
+                entry.announce_allowed_at = now + wait_time;
+            }
+        }
+
         self.send_to_interface(interface_id, &raw);
-        self.path_requests.insert(destination_hash, now_f64());
+        if let Some(entry) = self.interfaces.get_mut(&interface_id) {
+            entry.ingress.sent_path_request();
+        }
+        self.path_requests.insert(destination_hash, now);
     }
 
     fn forward_path_request(
@@ -551,46 +610,13 @@ impl TransportActor {
             return;
         }
 
-        // Python Transport.request_path sends a PLAIN packet to the
-        // rnstransport.path.request destination. The payload is the requested
-        // destination hash, optionally followed by the transport identity hash,
-        // and a random tag used for request deduplication.
         let mut request_tag = [0u8; 16];
         {
             use rand::RngCore;
             rand::thread_rng().fill_bytes(&mut request_tag);
         }
 
-        let mut request_data = Vec::with_capacity(48);
-        request_data.extend_from_slice(&destination_hash);
-        if self.is_transport_enabled {
-            if let Some(identity_hash) = self.transport_identity_hash {
-                request_data.extend_from_slice(&identity_hash);
-            }
-        }
-        request_data.extend_from_slice(&request_tag);
-
-        let path_request_dest = rns_identity::destination::Destination::hash_from_name_and_identity(
-            "rnstransport.path.request",
-            None,
-        );
-        let flags = rns_wire::flags::PacketFlags {
-            header_type: rns_wire::flags::HeaderType::Header1,
-            context_flag: false,
-            transport_type: rns_wire::flags::TransportType::Broadcast,
-            destination_type: rns_wire::flags::DestinationType::Plain,
-            packet_type: rns_wire::flags::PacketType::Data,
-        };
-        let path_request_header = rns_wire::header::PacketHeader {
-            flags,
-            hops: 0,
-            transport_id: None,
-            destination_hash: path_request_dest,
-            context: rns_wire::context::PacketContext::None,
-        };
-        let mut request_raw = path_request_header.pack();
-        request_raw.extend_from_slice(&request_data);
-        self.broadcast_on_interfaces(&request_raw, None);
+        self.forward_path_request(destination_hash, None, Some(&request_tag), false);
 
         debug!(
             dest = hex::encode(destination_hash),

@@ -38,17 +38,22 @@ impl TransportActor {
             self.reverse_table.cull_dead_interfaces(&active_interfaces);
             self.link_table.cull_dead_interfaces(&active_interfaces);
 
-            // An unvalidated link whose proof window elapsed means the
-            // cached path is probably stale — expire it and re-resolve so
-            // the next attempt doesn't hammer a dead route.
-            let (_, expired_dests) = self.link_table.cull_stale(LINK_TIMEOUT);
-            for dest_hash in expired_dests {
-                self.path_table.expire(&dest_hash);
-                self.on_path_request(dest_hash);
-                debug!(
-                    dest = hex::encode(dest_hash),
-                    "unvalidated link expired -- path expired and re-discovery triggered"
-                );
+            // Failed link establishment can mean either a stale path or a
+            // topology change. Queue rediscovery so automated path requests
+            // are bounded and throttled like upstream Reticulum 1.2.5.
+            let (_, expired_links) = self.link_table.cull_stale(LINK_TIMEOUT);
+            let mut queued_dests = HashSet::new();
+            for expired_link in expired_links {
+                if let Some(request) = self.rediscovery_request_for_expired_link(expired_link, now)
+                {
+                    if queued_dests.insert(request.destination_hash) {
+                        self.queue_discovery_path_request(
+                            request.destination_hash,
+                            request.blocked_interface,
+                            now,
+                        );
+                    }
+                }
             }
 
             // Cull may have removed path/tunnel entries — flag for save so
@@ -151,15 +156,168 @@ impl TransportActor {
 
         self.expire_path_waiters(now);
 
-        // Drop pending path-request markers older than 30 s so a retried
-        // request isn't treated as "still in flight".
-        self.path_requests.retain(|_, last| now - *last < 30.0);
+        // Drop pending path-request markers after the upstream gate timeout.
+        self.path_requests
+            .retain(|_, last| now - *last < PATH_REQUEST_GATE_TIMEOUT);
         self.discovery_path_requests
             .retain(|_, request| now < request.timeout);
         self.discovery_pr_tags
             .retain(|_, last| now - *last < PATH_REQUEST_GATE_TIMEOUT);
 
+        self.process_pending_discovery_path_requests(now);
         self.process_announce_queues(now);
+    }
+
+    pub(super) fn queue_discovery_path_request(
+        &mut self,
+        destination_hash: [u8; 16],
+        blocked_interface: Option<InterfaceId>,
+        now: f64,
+    ) -> bool {
+        if self.pending_discovery_prs.len() >= MAX_QUEUED_DISCOVERY_PRS {
+            trace!(
+                dest = hex::encode(destination_hash),
+                "dropping queued discovery path request because queue is full"
+            );
+            return false;
+        }
+
+        let was_empty = self.pending_discovery_prs.is_empty();
+        self.pending_discovery_prs
+            .push_back(PendingDiscoveryPathRequest {
+                destination_hash,
+                blocked_interface,
+            });
+        if was_empty {
+            self.last_discovery_pr_tx = now;
+        }
+        true
+    }
+
+    pub(super) fn process_pending_discovery_path_requests(&mut self, now: f64) {
+        if self.pending_discovery_prs.is_empty() {
+            return;
+        }
+        if now - self.last_discovery_pr_tx < DISCOVERY_PR_TX_THROTTLE {
+            return;
+        }
+
+        let Some(request) = self.pending_discovery_prs.pop_front() else {
+            return;
+        };
+        self.last_discovery_pr_tx = now;
+
+        if let Some(blocked_interface) = request.blocked_interface {
+            let ids: Vec<InterfaceId> = self
+                .interfaces
+                .iter()
+                .filter_map(|(&id, entry)| {
+                    if id == blocked_interface || !entry.direction.outbound {
+                        None
+                    } else {
+                        Some(id)
+                    }
+                })
+                .collect();
+            for id in ids {
+                self.send_path_request(request.destination_hash, id, None, false);
+            }
+        } else {
+            let mut request_tag = [0u8; 16];
+            {
+                use rand::RngCore;
+                rand::thread_rng().fill_bytes(&mut request_tag);
+            }
+            let ids: Vec<InterfaceId> = self
+                .interfaces
+                .iter()
+                .filter_map(|(&id, entry)| entry.direction.outbound.then_some(id))
+                .collect();
+            for id in ids {
+                self.send_path_request(request.destination_hash, id, Some(&request_tag), false);
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn handle_expired_unvalidated_link(
+        &mut self,
+        expired_link: crate::link_table::ExpiredLink,
+        now: f64,
+    ) {
+        if let Some(request) = self.rediscovery_request_for_expired_link(expired_link, now) {
+            self.queue_discovery_path_request(
+                request.destination_hash,
+                request.blocked_interface,
+                now,
+            );
+        }
+    }
+
+    fn rediscovery_request_for_expired_link(
+        &mut self,
+        expired_link: crate::link_table::ExpiredLink,
+        now: f64,
+    ) -> Option<PendingDiscoveryPathRequest> {
+        let destination_hash = expired_link.destination_hash;
+        let last_path_request = self
+            .path_requests
+            .get(&destination_hash)
+            .copied()
+            .unwrap_or(0.0);
+        let path_request_throttle = now - last_path_request < PATH_REQUEST_MI;
+
+        let mut blocked_interface = None;
+        let mut should_request = false;
+
+        if !self.path_table.has_path(&destination_hash) {
+            should_request = true;
+        } else if !path_request_throttle && expired_link.taken_hops == 0 {
+            should_request = true;
+        } else if !path_request_throttle && self.path_table.hops_to(&destination_hash) == Some(1) {
+            should_request = true;
+            blocked_interface = Some(expired_link.receiving_interface);
+            self.mark_failed_link_path_unresponsive(&expired_link);
+        } else if !path_request_throttle && expired_link.taken_hops == 1 {
+            should_request = true;
+            blocked_interface = Some(expired_link.receiving_interface);
+            self.mark_failed_link_path_unresponsive(&expired_link);
+        }
+
+        if !should_request {
+            return None;
+        }
+
+        if !self.is_transport_enabled {
+            self.path_table.expire(&destination_hash);
+        }
+
+        debug!(
+            dest = hex::encode(destination_hash),
+            blocked_interface, "unvalidated link expired -- queued re-discovery"
+        );
+
+        Some(PendingDiscoveryPathRequest {
+            destination_hash,
+            blocked_interface,
+        })
+    }
+
+    fn mark_failed_link_path_unresponsive(
+        &mut self,
+        expired_link: &crate::link_table::ExpiredLink,
+    ) {
+        if !self.is_transport_enabled {
+            return;
+        }
+        let receiving_is_boundary = self
+            .interfaces
+            .get(&expired_link.receiving_interface)
+            .is_some_and(|entry| entry.mode == InterfaceMode::Boundary);
+        if !receiving_is_boundary {
+            self.path_table
+                .set_state(expired_link.destination_hash, PathState::Unresponsive);
+        }
     }
 
     /// Called on background → foreground. Resets every `last_*_check` so the

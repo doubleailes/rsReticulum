@@ -67,6 +67,10 @@ pub struct TransportActor {
     pub discovery_path_requests: HashMap<[u8; 16], DiscoveryPathRequest>,
     /// Python `discovery_pr_tags`: destination hash plus truncated path-request tag.
     pub discovery_pr_tags: HashMap<Vec<u8>, f64>,
+    /// Python `pending_discovery_prs`: failed-link rediscovery requests queued
+    /// for throttled emission.
+    pub pending_discovery_prs: VecDeque<PendingDiscoveryPathRequest>,
+    last_discovery_pr_tx: f64,
     /// External interface waiting for a path response from a local shared client.
     /// Python calls this `pending_local_path_requests`.
     pub pending_local_path_requests: HashMap<[u8; 16], InterfaceId>,
@@ -154,6 +158,12 @@ pub struct DiscoveryPathRequest {
     pub timeout: f64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PendingDiscoveryPathRequest {
+    pub destination_hash: [u8; 16],
+    pub blocked_interface: Option<InterfaceId>,
+}
+
 struct AnnounceHandlerRegistration {
     aspect_filter: Option<String>,
     receive_path_responses: bool,
@@ -202,6 +212,8 @@ impl TransportActor {
             path_requests: HashMap::new(),
             discovery_path_requests: HashMap::new(),
             discovery_pr_tags: HashMap::new(),
+            pending_discovery_prs: VecDeque::new(),
+            last_discovery_pr_tx: 0.0,
             pending_local_path_requests: HashMap::new(),
             path_states: HashMap::new(),
             path_waiters: HashMap::new(),
@@ -618,6 +630,8 @@ impl TransportActor {
         self.packet_metrics_order.clear();
         self.discovery_path_requests.clear();
         self.pending_local_path_requests.clear();
+        self.pending_discovery_prs.clear();
+        self.last_discovery_pr_tx = 0.0;
         self.state_dirty = true;
     }
 
@@ -1184,7 +1198,9 @@ fn mode_discovers_unknown_paths(mode: InterfaceMode) -> bool {
 mod tests {
     use super::*;
     use crate::constants::InterfaceDirection;
-    use crate::messages::{InboundPacket, InterfaceEntry, OutboundRequest};
+    use crate::messages::{
+        InboundPacket, InterfaceEntry, OutboundRequest, TransportQuery, TransportQueryResponse,
+    };
 
     fn make_valid_announce(app_name: &str, hops: u8) -> (Bytes, [u8; 16]) {
         let identity = rns_identity::identity::Identity::new();
@@ -3923,6 +3939,40 @@ mod tests {
         assert_eq!(actor.interfaces.get(&1).unwrap().ingress.held_count(), 1);
     }
 
+    #[test]
+    fn test_interface_stats_include_pr_and_burst_state() {
+        let (mut actor, _tx) = TransportActor::new();
+        let (mut entry, _rx) = make_test_interface("stats_iface");
+
+        for _ in 0..50 {
+            entry.ingress.received_announce();
+            entry.ingress.received_path_request();
+        }
+        assert!(entry.ingress.should_ingress_limit());
+        assert!(entry.ingress.should_ingress_limit_pr());
+        for _ in 0..3 {
+            entry.ingress.sent_announce();
+            entry.ingress.sent_path_request();
+        }
+        actor.interfaces.insert(1, entry);
+
+        match actor.handle_query(TransportQuery::GetInterfaceStats) {
+            TransportQueryResponse::InterfaceStats(stats) => {
+                assert_eq!(stats.len(), 1);
+                let entry = &stats[0];
+                assert!(entry.incoming_announce_frequency > 0.0);
+                assert!(entry.outgoing_announce_frequency > 0.0);
+                assert!(entry.incoming_pr_frequency > 0.0);
+                assert!(entry.outgoing_pr_frequency > 0.0);
+                assert!(entry.burst_active);
+                assert!(entry.burst_activated > 0.0);
+                assert!(entry.pr_burst_active);
+                assert!(entry.pr_burst_activated > 0.0);
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
+    }
+
     /// Floods a fresh actor with a tight burst of *unique* announces on one
     /// interface, then asserts: (a) the per-interface ingress controller
     /// engaged burst mode, and (b) the controller is now holding at least
@@ -4817,6 +4867,48 @@ mod tests {
         payload
     }
 
+    fn prime_ingress_pr_burst(actor: &mut TransportActor, interface_id: InterfaceId) {
+        let ingress = &mut actor
+            .interfaces
+            .get_mut(&interface_id)
+            .expect("test interface should exist")
+            .ingress;
+        for _ in 0..IC_BURST_MIN_SAMPLES {
+            ingress.received_path_request();
+        }
+    }
+
+    fn enable_and_prime_egress_pr_limit(actor: &mut TransportActor, interface_id: InterfaceId) {
+        let ingress = &mut actor
+            .interfaces
+            .get_mut(&interface_id)
+            .expect("test interface should exist")
+            .ingress;
+        *ingress =
+            crate::ingress::IngressController::with_overrides(&crate::ingress::IngressOverrides {
+                egress_control: Some(true),
+                ..Default::default()
+            });
+        for _ in 0..IC_BURST_MIN_SAMPLES {
+            ingress.sent_path_request();
+        }
+    }
+
+    fn expired_link(
+        destination_hash: [u8; 16],
+        receiving_interface: InterfaceId,
+        taken_hops: u8,
+    ) -> crate::link_table::ExpiredLink {
+        crate::link_table::ExpiredLink {
+            next_hop: Some([0xAB; 16]),
+            interface_id: 2,
+            remaining_hops: 2,
+            destination_hash,
+            receiving_interface,
+            taken_hops,
+        }
+    }
+
     #[test]
     fn path_request_payloads_use_python_default_lengths() {
         let destination = [0x11; 16];
@@ -4912,6 +5004,7 @@ mod tests {
 
         let (mut gateway, _gateway_rx) = make_test_interface("gateway");
         gateway.mode = InterfaceMode::Gateway;
+        gateway.ingress = crate::ingress::IngressController::disabled();
         actor.interfaces.insert(1, gateway);
         let (mut boundary, mut boundary_rx) = make_test_interface("boundary");
         boundary.mode = InterfaceMode::Boundary;
@@ -4932,6 +5025,7 @@ mod tests {
 
         let (mut gateway, _gateway_rx) = make_test_interface("gateway");
         gateway.mode = InterfaceMode::Gateway;
+        gateway.ingress = crate::ingress::IngressController::disabled();
         actor.interfaces.insert(1, gateway);
         let (mut boundary, mut boundary_rx) = make_test_interface("boundary");
         boundary.mode = InterfaceMode::Boundary;
@@ -4968,6 +5062,11 @@ mod tests {
             .expect("first forwarded request should create a waiting discovery entry")
             .timeout = 0.0;
         actor.on_tick();
+        actor
+            .interfaces
+            .get_mut(&2)
+            .expect("boundary interface should still exist")
+            .announce_allowed_at = 0.0;
 
         let third_tag = make_path_request_payload_with_tag(requested, None, [0xC7; 16]);
         actor.handle_inbound_path_request(&third_tag, 1);
@@ -4975,6 +5074,320 @@ mod tests {
             "same destination should forward again after the waiting discovery entry expires",
         );
         assert_eq!(actor.discovery_pr_tags.len(), 3);
+    }
+
+    #[test]
+    fn duplicate_path_requests_still_count_toward_ingress_frequency() {
+        let (mut actor, _tx) = TransportActor::new();
+        actor.is_transport_enabled = true;
+
+        let (mut gateway, _gateway_rx) = make_test_interface("gateway");
+        gateway.mode = InterfaceMode::Gateway;
+        actor.interfaces.insert(1, gateway);
+        let (mut boundary, mut boundary_rx) = make_test_interface("boundary");
+        boundary.mode = InterfaceMode::Boundary;
+        actor.interfaces.insert(2, boundary);
+
+        let requested = [0xD4; 16];
+        let payload = make_path_request_payload_with_tag(requested, None, [0xAA; 16]);
+        actor.handle_inbound_path_request(&payload, 1);
+        boundary_rx
+            .try_recv()
+            .expect("first tagged request should be forwarded");
+
+        actor.handle_inbound_path_request(&payload, 1);
+        actor.handle_inbound_path_request(&payload, 1);
+
+        assert!(boundary_rx.try_recv().is_err());
+        assert!(
+            actor
+                .interfaces
+                .get(&1)
+                .unwrap()
+                .ingress
+                .incoming_pr_frequency()
+                > 0.0,
+            "duplicate tagged PRs must still contribute to ingress PR stats"
+        );
+    }
+
+    #[test]
+    fn pr_ingress_burst_blocks_only_unknown_recursive_forwarding() {
+        let (mut actor, _tx) = TransportActor::new();
+        actor.is_transport_enabled = true;
+
+        let (mut gateway, _gateway_rx) = make_test_interface("gateway");
+        gateway.mode = InterfaceMode::Gateway;
+        actor.interfaces.insert(1, gateway);
+        let (mut boundary, mut boundary_rx) = make_test_interface("boundary");
+        boundary.mode = InterfaceMode::Boundary;
+        actor.interfaces.insert(2, boundary);
+        prime_ingress_pr_burst(&mut actor, 1);
+
+        let requested = [0xE0; 16];
+        actor.handle_inbound_path_request(&make_path_request_payload(requested, None), 1);
+
+        assert!(
+            boundary_rx.try_recv().is_err(),
+            "PR burst on ingress interface must suppress unknown recursive forwarding"
+        );
+        assert!(
+            !actor.discovery_path_requests.contains_key(&requested),
+            "suppressed recursive PRs should not create waiting discovery entries"
+        );
+    }
+
+    #[test]
+    fn pr_ingress_burst_does_not_block_local_destination_response() {
+        let (mut actor, _tx) = TransportActor::new();
+        actor.is_transport_enabled = true;
+
+        let (mut gateway, _gateway_rx) = make_test_interface("gateway");
+        gateway.mode = InterfaceMode::Gateway;
+        actor.interfaces.insert(1, gateway);
+        prime_ingress_pr_burst(&mut actor, 1);
+
+        let dest = [0xE1; 16];
+        let tag = [0xE2; 16];
+        let (event_tx, mut event_rx) = mpsc::channel(4);
+        actor.local_destinations.insert(dest);
+        actor.destination_channels.insert(dest, event_tx);
+
+        actor.handle_inbound_path_request(&make_path_request_payload_with_tag(dest, None, tag), 1);
+
+        let event = event_rx
+            .try_recv()
+            .expect("local destination should still be asked to announce");
+        let crate::link_messages::DestinationEvent::AnnounceRequested(request) = event else {
+            panic!("expected AnnounceRequested event");
+        };
+        assert!(request.path_response);
+        assert_eq!(request.tag.as_deref(), Some(&tag[..]));
+    }
+
+    #[test]
+    fn pr_ingress_burst_does_not_block_known_path_response() {
+        let (mut actor, _tx) = TransportActor::new();
+        actor.is_transport_enabled = true;
+        actor.transport_identity_hash = Some([0x44; 16]);
+
+        let (mut gateway, _gateway_rx) = make_test_interface("gateway");
+        gateway.mode = InterfaceMode::Gateway;
+        actor.interfaces.insert(1, gateway);
+        let (next_hop_iface, _rx2) = make_test_interface("next_hop_iface");
+        actor.interfaces.insert(2, next_hop_iface);
+        prime_ingress_pr_burst(&mut actor, 1);
+
+        let (raw, dest) = make_valid_announce("test.pr_burst.known_path", 1);
+        let mut path_entry =
+            crate::path_table::PathEntry::new(Some([0xAB; 16]), 2, 2, InterfaceMode::Gateway);
+        path_entry.packet_hash = Some(rns_wire::hash::packet_hash(
+            &raw,
+            rns_wire::flags::HeaderType::Header1,
+        ));
+        actor.path_table.insert(dest, path_entry);
+        actor.recent_announces.insert(
+            dest,
+            RecentAnnounce {
+                dest_hash: dest,
+                hops: 2,
+                app_data: None,
+                timestamp: now_f64(),
+                public_key: None,
+                ratchet: None,
+                raw_packet: raw.to_vec(),
+                retained: false,
+                name_hash: [0u8; 10],
+            },
+        );
+
+        actor.handle_inbound_path_request(&make_path_request_payload(dest, None), 1);
+
+        let queued = actor
+            .announce_table
+            .get(&dest)
+            .expect("known path response should still be queued during PR burst");
+        assert!(queued.block_rebroadcast);
+        assert_eq!(queued.attached_interface, Some(1));
+    }
+
+    #[test]
+    fn pr_ingress_burst_does_not_block_local_client_forwarding() {
+        let (mut actor, _tx) = TransportActor::new();
+
+        let (mut local_client, _local_rx) = make_test_interface("SharedInstanceServer/client_6");
+        local_client.role = InterfaceRole::LocalClient;
+        actor.interfaces.insert(1, local_client);
+        let (gateway, mut gateway_rx) = make_test_interface("gateway");
+        actor.interfaces.insert(2, gateway);
+        prime_ingress_pr_burst(&mut actor, 1);
+
+        let requested = [0xE3; 16];
+        actor.handle_inbound_path_request(&make_path_request_payload(requested, None), 1);
+
+        gateway_rx
+            .try_recv()
+            .expect("local-client PR forwarding must bypass ingress PR burst");
+    }
+
+    #[test]
+    fn recursive_path_request_egress_limit_skips_only_limited_interface() {
+        let (mut actor, _tx) = TransportActor::new();
+        actor.is_transport_enabled = true;
+
+        let (mut requestor, _requestor_rx) = make_test_interface("requestor");
+        requestor.mode = InterfaceMode::Gateway;
+        actor.interfaces.insert(1, requestor);
+        let (limited, mut limited_rx) = make_test_interface("limited");
+        actor.interfaces.insert(2, limited);
+        let (open, mut open_rx) = make_test_interface("open");
+        actor.interfaces.insert(3, open);
+        enable_and_prime_egress_pr_limit(&mut actor, 2);
+
+        actor.handle_inbound_path_request(&make_path_request_payload([0xE4; 16], None), 1);
+
+        assert!(
+            limited_rx.try_recv().is_err(),
+            "egress-limited interface should be skipped"
+        );
+        open_rx
+            .try_recv()
+            .expect("non-limited outbound interface should still receive recursive PR");
+    }
+
+    #[test]
+    fn recursive_path_request_egress_limit_is_inactive_by_default() {
+        let (mut actor, _tx) = TransportActor::new();
+        actor.is_transport_enabled = true;
+
+        let (mut requestor, _requestor_rx) = make_test_interface("requestor");
+        requestor.mode = InterfaceMode::Gateway;
+        actor.interfaces.insert(1, requestor);
+        let (mut outbound, mut outbound_rx) = make_test_interface("outbound");
+        for _ in 0..IC_BURST_MIN_SAMPLES {
+            outbound.ingress.sent_path_request();
+        }
+        actor.interfaces.insert(2, outbound);
+
+        actor.handle_inbound_path_request(&make_path_request_payload([0xE5; 16], None), 1);
+
+        outbound_rx
+            .try_recv()
+            .expect("default egress_control=false must not suppress recursive PRs");
+    }
+
+    #[test]
+    fn recursive_path_request_skips_queued_announces_and_active_cap() {
+        let (mut actor, _tx) = TransportActor::new();
+        actor.is_transport_enabled = true;
+
+        let (mut requestor, _requestor_rx) = make_test_interface("requestor");
+        requestor.mode = InterfaceMode::Gateway;
+        actor.interfaces.insert(1, requestor);
+        let (mut queued, mut queued_rx) = make_test_interface("queued");
+        queued.announce_queue.push(crate::messages::QueuedAnnounce {
+            destination_hash: [0xAA; 16],
+            time: now_f64(),
+            hops: 1,
+            raw: Bytes::from_static(&[0x01, 0x02]),
+        });
+        actor.interfaces.insert(2, queued);
+        let (mut capped, mut capped_rx) = make_test_interface("capped");
+        capped.announce_allowed_at = now_f64() + 60.0;
+        actor.interfaces.insert(3, capped);
+
+        actor.handle_inbound_path_request(&make_path_request_payload([0xE6; 16], None), 1);
+
+        assert!(queued_rx.try_recv().is_err());
+        assert!(capped_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn recursive_path_request_updates_announce_cap_window() {
+        let (mut actor, _tx) = TransportActor::new();
+        actor.is_transport_enabled = true;
+
+        let (mut requestor, _requestor_rx) = make_test_interface("requestor");
+        requestor.mode = InterfaceMode::Gateway;
+        actor.interfaces.insert(1, requestor);
+        let (outbound, mut outbound_rx) = make_test_interface("outbound");
+        actor.interfaces.insert(2, outbound);
+
+        actor.handle_inbound_path_request(&make_path_request_payload([0xE7; 16], None), 1);
+
+        outbound_rx
+            .try_recv()
+            .expect("recursive PR should be transmitted");
+        assert!(
+            actor.interfaces.get(&2).unwrap().announce_allowed_at > now_f64(),
+            "recursive PR send should reserve announce-cap airtime"
+        );
+    }
+
+    #[test]
+    fn outgoing_path_request_frequency_counts_direct_forwarded_and_recursive_sends() {
+        let (mut direct, _tx) = TransportActor::new();
+        let (direct_iface, mut direct_rx) = make_test_interface("direct");
+        direct.interfaces.insert(1, direct_iface);
+        direct.on_path_request([0x10; 16]);
+        direct.on_path_request([0x11; 16]);
+        direct_rx.try_recv().expect("first direct PR");
+        direct_rx.try_recv().expect("second direct PR");
+        assert!(
+            direct
+                .interfaces
+                .get(&1)
+                .unwrap()
+                .ingress
+                .outgoing_pr_frequency()
+                > 0.0
+        );
+
+        let (mut forwarded, _tx) = TransportActor::new();
+        let (mut local_client, _local_rx) = make_test_interface("SharedInstanceServer/client_7");
+        local_client.role = InterfaceRole::LocalClient;
+        forwarded.interfaces.insert(1, local_client);
+        let (gateway, mut gateway_rx) = make_test_interface("gateway");
+        forwarded.interfaces.insert(2, gateway);
+        forwarded.handle_inbound_path_request(&make_path_request_payload([0x12; 16], None), 1);
+        forwarded.handle_inbound_path_request(&make_path_request_payload([0x13; 16], None), 1);
+        gateway_rx.try_recv().expect("first forwarded PR");
+        gateway_rx.try_recv().expect("second forwarded PR");
+        assert!(
+            forwarded
+                .interfaces
+                .get(&2)
+                .unwrap()
+                .ingress
+                .outgoing_pr_frequency()
+                > 0.0
+        );
+
+        let (mut recursive, _tx) = TransportActor::new();
+        recursive.is_transport_enabled = true;
+        let (mut requestor, _requestor_rx) = make_test_interface("requestor");
+        requestor.mode = InterfaceMode::Gateway;
+        recursive.interfaces.insert(1, requestor);
+        let (outbound, mut outbound_rx) = make_test_interface("outbound");
+        recursive.interfaces.insert(2, outbound);
+        recursive.handle_inbound_path_request(&make_path_request_payload([0x14; 16], None), 1);
+        recursive
+            .interfaces
+            .get_mut(&2)
+            .unwrap()
+            .announce_allowed_at = 0.0;
+        recursive.handle_inbound_path_request(&make_path_request_payload([0x15; 16], None), 1);
+        outbound_rx.try_recv().expect("first recursive PR");
+        outbound_rx.try_recv().expect("second recursive PR");
+        assert!(
+            recursive
+                .interfaces
+                .get(&2)
+                .unwrap()
+                .ingress
+                .outgoing_pr_frequency()
+                > 0.0
+        );
     }
 
     #[test]
@@ -5146,6 +5559,236 @@ mod tests {
             !actor.discovery_path_requests.contains_key(&requested),
             "waiting discovery path requests should expire after PATH_REQUEST_TIMEOUT"
         );
+    }
+
+    #[test]
+    fn pending_discovery_pr_queue_caps_at_32() {
+        let (mut actor, _tx) = TransportActor::new();
+        let now = now_f64();
+
+        for value in 0u8..40 {
+            actor.queue_discovery_path_request([value; 16], None, now);
+        }
+
+        assert_eq!(actor.pending_discovery_prs.len(), MAX_QUEUED_DISCOVERY_PRS);
+        assert_eq!(
+            actor
+                .pending_discovery_prs
+                .front()
+                .unwrap()
+                .destination_hash,
+            [0x00; 16],
+            "full queue should retain earlier entries and drop new excess entries"
+        );
+        assert_eq!(
+            actor.pending_discovery_prs.back().unwrap().destination_hash,
+            [31; 16]
+        );
+    }
+
+    #[test]
+    fn queued_discovery_prs_emit_at_throttle_cadence() {
+        let (mut actor, _tx) = TransportActor::new();
+        let (iface, mut rx) = make_test_interface("gateway");
+        actor.interfaces.insert(1, iface);
+        let now = now_f64();
+
+        actor.queue_discovery_path_request([0xA1; 16], None, now);
+        actor.queue_discovery_path_request([0xA2; 16], None, now);
+
+        actor.process_pending_discovery_path_requests(now + DISCOVERY_PR_TX_THROTTLE - 0.01);
+        assert!(rx.try_recv().is_err());
+        assert_eq!(actor.pending_discovery_prs.len(), 2);
+
+        actor.process_pending_discovery_path_requests(now + DISCOVERY_PR_TX_THROTTLE);
+        rx.try_recv()
+            .expect("first queued discovery PR should transmit after throttle");
+        assert_eq!(actor.pending_discovery_prs.len(), 1);
+
+        actor.process_pending_discovery_path_requests(now + DISCOVERY_PR_TX_THROTTLE + 0.1);
+        assert!(rx.try_recv().is_err());
+        assert_eq!(actor.pending_discovery_prs.len(), 1);
+
+        actor.process_pending_discovery_path_requests(now + DISCOVERY_PR_TX_THROTTLE * 2.0);
+        rx.try_recv()
+            .expect("second queued discovery PR should wait for the next throttle window");
+        assert!(actor.pending_discovery_prs.is_empty());
+    }
+
+    #[test]
+    fn queued_discovery_pr_skips_blocked_interface() {
+        let (mut actor, _tx) = TransportActor::new();
+        let (iface_a, mut rx_a) = make_test_interface("a");
+        actor.interfaces.insert(1, iface_a);
+        let (iface_b, mut rx_b) = make_test_interface("b");
+        actor.interfaces.insert(2, iface_b);
+        let (iface_c, mut rx_c) = make_test_interface("c");
+        actor.interfaces.insert(3, iface_c);
+        let now = now_f64();
+
+        actor.queue_discovery_path_request([0xB1; 16], Some(2), now);
+        actor.process_pending_discovery_path_requests(now + DISCOVERY_PR_TX_THROTTLE);
+
+        rx_a.try_recv()
+            .expect("unblocked interface should receive queued discovery PR");
+        assert!(
+            rx_b.try_recv().is_err(),
+            "blocked interface must be excluded from rediscovery"
+        );
+        rx_c.try_recv()
+            .expect("other unblocked interface should receive queued discovery PR");
+    }
+
+    #[test]
+    fn failed_link_missing_path_queues_rediscovery() {
+        let (mut actor, _tx) = TransportActor::new();
+        let dest = [0xB2; 16];
+
+        actor.handle_expired_unvalidated_link(expired_link(dest, 1, 2), now_f64());
+
+        assert_eq!(actor.pending_discovery_prs.len(), 1);
+        assert_eq!(
+            actor
+                .pending_discovery_prs
+                .front()
+                .unwrap()
+                .destination_hash,
+            dest
+        );
+        assert_eq!(
+            actor
+                .pending_discovery_prs
+                .front()
+                .unwrap()
+                .blocked_interface,
+            None
+        );
+    }
+
+    #[test]
+    fn failed_link_taken_hops_zero_queues_when_not_recently_requested() {
+        let (mut actor, _tx) = TransportActor::new();
+        let dest = [0xB3; 16];
+        actor.path_table.insert(
+            dest,
+            crate::path_table::PathEntry::new(Some([0xAA; 16]), 2, 2, InterfaceMode::Gateway),
+        );
+        let now = now_f64();
+
+        actor.handle_expired_unvalidated_link(expired_link(dest, 1, 0), now);
+        assert_eq!(actor.pending_discovery_prs.len(), 1);
+
+        let (mut throttled, _tx) = TransportActor::new();
+        throttled.path_table.insert(
+            dest,
+            crate::path_table::PathEntry::new(Some([0xAA; 16]), 2, 2, InterfaceMode::Gateway),
+        );
+        throttled.path_requests.insert(dest, now);
+        throttled.handle_expired_unvalidated_link(expired_link(dest, 1, 0), now);
+        assert!(
+            throttled.pending_discovery_prs.is_empty(),
+            "taken_hops=0 rediscovery should respect PATH_REQUEST_MI"
+        );
+    }
+
+    #[test]
+    fn failed_link_previous_one_hop_destination_marks_unresponsive() {
+        let (mut actor, _tx) = TransportActor::new();
+        actor.is_transport_enabled = true;
+        let (mut gateway, _rx) = make_test_interface("gateway");
+        gateway.mode = InterfaceMode::Gateway;
+        actor.interfaces.insert(1, gateway);
+        let dest = [0xB4; 16];
+        actor.path_table.insert(
+            dest,
+            crate::path_table::PathEntry::new(None, 1, 1, InterfaceMode::Gateway),
+        );
+
+        actor.handle_expired_unvalidated_link(expired_link(dest, 1, 2), now_f64());
+
+        let request = actor.pending_discovery_prs.front().unwrap();
+        assert_eq!(request.destination_hash, dest);
+        assert_eq!(request.blocked_interface, Some(1));
+        assert_eq!(actor.path_table.get_state(&dest), PathState::Unresponsive);
+    }
+
+    #[test]
+    fn failed_link_one_hop_initiator_marks_unresponsive() {
+        let (mut actor, _tx) = TransportActor::new();
+        actor.is_transport_enabled = true;
+        let (mut gateway, _rx) = make_test_interface("gateway");
+        gateway.mode = InterfaceMode::Gateway;
+        actor.interfaces.insert(1, gateway);
+        let dest = [0xB5; 16];
+        actor.path_table.insert(
+            dest,
+            crate::path_table::PathEntry::new(Some([0xAA; 16]), 2, 2, InterfaceMode::Gateway),
+        );
+
+        actor.handle_expired_unvalidated_link(expired_link(dest, 1, 1), now_f64());
+
+        let request = actor.pending_discovery_prs.front().unwrap();
+        assert_eq!(request.destination_hash, dest);
+        assert_eq!(request.blocked_interface, Some(1));
+        assert_eq!(actor.path_table.get_state(&dest), PathState::Unresponsive);
+    }
+
+    #[test]
+    fn failed_link_boundary_interface_does_not_mark_unresponsive() {
+        let (mut actor, _tx) = TransportActor::new();
+        actor.is_transport_enabled = true;
+        let (mut boundary, _rx) = make_test_interface("boundary");
+        boundary.mode = InterfaceMode::Boundary;
+        actor.interfaces.insert(1, boundary);
+        let dest = [0xB6; 16];
+        actor.path_table.insert(
+            dest,
+            crate::path_table::PathEntry::new(None, 1, 1, InterfaceMode::Boundary),
+        );
+
+        actor.handle_expired_unvalidated_link(expired_link(dest, 1, 2), now_f64());
+
+        assert_eq!(
+            actor
+                .pending_discovery_prs
+                .front()
+                .unwrap()
+                .blocked_interface,
+            Some(1)
+        );
+        assert_eq!(actor.path_table.get_state(&dest), PathState::Unknown);
+    }
+
+    #[test]
+    fn non_transport_leaf_expires_current_path_before_rediscovery() {
+        let (mut actor, _tx) = TransportActor::new();
+        let dest = [0xB7; 16];
+        actor.path_table.insert(
+            dest,
+            crate::path_table::PathEntry::new(None, 1, 1, InterfaceMode::Gateway),
+        );
+
+        actor.handle_expired_unvalidated_link(expired_link(dest, 1, 2), now_f64());
+
+        assert!(!actor.path_table.has_path(&dest));
+        assert_eq!(actor.pending_discovery_prs.len(), 1);
+    }
+
+    #[test]
+    fn path_request_markers_survive_30s_and_expire_after_120s() {
+        let (mut actor, _tx) = TransportActor::new();
+        let keep = [0xB8; 16];
+        let expire = [0xB9; 16];
+        let now = now_f64();
+        actor.path_requests.insert(keep, now - 31.0);
+        actor
+            .path_requests
+            .insert(expire, now - PATH_REQUEST_GATE_TIMEOUT - 1.0);
+
+        actor.on_tick();
+
+        assert!(actor.path_requests.contains_key(&keep));
+        assert!(!actor.path_requests.contains_key(&expire));
     }
 
     #[test]
@@ -5558,7 +6201,8 @@ mod tests {
     #[test]
     fn dispatch_with_no_filter_receives_all() {
         let (mut actor, _tx) = TransportActor::new();
-        let (entry, _rx) = make_test_interface("test_iface");
+        let (mut entry, _rx) = make_test_interface("test_iface");
+        entry.ingress = crate::ingress::IngressController::disabled();
         actor.interfaces.insert(1, entry);
 
         let (htx, mut hrx) = mpsc::channel(8);
@@ -5975,7 +6619,8 @@ mod tests {
         let (raw_c, dest_c) = make_announce_for(&other, "lxmf.delivery", 2);
 
         actor.is_transport_enabled = true;
-        let (entry, _rx) = make_test_interface("scrub_iface");
+        let (mut entry, _rx) = make_test_interface("scrub_iface");
+        entry.ingress = crate::ingress::IngressController::disabled();
         actor.interfaces.insert(1, entry);
 
         for raw in [raw_a, raw_b, raw_c] {

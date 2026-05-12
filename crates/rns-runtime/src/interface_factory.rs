@@ -1003,6 +1003,8 @@ impl InterfacePostInit {
             enabled: if ingress_control { None } else { Some(false) },
             burst_freq_new: section.get_float("ic_burst_freq_new"),
             burst_freq: section.get_float("ic_burst_freq"),
+            pr_burst_freq_new: section.get_float("ic_pr_burst_freq_new"),
+            pr_burst_freq: section.get_float("ic_pr_burst_freq"),
             new_time: section.get_float("ic_new_time"),
             burst_hold: section.get_float("ic_burst_hold"),
             burst_penalty: section.get_float("ic_burst_penalty"),
@@ -1010,6 +1012,9 @@ impl InterfacePostInit {
                 .get_uint("ic_max_held_announces")
                 .map(|v| v as usize),
             held_release_interval: section.get_float("ic_held_release_interval"),
+            ec_pr_freq: section.get_float("ec_pr_freq"),
+            egress_control: section.get_bool("egress_control"),
+            ..Default::default()
         };
         Self {
             outgoing: section.get_bool("outgoing").unwrap_or(true),
@@ -1572,6 +1577,10 @@ mod tests {
         section.set("ifac_size", "16");
         section.set("ingress_control", "false");
         section.set("announce_cap", "5.0");
+        section.set("ic_pr_burst_freq_new", "4.5");
+        section.set("ic_pr_burst_freq", "9.5");
+        section.set("ec_pr_freq", "6.5");
+        section.set("egress_control", "Yes");
 
         let pi = InterfacePostInit::from_section(&section);
         assert!(!pi.outgoing);
@@ -1581,6 +1590,11 @@ mod tests {
         assert_eq!(pi.ifac_size, Some(16));
         assert!(!pi.ingress_control);
         assert!((pi.announce_cap.unwrap() - 5.0).abs() < f64::EPSILON);
+        assert_eq!(pi.ingress_overrides.enabled, Some(false));
+        assert_eq!(pi.ingress_overrides.pr_burst_freq_new, Some(4.5));
+        assert_eq!(pi.ingress_overrides.pr_burst_freq, Some(9.5));
+        assert_eq!(pi.ingress_overrides.ec_pr_freq, Some(6.5));
+        assert_eq!(pi.ingress_overrides.egress_control, Some(true));
     }
 
     #[test]

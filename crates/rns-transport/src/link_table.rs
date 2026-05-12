@@ -25,6 +25,30 @@ pub struct LinkEntry {
     pub taken_hops: u8,
 }
 
+/// Metadata retained when an unvalidated link expires before proof.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExpiredLink {
+    pub next_hop: Option<[u8; 16]>,
+    pub interface_id: InterfaceId,
+    pub remaining_hops: u8,
+    pub destination_hash: [u8; 16],
+    pub receiving_interface: InterfaceId,
+    pub taken_hops: u8,
+}
+
+impl From<&LinkEntry> for ExpiredLink {
+    fn from(entry: &LinkEntry) -> Self {
+        Self {
+            next_hop: entry.next_hop,
+            interface_id: entry.interface_id,
+            remaining_hops: entry.remaining_hops,
+            destination_hash: entry.destination_hash,
+            receiving_interface: entry.receiving_interface,
+            taken_hops: entry.taken_hops,
+        }
+    }
+}
+
 pub struct LinkTable {
     entries: HashMap<LinkId, LinkEntry>,
 }
@@ -73,9 +97,9 @@ impl LinkTable {
     /// - Unvalidated links drop once their own `proof_timeout` elapses, since
     ///   proof never arrived during the establishment window.
     ///
-    /// Returns `(total_culled, destinations_that_expired_unvalidated)` — the
-    /// caller can re-issue path discovery for those destinations.
-    pub fn cull_stale(&mut self, timeout: f64) -> (usize, Vec<[u8; 16]>) {
+    /// Returns `(total_culled, expired_unvalidated_links)` — the caller can
+    /// apply failed-link rediscovery rules using the retained route metadata.
+    pub fn cull_stale(&mut self, timeout: f64) -> (usize, Vec<ExpiredLink>) {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -89,7 +113,7 @@ impl LinkTable {
             if entry.validated {
                 entry.timestamp > cutoff
             } else if now > entry.proof_timeout {
-                unvalidated_expired.push(entry.destination_hash);
+                unvalidated_expired.push(ExpiredLink::from(&*entry));
                 false
             } else {
                 true
@@ -196,7 +220,9 @@ mod tests {
         let (culled, expired_dests) = table.cull_stale(900.0);
         assert_eq!(culled, 1);
         assert_eq!(expired_dests.len(), 1);
-        assert_eq!(expired_dests[0], dest_hash);
+        assert_eq!(expired_dests[0].destination_hash, dest_hash);
+        assert_eq!(expired_dests[0].receiving_interface, 2);
+        assert_eq!(expired_dests[0].taken_hops, 0);
         assert_eq!(table.len(), 0);
     }
 
@@ -278,7 +304,7 @@ mod tests {
         assert_eq!(culled, 2);
         assert_eq!(table.len(), 2);
         assert_eq!(expired_dests.len(), 1);
-        assert_eq!(expired_dests[0], [0xA4; 16]);
+        assert_eq!(expired_dests[0].destination_hash, [0xA4; 16]);
     }
 
     #[test]

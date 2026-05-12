@@ -625,6 +625,7 @@ pub async fn spawn_android_usb_rnode_interface(
 
     Ok(InterfaceHandle {
         id,
+        parent_id: None,
         name,
         mode: config.mode,
         direction: InterfaceDirection {

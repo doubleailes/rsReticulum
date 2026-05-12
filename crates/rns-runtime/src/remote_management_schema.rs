@@ -34,7 +34,13 @@ pub struct InterfaceStats {
     pub txb: u64,
     pub incoming_announce_frequency: f64,
     pub outgoing_announce_frequency: f64,
+    pub incoming_pr_frequency: f64,
+    pub outgoing_pr_frequency: f64,
     pub held_announces: u64,
+    pub burst_active: bool,
+    pub burst_activated: f64,
+    pub pr_burst_active: bool,
+    pub pr_burst_activated: f64,
     /// Python field name (not `online`).
     pub status: bool,
     /// Matches Python `Interface.MODE_*` integers.

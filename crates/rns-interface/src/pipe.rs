@@ -189,6 +189,7 @@ pub async fn spawn_pipe_interface(
 
     Ok(InterfaceHandle {
         id,
+        parent_id: None,
         name,
         mode,
         direction: InterfaceDirection {

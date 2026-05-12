@@ -45,6 +45,14 @@ fn interface_tasks() -> &'static std::sync::Mutex<HashMap<u64, JoinHandle<()>>> 
 }
 
 #[derive(Clone)]
+struct InterfaceControlMetadata {
+    role: rns_transport::messages::InterfaceRole,
+    ingress_overrides: rns_transport::ingress::IngressOverrides,
+}
+
+type InterfaceControlMap = Arc<std::sync::Mutex<HashMap<u64, InterfaceControlMetadata>>>;
+
+#[derive(Clone)]
 pub struct ReticulumHandle {
     pub transport_tx: mpsc::Sender<TransportMessage>,
     pub config_dir: PathBuf,
@@ -54,6 +62,7 @@ pub struct ReticulumHandle {
     pub id_gen: Arc<AtomicU64>,
     /// Used by server-style interfaces to register per-client sub-handles.
     pub handle_tx: mpsc::Sender<rns_interface::traits::InterfaceHandle>,
+    interface_controls: InterfaceControlMap,
     pub socket_base: PathBuf,
     pub config: ReticulumConfig,
     /// Mobile builds throttle tick rates when the app is backgrounded.
@@ -352,6 +361,12 @@ fn rpc_response_to_transport_response(
                     held_announces: entry.held_announces,
                     incoming_announce_frequency: entry.incoming_announce_frequency,
                     outgoing_announce_frequency: entry.outgoing_announce_frequency,
+                    incoming_pr_frequency: entry.incoming_pr_frequency,
+                    outgoing_pr_frequency: entry.outgoing_pr_frequency,
+                    burst_active: entry.burst_active,
+                    burst_activated: entry.burst_activated,
+                    pr_burst_active: entry.pr_burst_active,
+                    pr_burst_activated: entry.pr_burst_activated,
                     clients: entry.clients,
                     announce_rate_target: entry.announce_rate_target,
                     announce_rate_grace: entry.announce_rate_grace,
@@ -545,6 +560,8 @@ pub struct ReticulumConfig {
     pub default_ar_target: Option<u64>,
     pub default_ar_penalty: Option<u64>,
     pub default_ar_grace: Option<u32>,
+    /// Global Reticulum defaults for per-interface ingress/egress control.
+    pub ingress_overrides: rns_transport::ingress::IngressOverrides,
     pub loglevel: i32,
 
     /// Optional "network identity" file: discovery announce app_data is
@@ -593,6 +610,7 @@ impl Default for ReticulumConfig {
             default_ar_target: None,
             default_ar_penalty: None,
             default_ar_grace: None,
+            ingress_overrides: rns_transport::ingress::IngressOverrides::default(),
             loglevel: 4,
             network_identity_path: None,
             discover_interfaces: false,
@@ -667,6 +685,20 @@ fn config_uint(
         .ok_or_else(|| invalid_config_value(section_name, key, "value is not an unsigned integer"))
 }
 
+fn config_float(
+    section_name: &str,
+    section: &ConfigSection,
+    key: &str,
+) -> Result<Option<f64>, ConfigError> {
+    if !section.has(key) {
+        return Ok(None);
+    }
+    section
+        .get_float(key)
+        .map(Some)
+        .ok_or_else(|| invalid_config_value(section_name, key, "value is not a float"))
+}
+
 fn config_u16(
     section_name: &str,
     section: &ConfigSection,
@@ -678,6 +710,46 @@ fn config_u16(
     let value = u16::try_from(value)
         .map_err(|_| invalid_config_value(section_name, key, "value is outside u16 range"))?;
     Ok(Some(value))
+}
+
+fn parse_ingress_overrides(
+    section_name: &str,
+    section: &ConfigSection,
+) -> Result<rns_transport::ingress::IngressOverrides, ConfigError> {
+    Ok(rns_transport::ingress::IngressOverrides {
+        burst_freq_new: config_float(section_name, section, "ic_burst_freq_new")?,
+        burst_freq: config_float(section_name, section, "ic_burst_freq")?,
+        pr_burst_freq_new: config_float(section_name, section, "ic_pr_burst_freq_new")?,
+        pr_burst_freq: config_float(section_name, section, "ic_pr_burst_freq")?,
+        new_time: config_float(section_name, section, "ic_new_time")?,
+        burst_hold: config_float(section_name, section, "ic_burst_hold")?,
+        burst_penalty: config_float(section_name, section, "ic_burst_penalty")?,
+        max_held: config_uint(section_name, section, "ic_max_held_announces")?.map(|v| v as usize),
+        held_release_interval: config_float(section_name, section, "ic_held_release_interval")?,
+        ec_pr_freq: config_float(section_name, section, "ec_pr_freq")?,
+        egress_control: config_bool(section_name, section, "egress_control")?,
+        ..Default::default()
+    })
+}
+
+fn merge_ingress_overrides(
+    base: &rns_transport::ingress::IngressOverrides,
+    overlay: &rns_transport::ingress::IngressOverrides,
+) -> rns_transport::ingress::IngressOverrides {
+    rns_transport::ingress::IngressOverrides {
+        enabled: overlay.enabled.or(base.enabled),
+        burst_freq_new: overlay.burst_freq_new.or(base.burst_freq_new),
+        burst_freq: overlay.burst_freq.or(base.burst_freq),
+        pr_burst_freq_new: overlay.pr_burst_freq_new.or(base.pr_burst_freq_new),
+        pr_burst_freq: overlay.pr_burst_freq.or(base.pr_burst_freq),
+        new_time: overlay.new_time.or(base.new_time),
+        burst_hold: overlay.burst_hold.or(base.burst_hold),
+        burst_penalty: overlay.burst_penalty.or(base.burst_penalty),
+        max_held: overlay.max_held.or(base.max_held),
+        held_release_interval: overlay.held_release_interval.or(base.held_release_interval),
+        ec_pr_freq: overlay.ec_pr_freq.or(base.ec_pr_freq),
+        egress_control: overlay.egress_control.or(base.egress_control),
+    }
 }
 
 fn parse_autoconnect_limit(sec: &ConfigSection) -> Result<Option<usize>, ConfigError> {
@@ -788,6 +860,7 @@ impl ReticulumConfig {
             if let Some(v) = config_uint("reticulum", sec, "default_ar_grace")? {
                 rc.default_ar_grace = Some(v.min(u32::MAX as u64) as u32);
             }
+            rc.ingress_overrides = parse_ingress_overrides("reticulum", sec)?;
 
             if let Some(list) = sec.get_list("remote_management_allowed") {
                 rc.remote_management_allowed =
@@ -925,6 +998,7 @@ pub async fn init(
 
     // Sub-interface sink (e.g. TCP per-client).
     let (handle_tx, mut handle_rx) = mpsc::channel::<rns_interface::traits::InterfaceHandle>(64);
+    let interface_controls: InterfaceControlMap = Arc::new(std::sync::Mutex::new(HashMap::new()));
 
     let socket_base = socket_dir.clone().unwrap_or_else(std::env::temp_dir);
     let instance_mode = if rc.share_instance {
@@ -948,6 +1022,7 @@ pub async fn init(
                             &transport_tx,
                             client_handle,
                             rns_transport::messages::InterfaceRole::SharedInstancePeer,
+                            &interface_controls,
                         )
                         .await;
                         let _ = transport_tx
@@ -980,6 +1055,7 @@ pub async fn init(
                             &transport_tx,
                             server_handle,
                             rns_transport::messages::InterfaceRole::SharedServer,
+                            &interface_controls,
                         )
                         .await;
                         InstanceMode::Shared
@@ -1002,6 +1078,7 @@ pub async fn init(
                                         &transport_tx,
                                         client_handle,
                                         rns_transport::messages::InterfaceRole::SharedInstancePeer,
+                                        &interface_controls,
                                     )
                                     .await;
                                     let _ = transport_tx
@@ -1068,6 +1145,7 @@ pub async fn init(
                             &transport_tx,
                             client_handle,
                             rns_transport::messages::InterfaceRole::SharedInstancePeer,
+                            &interface_controls,
                         )
                         .await;
                         let _ = transport_tx
@@ -1097,6 +1175,7 @@ pub async fn init(
                             &transport_tx,
                             server_handle,
                             rns_transport::messages::InterfaceRole::SharedServer,
+                            &interface_controls,
                         )
                         .await;
                         InstanceMode::Shared
@@ -1120,6 +1199,7 @@ pub async fn init(
                                     &transport_tx,
                                     client_handle,
                                     rns_transport::messages::InterfaceRole::SharedInstancePeer,
+                                    &interface_controls,
                                 )
                                 .await;
                                 let _ = transport_tx
@@ -1190,7 +1270,7 @@ pub async fn init(
         for iface_config in &interfaces {
             let iface_id = next_id(&id_gen);
             let mut post_init = get_post_init_for_config(&config, iface_config);
-            apply_default_announce_rate(&mut post_init, &rc);
+            finalize_post_init(&mut post_init, &rc);
             let discovery_config = discovery_config_for_interface(
                 &config,
                 iface_config,
@@ -1219,6 +1299,7 @@ pub async fn init(
                             iface_handle,
                             &post_init,
                             ifac_key,
+                            &interface_controls,
                         )
                         .await;
                         if let Some(ref cfg) = discovery_config {
@@ -1252,14 +1333,19 @@ pub async fn init(
 
     {
         let reg_tx = transport_tx.clone();
+        let reg_controls = interface_controls.clone();
         tokio::spawn(async move {
             while let Some(sub_handle) = handle_rx.recv().await {
-                let role = if sub_handle.name.starts_with("SharedInstanceServer/") {
-                    rns_transport::messages::InterfaceRole::LocalClient
-                } else {
-                    rns_transport::messages::InterfaceRole::Normal
-                };
-                register_interface_handle_with_role(&reg_tx, sub_handle, role).await;
+                let (role, ingress_overrides) =
+                    child_registration_from_parent(&reg_controls, sub_handle.parent_id);
+                register_interface_handle_with_role_and_overrides(
+                    &reg_tx,
+                    sub_handle,
+                    role,
+                    ingress_overrides,
+                    &reg_controls,
+                )
+                .await;
             }
         });
     }
@@ -1271,6 +1357,7 @@ pub async fn init(
         interface_configs: interfaces,
         id_gen: id_gen.clone(),
         handle_tx: handle_tx.clone(),
+        interface_controls: interface_controls.clone(),
         socket_base: socket_base.clone(),
         config: rc.clone(),
         is_foreground,
@@ -1421,6 +1508,44 @@ pub async fn init(
     Ok(handle)
 }
 
+fn child_registration_from_parent(
+    interface_controls: &InterfaceControlMap,
+    parent_id: Option<u64>,
+) -> (
+    rns_transport::messages::InterfaceRole,
+    rns_transport::ingress::IngressOverrides,
+) {
+    let parent_control = parent_id.and_then(|parent_id| {
+        interface_controls
+            .lock()
+            .expect("interface_controls mutex poisoned")
+            .get(&parent_id)
+            .cloned()
+    });
+    let role = if parent_control
+        .as_ref()
+        .is_some_and(|control| control.role == rns_transport::messages::InterfaceRole::SharedServer)
+    {
+        rns_transport::messages::InterfaceRole::LocalClient
+    } else {
+        rns_transport::messages::InterfaceRole::Normal
+    };
+    let ingress_overrides = parent_control
+        .map(|control| control.ingress_overrides)
+        .unwrap_or_default();
+    (role, ingress_overrides)
+}
+
+fn discovered_backbone_client_mode(
+    config: &ReticulumConfig,
+) -> rns_interface::traits::InterfaceMode {
+    if config.enable_transport {
+        rns_interface::traits::InterfaceMode::Gateway
+    } else {
+        rns_interface::traits::InterfaceMode::Full
+    }
+}
+
 fn next_id(id_gen: &Arc<AtomicU64>) -> u64 {
     id_gen.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
@@ -1456,11 +1581,13 @@ fn convert_mode(
 async fn register_interface_handle(
     transport_tx: &mpsc::Sender<TransportMessage>,
     handle: rns_interface::traits::InterfaceHandle,
+    interface_controls: &InterfaceControlMap,
 ) {
     register_interface_handle_with_role(
         transport_tx,
         handle,
         rns_transport::messages::InterfaceRole::Normal,
+        interface_controls,
     )
     .await;
 }
@@ -1471,14 +1598,47 @@ async fn register_interface_handle_with_role(
     transport_tx: &mpsc::Sender<TransportMessage>,
     handle: rns_interface::traits::InterfaceHandle,
     role: rns_transport::messages::InterfaceRole,
+    interface_controls: &InterfaceControlMap,
+) {
+    register_interface_handle_with_role_and_overrides(
+        transport_tx,
+        handle,
+        role,
+        rns_transport::ingress::IngressOverrides::default(),
+        interface_controls,
+    )
+    .await;
+}
+
+async fn register_interface_handle_with_role_and_overrides(
+    transport_tx: &mpsc::Sender<TransportMessage>,
+    handle: rns_interface::traits::InterfaceHandle,
+    role: rns_transport::messages::InterfaceRole,
+    ingress_overrides: rns_transport::ingress::IngressOverrides,
+    interface_controls: &InterfaceControlMap,
 ) {
     let name = handle.name.clone();
     let id = handle.id;
+    let ingress = if ingress_overrides.is_empty() {
+        rns_transport::ingress::IngressController::new()
+    } else {
+        rns_transport::ingress::IngressController::with_overrides(&ingress_overrides)
+    };
     // Stash the driver task so `teardown_interface` can abort it; drop alone only detaches.
     interface_tasks()
         .lock()
         .expect("interface_tasks mutex poisoned")
         .insert(id, handle.read_task);
+    interface_controls
+        .lock()
+        .expect("interface_controls mutex poisoned")
+        .insert(
+            id,
+            InterfaceControlMetadata {
+                role,
+                ingress_overrides: ingress_overrides.clone(),
+            },
+        );
     let entry = rns_transport::messages::InterfaceEntry {
         name: handle.name.clone(),
         mode: convert_mode(handle.mode),
@@ -1501,7 +1661,7 @@ async fn register_interface_handle_with_role(
         rxb: handle.rxb,
         txb: handle.txb,
         tx_drops: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
-        ingress: rns_transport::ingress::IngressController::new(),
+        ingress,
         announce_queue: Vec::new(),
     };
     if let Err(e) = transport_tx
@@ -1518,15 +1678,14 @@ async fn register_interface_with_post_init(
     handle: rns_interface::traits::InterfaceHandle,
     post_init: &interface_factory::InterfacePostInit,
     ifac_key: Option<[u8; 64]>,
+    interface_controls: &InterfaceControlMap,
 ) {
     // Outbound = physical capability AND `outgoing` config flag.
     let direction = rns_transport::constants::InterfaceDirection {
         inbound: handle.direction.inbound,
         outbound: handle.direction.outbound && post_init.outgoing,
     };
-    let ingress = if !post_init.ingress_control {
-        rns_transport::ingress::IngressController::disabled()
-    } else if post_init.ingress_overrides.is_empty() {
+    let ingress = if post_init.ingress_overrides.is_empty() {
         rns_transport::ingress::IngressController::new()
     } else {
         rns_transport::ingress::IngressController::with_overrides(&post_init.ingress_overrides)
@@ -1537,6 +1696,16 @@ async fn register_interface_with_post_init(
         .lock()
         .expect("interface_tasks mutex poisoned")
         .insert(id, handle.read_task);
+    interface_controls
+        .lock()
+        .expect("interface_controls mutex poisoned")
+        .insert(
+            id,
+            InterfaceControlMetadata {
+                role: rns_transport::messages::InterfaceRole::Normal,
+                ingress_overrides: post_init.ingress_overrides.clone(),
+            },
+        );
     let entry = rns_transport::messages::InterfaceEntry {
         name: handle.name.clone(),
         mode: convert_mode(handle.mode),
@@ -1623,6 +1792,22 @@ fn apply_default_announce_rate(
                 .unwrap_or(rns_interface::traits::DEFAULT_AR_GRACE),
         );
     }
+}
+
+fn apply_reticulum_ingress_defaults(
+    post_init: &mut interface_factory::InterfacePostInit,
+    config: &ReticulumConfig,
+) {
+    post_init.ingress_overrides =
+        merge_ingress_overrides(&config.ingress_overrides, &post_init.ingress_overrides);
+}
+
+fn finalize_post_init(
+    post_init: &mut interface_factory::InterfacePostInit,
+    config: &ReticulumConfig,
+) {
+    apply_default_announce_rate(post_init, config);
+    apply_reticulum_ingress_defaults(post_init, config);
 }
 
 fn interface_config_name(iface_config: &interface_factory::InterfaceConfig) -> &str {
@@ -2092,7 +2277,8 @@ async fn spawn_discovered_backbone_client(
             .map(|c| if c == '/' { '_' } else { c })
             .collect::<String>()
     );
-    let config = rns_interface::backbone::BackboneClientConfig::new(&name, host, port);
+    let mut config = rns_interface::backbone::BackboneClientConfig::new(&name, host, port);
+    config.mode = discovered_backbone_client_mode(&handle.config);
     let iface_handle =
         rns_interface::backbone::spawn_backbone_client(config, id, handle.transport_tx.clone())
             .await
@@ -2100,12 +2286,18 @@ async fn spawn_discovered_backbone_client(
 
     let mut post_init = interface_factory::InterfacePostInit::from_section(&ConfigSection::new())
         .with_default_ifac_size(16);
-    apply_default_announce_rate(&mut post_init, &handle.config);
+    finalize_post_init(&mut post_init, &handle.config);
     post_init.ifac_network_name = record.info.ifac_netname.clone();
     post_init.ifac_passphrase = record.info.ifac_netkey.clone();
     let ifac_key = derive_ifac_key_from_post_init(&post_init);
-    register_interface_with_post_init(&handle.transport_tx, iface_handle, &post_init, ifac_key)
-        .await;
+    register_interface_with_post_init(
+        &handle.transport_tx,
+        iface_handle,
+        &post_init,
+        ifac_key,
+        &handle.interface_controls,
+    )
+    .await;
     tracing::info!(name = %name, id, endpoint = %format!("{host}:{port}"), "auto-connected discovered interface");
     Ok(id)
 }
@@ -2369,7 +2561,12 @@ pub async fn spawn_tcp_client_runtime(
             .await
             .map_err(|e| format!("TCP client spawn failed: {e}"))?;
 
-    register_interface_handle(&handle.transport_tx, iface_handle).await;
+    register_interface_handle(
+        &handle.transport_tx,
+        iface_handle,
+        &handle.interface_controls,
+    )
+    .await;
     tracing::info!(name = %name, id, "runtime TCP client interface spawned");
     Ok(id)
 }
@@ -2393,7 +2590,12 @@ pub async fn spawn_tcp_server_runtime(
     .await
     .map_err(|e| format!("TCP server spawn failed: {e}"))?;
 
-    register_interface_handle(&handle.transport_tx, iface_handle).await;
+    register_interface_handle(
+        &handle.transport_tx,
+        iface_handle,
+        &handle.interface_controls,
+    )
+    .await;
     tracing::info!(name = %name, id, "runtime TCP server interface spawned");
     Ok(id)
 }
@@ -2423,7 +2625,12 @@ pub async fn spawn_backbone_client_runtime(
             .await
             .map_err(|e| format!("Backbone client spawn failed: {e}"))?;
 
-    register_interface_handle(&handle.transport_tx, iface_handle).await;
+    register_interface_handle(
+        &handle.transport_tx,
+        iface_handle,
+        &handle.interface_controls,
+    )
+    .await;
     tracing::info!(name = %name, id, "runtime Backbone client interface spawned");
     Ok(id)
 }
@@ -2452,7 +2659,12 @@ pub async fn spawn_backbone_server_runtime(
     .await
     .map_err(|e| format!("Backbone server spawn failed: {e}"))?;
 
-    register_interface_handle(&handle.transport_tx, iface_handle).await;
+    register_interface_handle(
+        &handle.transport_tx,
+        iface_handle,
+        &handle.interface_controls,
+    )
+    .await;
     tracing::info!(name = %name, id, "runtime Backbone server interface spawned");
     Ok(id)
 }
@@ -2489,7 +2701,12 @@ pub async fn spawn_ble_rnode_runtime(
     .map_err(|e| format!("BLE RNode spawn failed: {e}"))?;
 
     let online = iface_handle.online.clone();
-    register_interface_handle(&handle.transport_tx, iface_handle).await;
+    register_interface_handle(
+        &handle.transport_tx,
+        iface_handle,
+        &handle.interface_controls,
+    )
+    .await;
     tracing::info!(name = %name, id, "runtime BLE RNode interface spawned");
     Ok((id, online))
 }
@@ -2545,7 +2762,12 @@ pub async fn spawn_rnode_runtime(
             .map_err(|e| format!("RNode spawn failed: {e}"))?;
 
     let online = iface_handle.online.clone();
-    register_interface_handle(&handle.transport_tx, iface_handle).await;
+    register_interface_handle(
+        &handle.transport_tx,
+        iface_handle,
+        &handle.interface_controls,
+    )
+    .await;
     tracing::info!(name = %name, id, "runtime RNode interface spawned");
     Ok((id, online))
 }
@@ -2583,7 +2805,12 @@ pub async fn spawn_ble_rnode_runtime_native(
     .map_err(|e| format!("BLE RNode native spawn failed: {e}"))?;
 
     let online = iface_handle.online.clone();
-    register_interface_handle(&handle.transport_tx, iface_handle).await;
+    register_interface_handle(
+        &handle.transport_tx,
+        iface_handle,
+        &handle.interface_controls,
+    )
+    .await;
     tracing::info!(name = %name, id, tcp_port, "runtime BLE RNode interface spawned (native bridge)");
     Ok((id, online))
 }
@@ -2606,7 +2833,12 @@ pub async fn spawn_auto_interface_runtime_with_config(
     .await
     .map_err(|e| format!("Auto interface spawn failed: {e}"))?;
 
-    register_interface_handle(&handle.transport_tx, iface_handle).await;
+    register_interface_handle(
+        &handle.transport_tx,
+        iface_handle,
+        &handle.interface_controls,
+    )
+    .await;
     tracing::info!(name = %name, id, "runtime Auto interface spawned");
     Ok(id)
 }
@@ -2665,7 +2897,12 @@ pub async fn spawn_ble_peer_runtime(
         format!("BLE Peer spawn failed: {e}")
     })?;
 
-    register_interface_handle(&handle.transport_tx, iface_handle).await;
+    register_interface_handle(
+        &handle.transport_tx,
+        iface_handle,
+        &handle.interface_controls,
+    )
+    .await;
     tracing::info!(name = %name, id, "runtime BLE Peer mesh interface spawned");
     Ok(id)
 }
@@ -2719,7 +2956,12 @@ pub async fn spawn_android_usb_rnode_runtime(
     .await
     .map_err(|e| format!("Android USB spawn failed: {e}"))?;
 
-    register_interface_handle(&handle.transport_tx, iface_handle).await;
+    register_interface_handle(
+        &handle.transport_tx,
+        iface_handle,
+        &handle.interface_controls,
+    )
+    .await;
     tracing::info!(name = %name, id, "runtime Android USB RNode interface spawned");
     Ok(id)
 }
@@ -2737,6 +2979,11 @@ pub async fn teardown_interface(handle: &ReticulumHandle, id: u64) {
         task.abort();
         tracing::debug!(id, "interface driver task aborted");
     }
+    handle
+        .interface_controls
+        .lock()
+        .expect("interface_controls mutex poisoned")
+        .remove(&id);
     let _ = handle
         .transport_tx
         .send(TransportMessage::DeregisterInterface { id })
@@ -3166,6 +3413,33 @@ mod tests {
         bytes::Bytes::from(raw)
     }
 
+    fn test_interface_handle(
+        id: u64,
+        parent_id: Option<u64>,
+        name: &str,
+    ) -> rns_interface::traits::InterfaceHandle {
+        let (tx, _rx) = mpsc::channel(4);
+        rns_interface::traits::InterfaceHandle {
+            id,
+            parent_id,
+            name: name.to_string(),
+            mode: rns_interface::traits::InterfaceMode::Gateway,
+            direction: rns_interface::traits::InterfaceDirection {
+                inbound: true,
+                outbound: true,
+                forward: false,
+                repeat: false,
+            },
+            bitrate: 115_200,
+            mtu: 500,
+            online: Arc::new(AtomicBool::new(true)),
+            rxb: None,
+            txb: None,
+            tx,
+            read_task: tokio::spawn(async {}),
+        }
+    }
+
     #[test]
     fn test_default_config() {
         let rc = ReticulumConfig::default();
@@ -3282,6 +3556,7 @@ loglevel = 7
             interface_configs: Vec::new(),
             id_gen: Arc::new(AtomicU64::new(0)),
             handle_tx: htx,
+            interface_controls: Arc::new(std::sync::Mutex::new(HashMap::new())),
             socket_base: PathBuf::from("/tmp/dummy"),
             config: ReticulumConfig::default(),
             is_foreground: Arc::new(AtomicBool::new(true)),
@@ -3397,6 +3672,67 @@ loglevel = 7
     }
 
     #[test]
+    fn test_global_ingress_control_keys_parsed() {
+        let input = "[reticulum]\n\
+                     ic_max_held_announces = 64\n\
+                     ic_burst_hold = 11.5\n\
+                     ic_burst_freq_new = 2.5\n\
+                     ic_burst_freq = 12.5\n\
+                     ic_pr_burst_freq_new = 4.5\n\
+                     ic_pr_burst_freq = 9.5\n\
+                     ec_pr_freq = 6.5\n\
+                     egress_control = Yes\n\
+                     ic_new_time = 1234\n\
+                     ic_burst_penalty = 17.5\n\
+                     ic_held_release_interval = 3.5\n";
+        let config = Config::parse(input).unwrap();
+        let rc = ReticulumConfig::from_config(&config);
+
+        assert_eq!(rc.ingress_overrides.max_held, Some(64));
+        assert_eq!(rc.ingress_overrides.burst_hold, Some(11.5));
+        assert_eq!(rc.ingress_overrides.burst_freq_new, Some(2.5));
+        assert_eq!(rc.ingress_overrides.burst_freq, Some(12.5));
+        assert_eq!(rc.ingress_overrides.pr_burst_freq_new, Some(4.5));
+        assert_eq!(rc.ingress_overrides.pr_burst_freq, Some(9.5));
+        assert_eq!(rc.ingress_overrides.ec_pr_freq, Some(6.5));
+        assert_eq!(rc.ingress_overrides.egress_control, Some(true));
+        assert_eq!(rc.ingress_overrides.new_time, Some(1234.0));
+        assert_eq!(rc.ingress_overrides.burst_penalty, Some(17.5));
+        assert_eq!(rc.ingress_overrides.held_release_interval, Some(3.5));
+    }
+
+    #[test]
+    fn ingress_control_precedence_global_then_interface() {
+        let input = r#"
+[reticulum]
+ic_burst_freq = 12
+ic_pr_burst_freq = 9
+ec_pr_freq = 7
+egress_control = No
+
+[interfaces]
+
+[[Test TCP]]
+type = TCPClientInterface
+target_host = 127.0.0.1
+target_port = 4242
+ic_pr_burst_freq = 5
+egress_control = Yes
+"#;
+        let config = Config::parse(input).unwrap();
+        let rc = ReticulumConfig::from_config(&config);
+        let interfaces = synthesize_interfaces(&config, false).unwrap();
+        let mut post_init = get_post_init_for_config(&config, &interfaces[0]);
+
+        finalize_post_init(&mut post_init, &rc);
+
+        assert_eq!(post_init.ingress_overrides.burst_freq, Some(12.0));
+        assert_eq!(post_init.ingress_overrides.ec_pr_freq, Some(7.0));
+        assert_eq!(post_init.ingress_overrides.pr_burst_freq, Some(5.0));
+        assert_eq!(post_init.ingress_overrides.egress_control, Some(true));
+    }
+
+    #[test]
     fn test_network_identity_path_follows_python_expanduser_only_policy() {
         let config = Config::parse("[reticulum]\nnetwork_identity = network.identity\n").unwrap();
         let rc = ReticulumConfig::from_config(&config);
@@ -3438,6 +3774,101 @@ loglevel = 7
         assert_eq!(post_init.announce_rate_target, Some(7200));
         assert_eq!(post_init.announce_rate_penalty, Some(30));
         assert_eq!(post_init.announce_rate_grace, Some(9));
+    }
+
+    #[tokio::test]
+    async fn dynamic_child_inherits_parent_control_settings() {
+        let parent_id = 910_001;
+        let child_id = 910_002;
+        let (transport_tx, mut transport_rx) = mpsc::channel::<TransportMessage>(4);
+        let interface_controls: InterfaceControlMap =
+            Arc::new(std::sync::Mutex::new(HashMap::new()));
+
+        let mut section = ConfigSection::new();
+        section.set("ic_pr_burst_freq_new", "4.0");
+        section.set("ic_pr_burst_freq", "9.0");
+        section.set("ec_pr_freq", "6.0");
+        section.set("egress_control", "Yes");
+        let post_init = interface_factory::InterfacePostInit::from_section(&section);
+
+        register_interface_with_post_init(
+            &transport_tx,
+            test_interface_handle(parent_id, None, "parent"),
+            &post_init,
+            None,
+            &interface_controls,
+        )
+        .await;
+        let _ = transport_rx.recv().await.expect("parent registration");
+
+        let (role, inherited) =
+            child_registration_from_parent(&interface_controls, Some(parent_id));
+        assert_eq!(role, rns_transport::messages::InterfaceRole::Normal);
+        register_interface_handle_with_role_and_overrides(
+            &transport_tx,
+            test_interface_handle(child_id, Some(parent_id), "child"),
+            role,
+            inherited,
+            &interface_controls,
+        )
+        .await;
+
+        let msg = transport_rx.recv().await.expect("child registration");
+        let TransportMessage::RegisterInterface { entry, .. } = msg else {
+            panic!("expected child RegisterInterface");
+        };
+        assert_eq!(entry.ingress.pr_burst_freq_new(), 4.0);
+        assert_eq!(entry.ingress.pr_burst_freq(), 9.0);
+        assert_eq!(entry.ingress.ec_pr_freq(), 6.0);
+        assert!(entry.ingress.is_egress_control_enabled());
+
+        interface_tasks()
+            .lock()
+            .expect("interface_tasks mutex poisoned")
+            .remove(&parent_id);
+        interface_tasks()
+            .lock()
+            .expect("interface_tasks mutex poisoned")
+            .remove(&child_id);
+    }
+
+    #[test]
+    fn shared_server_child_role_uses_parent_metadata_not_name_prefix() {
+        let parent_id = 910_101;
+        let interface_controls: InterfaceControlMap =
+            Arc::new(std::sync::Mutex::new(HashMap::new()));
+        interface_controls
+            .lock()
+            .expect("interface_controls mutex poisoned")
+            .insert(
+                parent_id,
+                InterfaceControlMetadata {
+                    role: rns_transport::messages::InterfaceRole::SharedServer,
+                    ingress_overrides: rns_transport::ingress::IngressOverrides::default(),
+                },
+            );
+
+        let (role, _) = child_registration_from_parent(&interface_controls, Some(parent_id));
+
+        assert_eq!(role, rns_transport::messages::InterfaceRole::LocalClient);
+    }
+
+    #[test]
+    fn discovered_backbone_autoconnect_mode_tracks_transport_setting() {
+        let leaf = ReticulumConfig::default();
+        assert_eq!(
+            discovered_backbone_client_mode(&leaf),
+            rns_interface::traits::InterfaceMode::Full
+        );
+
+        let transport = ReticulumConfig {
+            enable_transport: true,
+            ..ReticulumConfig::default()
+        };
+        assert_eq!(
+            discovered_backbone_client_mode(&transport),
+            rns_interface::traits::InterfaceMode::Gateway
+        );
     }
 
     #[test]
@@ -3503,6 +3934,8 @@ loglevel = 7
             ("shared_instance_port", "notaport"),
             ("autoconnect_discovered_interfaces", "Yes"),
             ("blackhole_sources", "deadbeef"),
+            ("egress_control", "maybe"),
+            ("ic_pr_burst_freq", "fast"),
         ] {
             let input = format!("[reticulum]\n{key} = {value}\n");
             let config = Config::parse(&input).unwrap();

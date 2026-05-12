@@ -545,6 +545,7 @@ pub async fn spawn_i2p_client(
 
     Ok(InterfaceHandle {
         id,
+        parent_id: None,
         name,
         mode,
         direction: InterfaceDirection {
@@ -738,6 +739,7 @@ pub async fn spawn_i2p_server(
 
                 let handle = InterfaceHandle {
                     id: client_id,
+                    parent_id: Some(0),
                     name: client_name,
                     mode: config.mode,
                     direction: InterfaceDirection {
@@ -774,6 +776,7 @@ pub async fn spawn_i2p_server(
 
     Ok(InterfaceHandle {
         id: 0,
+        parent_id: None,
         name,
         mode,
         direction: InterfaceDirection {

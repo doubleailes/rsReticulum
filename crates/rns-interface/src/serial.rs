@@ -171,6 +171,7 @@ pub async fn spawn_serial_interface(
 
     Ok(InterfaceHandle {
         id,
+        parent_id: None,
         name,
         mode,
         direction: InterfaceDirection {

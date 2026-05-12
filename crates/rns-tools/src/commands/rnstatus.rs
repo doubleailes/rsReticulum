@@ -27,7 +27,7 @@ const DEFAULT_TIMEOUT_SECS: u64 = 5;
 const REMOTE_TIMEOUT_SECS: u64 = 30;
 const REMOTE_HOPS: u8 = 8;
 const MGMT_APP: &str = "rnstransport.remote.management";
-const RETICULUM_COMPAT_VERSION: &str = "1.2.4";
+const RETICULUM_COMPAT_VERSION: &str = "1.2.5";
 
 #[derive(Parser)]
 #[command(
@@ -44,15 +44,23 @@ struct Args {
     #[arg(short = 'A', long)]
     announce_stats: bool,
 
+    /// Show path request frequency stats.
+    #[arg(short = 'P', long = "pr-stats")]
+    pr_stats: bool,
+
     /// Show link table entry count.
     #[arg(short, long)]
     link_stats: bool,
+
+    /// Only show interfaces with active announce or path request bursts.
+    #[arg(short = 'B', long)]
+    burst: bool,
 
     /// Display traffic totals.
     #[arg(short, long)]
     totals: bool,
 
-    /// Sort interfaces by rate, traffic, rx, tx, rxs, txs, announces, arx, atx or held.
+    /// Sort interfaces by rate, traffic, rx, tx, rxs, txs, announces, arx, atx, prx, ptx or held.
     #[arg(short, long)]
     sort: Option<String>,
 
@@ -323,6 +331,8 @@ enum SortKey {
     Announces,
     AnnounceRx,
     AnnounceTx,
+    PathRequestRx,
+    PathRequestTx,
     Held,
 }
 
@@ -353,10 +363,12 @@ fn parse_sort_key(value: Option<&str>) -> Result<Option<SortKey>, String> {
         "announces" | "announce" => SortKey::Announces,
         "arx" => SortKey::AnnounceRx,
         "atx" => SortKey::AnnounceTx,
+        "prx" => SortKey::PathRequestRx,
+        "ptx" => SortKey::PathRequestTx,
         "held" => SortKey::Held,
         _ => {
             return Err(format!(
-                "--sort must be one of rate, traffic, rx, tx, rxs, txs, announces, arx, atx or held; got {value}"
+                "--sort must be one of rate, traffic, rx, tx, rxs, txs, announces, arx, atx, prx, ptx or held; got {value}"
             ));
         }
     };
@@ -374,6 +386,8 @@ fn local_stat_sort_value(e: &rpc::InterfaceStatEntry, key: SortKey) -> f64 {
         SortKey::Announces => e.incoming_announce_frequency + e.outgoing_announce_frequency,
         SortKey::AnnounceRx => e.incoming_announce_frequency,
         SortKey::AnnounceTx => e.outgoing_announce_frequency,
+        SortKey::PathRequestRx => e.incoming_pr_frequency,
+        SortKey::PathRequestTx => e.outgoing_pr_frequency,
         SortKey::Held => e.held_announces as f64,
     }
 }
@@ -394,6 +408,24 @@ fn interface_matches_filter(name: &str, filter: Option<&str>) -> bool {
     })
 }
 
+fn interface_matches_burst_filter(
+    name: &str,
+    burst_active: bool,
+    pr_burst_active: bool,
+    args: &Args,
+) -> bool {
+    if !args.burst {
+        return interface_matches_filter(name, args.filter.as_deref());
+    }
+
+    burst_active
+        || pr_burst_active
+        || args.filter.as_deref().is_some_and(|filter| {
+            name.to_ascii_lowercase()
+                .contains(&filter.to_ascii_lowercase())
+        })
+}
+
 fn filtered_local_stats<'a>(
     stats: &'a [rpc::InterfaceStatEntry],
     args: &Args,
@@ -401,7 +433,14 @@ fn filtered_local_stats<'a>(
     let mut entries: Vec<_> = stats
         .iter()
         .filter(|entry| args.all || visible_by_default(&entry.name))
-        .filter(|entry| interface_matches_filter(&entry.name, args.filter.as_deref()))
+        .filter(|entry| {
+            interface_matches_burst_filter(
+                &entry.name,
+                entry.burst_active,
+                entry.pr_burst_active,
+                args,
+            )
+        })
         .collect();
     if let Ok(Some(key)) = parse_sort_key(args.sort.as_deref()) {
         entries.sort_by(|a, b| {
@@ -457,6 +496,7 @@ fn print_local_human(stats: &[rpc::InterfaceStatEntry], link_count: Option<i64>,
                 }
                 if entry.incoming_announce_frequency > 0.0
                     || entry.outgoing_announce_frequency > 0.0
+                    || entry.burst_active
                 {
                     print_announce_frequency(
                         entry.incoming_announce_frequency,
@@ -465,8 +505,17 @@ fn print_local_human(stats: &[rpc::InterfaceStatEntry], link_count: Option<i64>,
                         entry.announce_rate_target,
                         entry.announce_rate_penalty,
                         entry.announce_rate_grace,
+                        burst_status_text(entry.burst_active, entry.burst_activated),
                     );
                 }
+            }
+            if args.pr_stats {
+                print_path_request_frequency(
+                    entry.incoming_pr_frequency,
+                    entry.outgoing_pr_frequency,
+                    entry.clients,
+                    burst_status_text(entry.pr_burst_active, entry.pr_burst_activated),
+                );
             }
             println!(
                 "    Traffic  : {} rx / {} tx",
@@ -514,7 +563,7 @@ fn print_local_json(stats: &[rpc::InterfaceStatEntry], link_count: Option<i64>, 
             print!(",");
         }
         print!(
-            "{{\"name\":{},\"online\":{},\"mode\":{},\"role\":{},\"bitrate\":{},\"mtu\":{},\"rxb\":{},\"txb\":{},\"rxs\":{},\"txs\":{},\"announce_queue\":{},\"held_announces\":{},\"incoming_announce_frequency\":{},\"outgoing_announce_frequency\":{},\"clients\":{},\"announce_rate_target\":{},\"announce_rate_grace\":{},\"announce_rate_penalty\":{},\"tx_drops\":{}}}",
+            "{{\"name\":{},\"online\":{},\"mode\":{},\"role\":{},\"bitrate\":{},\"mtu\":{},\"rxb\":{},\"txb\":{},\"rxs\":{},\"txs\":{},\"announce_queue\":{},\"held_announces\":{},\"incoming_announce_frequency\":{},\"outgoing_announce_frequency\":{},\"incoming_pr_frequency\":{},\"outgoing_pr_frequency\":{},\"burst_active\":{},\"burst_activated\":{},\"pr_burst_active\":{},\"pr_burst_activated\":{},\"clients\":{},\"announce_rate_target\":{},\"announce_rate_grace\":{},\"announce_rate_penalty\":{},\"tx_drops\":{}}}",
             json_str(&e.name),
             e.online,
             json_str(&e.mode),
@@ -531,6 +580,12 @@ fn print_local_json(stats: &[rpc::InterfaceStatEntry], link_count: Option<i64>, 
             e.held_announces,
             e.incoming_announce_frequency,
             e.outgoing_announce_frequency,
+            e.incoming_pr_frequency,
+            e.outgoing_pr_frequency,
+            e.burst_active,
+            e.burst_activated,
+            e.pr_burst_active,
+            e.pr_burst_activated,
             opt_u64_json(e.clients),
             opt_f64_json(e.announce_rate_target),
             opt_u32_json(e.announce_rate_grace),
@@ -902,6 +957,12 @@ struct RemoteInterface {
     held_announces: u64,
     incoming_announce_frequency: f64,
     outgoing_announce_frequency: f64,
+    incoming_pr_frequency: f64,
+    outgoing_pr_frequency: f64,
+    burst_active: bool,
+    burst_activated: f64,
+    pr_burst_active: bool,
+    pr_burst_activated: f64,
     clients: Option<u64>,
     announce_rate_target: Option<f64>,
     announce_rate_grace: Option<u32>,
@@ -922,6 +983,8 @@ impl RemoteInterface {
             }
             SortKey::AnnounceRx => self.incoming_announce_frequency,
             SortKey::AnnounceTx => self.outgoing_announce_frequency,
+            SortKey::PathRequestRx => self.incoming_pr_frequency,
+            SortKey::PathRequestTx => self.outgoing_pr_frequency,
             SortKey::Held => self.held_announces as f64,
         }
     }
@@ -972,7 +1035,14 @@ fn print_remote_status(bytes: &[u8], args: &Args) -> ExitCode {
             ifs.iter()
                 .filter_map(|iface| iface.as_map().map(|m| remote_interface_from_map(m)))
                 .filter(|iface| args.all || visible_by_default(&iface.name))
-                .filter(|iface| interface_matches_filter(&iface.name, args.filter.as_deref()))
+                .filter(|iface| {
+                    interface_matches_burst_filter(
+                        &iface.name,
+                        iface.burst_active,
+                        iface.pr_burst_active,
+                        args,
+                    )
+                })
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
@@ -994,7 +1064,7 @@ fn print_remote_status(bytes: &[u8], args: &Args) -> ExitCode {
                 print!(",");
             }
             print!(
-                "{{\"name\":{},\"online\":{},\"mode\":{},\"bitrate\":{},\"rxb\":{},\"txb\":{},\"rxs\":{},\"txs\":{},\"announce_queue\":{},\"held_announces\":{},\"incoming_announce_frequency\":{},\"outgoing_announce_frequency\":{},\"clients\":{},\"announce_rate_target\":{},\"announce_rate_grace\":{},\"announce_rate_penalty\":{}}}",
+                "{{\"name\":{},\"online\":{},\"mode\":{},\"bitrate\":{},\"rxb\":{},\"txb\":{},\"rxs\":{},\"txs\":{},\"announce_queue\":{},\"held_announces\":{},\"incoming_announce_frequency\":{},\"outgoing_announce_frequency\":{},\"incoming_pr_frequency\":{},\"outgoing_pr_frequency\":{},\"burst_active\":{},\"burst_activated\":{},\"pr_burst_active\":{},\"pr_burst_activated\":{},\"clients\":{},\"announce_rate_target\":{},\"announce_rate_grace\":{},\"announce_rate_penalty\":{}}}",
                 json_str(&iface.name),
                 iface.online,
                 iface.mode,
@@ -1010,6 +1080,12 @@ fn print_remote_status(bytes: &[u8], args: &Args) -> ExitCode {
                 iface.held_announces,
                 iface.incoming_announce_frequency,
                 iface.outgoing_announce_frequency,
+                iface.incoming_pr_frequency,
+                iface.outgoing_pr_frequency,
+                iface.burst_active,
+                iface.burst_activated,
+                iface.pr_burst_active,
+                iface.pr_burst_activated,
                 opt_u64_json(iface.clients),
                 opt_f64_json(iface.announce_rate_target),
                 opt_u32_json(iface.announce_rate_grace),
@@ -1058,6 +1134,7 @@ fn print_remote_status(bytes: &[u8], args: &Args) -> ExitCode {
                 }
                 if iface.incoming_announce_frequency > 0.0
                     || iface.outgoing_announce_frequency > 0.0
+                    || iface.burst_active
                 {
                     print_announce_frequency(
                         iface.incoming_announce_frequency,
@@ -1066,8 +1143,17 @@ fn print_remote_status(bytes: &[u8], args: &Args) -> ExitCode {
                         iface.announce_rate_target,
                         iface.announce_rate_penalty,
                         iface.announce_rate_grace,
+                        burst_status_text(iface.burst_active, iface.burst_activated),
                     );
                 }
+            }
+            if args.pr_stats {
+                print_path_request_frequency(
+                    iface.incoming_pr_frequency,
+                    iface.outgoing_pr_frequency,
+                    iface.clients,
+                    burst_status_text(iface.pr_burst_active, iface.pr_burst_activated),
+                );
             }
             println!(
                 "    Traffic  : {} rx / {} tx",
@@ -1118,6 +1204,12 @@ fn remote_interface_from_map(m: &[(rmpv::Value, rmpv::Value)]) -> RemoteInterfac
             .unwrap_or(0.0),
         outgoing_announce_frequency: map_f64_or_u64(m, "outgoing_announce_frequency")
             .unwrap_or(0.0),
+        incoming_pr_frequency: map_f64_or_u64(m, "incoming_pr_frequency").unwrap_or(0.0),
+        outgoing_pr_frequency: map_f64_or_u64(m, "outgoing_pr_frequency").unwrap_or(0.0),
+        burst_active: map_bool(m, "burst_active").unwrap_or(false),
+        burst_activated: map_f64_or_u64(m, "burst_activated").unwrap_or(0.0),
+        pr_burst_active: map_bool(m, "pr_burst_active").unwrap_or(false),
+        pr_burst_activated: map_f64_or_u64(m, "pr_burst_activated").unwrap_or(0.0),
         clients: map_u64(m, "clients"),
         announce_rate_target: map_f64_or_u64(m, "announce_rate_target"),
         announce_rate_grace: map_u64(m, "announce_rate_grace")
@@ -1157,6 +1249,7 @@ fn print_announce_frequency(
     target: Option<f64>,
     penalty: Option<f64>,
     grace: Option<u32>,
+    burst_text: String,
 ) {
     let outgoing_text = format!("{}↑", format::pretty_frequency(outgoing));
     let incoming_text = format!("{}↓", format::pretty_frequency(incoming));
@@ -1166,7 +1259,38 @@ fn print_announce_frequency(
         .unwrap_or_default();
     let limits = announce_rate_limits_text(target, penalty, grace);
     println!("    Announces: {outgoing_text}{per_client}");
-    println!("               {incoming_text} {limits}");
+    println!("               {incoming_text} {limits}{burst_text}");
+}
+
+fn print_path_request_frequency(
+    incoming: f64,
+    outgoing: f64,
+    clients: Option<u64>,
+    burst_text: String,
+) {
+    let outgoing_text = format!("{}↑", format::pretty_frequency(outgoing));
+    let incoming_text = format!("{}↓", format::pretty_frequency(incoming));
+    let per_client = clients
+        .filter(|clients| *clients > 0)
+        .map(|clients| format!(" {}/c", format::pretty_frequency(outgoing / clients as f64)))
+        .unwrap_or_default();
+    println!("    Path Rqs.: {outgoing_text}{per_client}");
+    println!("               {incoming_text} {burst_text}");
+}
+
+fn burst_status_text(active: bool, activated: f64) -> String {
+    if !active || activated <= 0.0 {
+        return String::new();
+    }
+    let age = (unix_now() - activated).max(0.0);
+    format!(" burst for {}", format::pretty_time(age))
+}
+
+fn unix_now() -> f64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs_f64()
 }
 
 fn announce_rate_limits_text(
@@ -1245,6 +1369,131 @@ fn json_str(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_args() -> Args {
+        Args {
+            all: true,
+            announce_stats: false,
+            pr_stats: false,
+            link_stats: false,
+            burst: false,
+            totals: false,
+            sort: None,
+            reverse: false,
+            json: false,
+            config: None,
+            remote: None,
+            identity: None,
+            timeout: None,
+            discovered: false,
+            discovered_details: false,
+            monitor: false,
+            monitor_interval: 1.0,
+            version: false,
+            verbose: 0,
+            quiet: 0,
+            filter: None,
+        }
+    }
+
+    fn local_entry(
+        name: &str,
+        burst_active: bool,
+        pr_burst_active: bool,
+    ) -> rpc::InterfaceStatEntry {
+        rpc::InterfaceStatEntry {
+            id: 1,
+            name: name.to_string(),
+            rx_bytes: 0,
+            tx_bytes: 0,
+            rx_rate: 0,
+            tx_rate: 0,
+            online: true,
+            bitrate: 1,
+            mtu: 500,
+            mode: "Full".to_string(),
+            role: "normal".to_string(),
+            announce_queue: None,
+            held_announces: 0,
+            incoming_announce_frequency: 0.0,
+            outgoing_announce_frequency: 0.0,
+            incoming_pr_frequency: 2.0,
+            outgoing_pr_frequency: 3.0,
+            burst_active,
+            burst_activated: if burst_active { 1_700_000_000.0 } else { 0.0 },
+            pr_burst_active,
+            pr_burst_activated: if pr_burst_active {
+                1_700_000_001.0
+            } else {
+                0.0
+            },
+            clients: None,
+            announce_rate_target: None,
+            announce_rate_grace: None,
+            announce_rate_penalty: None,
+            announce_cap: 0.0,
+            ifac_size: 0,
+            tx_drops: 0,
+        }
+    }
+
+    #[test]
+    fn sort_key_accepts_path_request_rates() {
+        assert_eq!(
+            parse_sort_key(Some("prx")).unwrap(),
+            Some(SortKey::PathRequestRx)
+        );
+        assert_eq!(
+            parse_sort_key(Some("ptx")).unwrap(),
+            Some(SortKey::PathRequestTx)
+        );
+
+        let entry = local_entry("SortIf", false, false);
+        assert_eq!(local_stat_sort_value(&entry, SortKey::PathRequestRx), 2.0);
+        assert_eq!(local_stat_sort_value(&entry, SortKey::PathRequestTx), 3.0);
+    }
+
+    #[test]
+    fn pr_and_burst_flags_parse() {
+        let args = Args::try_parse_from(["rnstatus-rs", "-P", "-B"]).unwrap();
+        assert!(args.pr_stats);
+        assert!(args.burst);
+    }
+
+    #[test]
+    fn burst_filter_includes_active_bursts_or_name_matches() {
+        let stats = vec![
+            local_entry("InactiveIf", false, false),
+            local_entry("AnnounceBurstIf", true, false),
+            local_entry("PrBurstIf", false, true),
+            local_entry("ManualMatchIf", false, false),
+        ];
+        let mut args = test_args();
+        args.burst = true;
+        args.filter = Some("manual".to_string());
+
+        let names: Vec<_> = filtered_local_stats(&stats, &args)
+            .into_iter()
+            .map(|entry| entry.name.as_str())
+            .collect();
+
+        assert_eq!(names, vec!["AnnounceBurstIf", "PrBurstIf", "ManualMatchIf"]);
+    }
+
+    #[test]
+    fn remote_status_parser_defaults_missing_125_fields() {
+        let iface = remote_interface_from_map(&[
+            (rmpv::Value::from("name"), rmpv::Value::from("LegacyIf")),
+            (rmpv::Value::from("status"), rmpv::Value::from(true)),
+        ]);
+
+        assert_eq!(iface.incoming_pr_frequency, 0.0);
+        assert_eq!(iface.outgoing_pr_frequency, 0.0);
+        assert!(!iface.burst_active);
+        assert_eq!(iface.burst_activated, 0.0);
+        assert!(!iface.pr_burst_active);
+        assert_eq!(iface.pr_burst_activated, 0.0);
+    }
 
     #[test]
     fn local_rpc_auth_failure_explains_config_mismatch_and_port_owner() {

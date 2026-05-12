@@ -130,6 +130,18 @@ pub struct InterfaceStatEntry {
     pub held_announces: u64,
     pub incoming_announce_frequency: f64,
     pub outgoing_announce_frequency: f64,
+    #[serde(default)]
+    pub incoming_pr_frequency: f64,
+    #[serde(default)]
+    pub outgoing_pr_frequency: f64,
+    #[serde(default)]
+    pub burst_active: bool,
+    #[serde(default)]
+    pub burst_activated: f64,
+    #[serde(default)]
+    pub pr_burst_active: bool,
+    #[serde(default)]
+    pub pr_burst_activated: f64,
     pub clients: Option<u64>,
     pub announce_rate_target: Option<f64>,
     pub announce_rate_grace: Option<u32>,
@@ -455,6 +467,18 @@ fn response_to_py_value(resp: &RpcResponse) -> PyValue {
                             PyValue::Float(e.outgoing_announce_frequency),
                         ),
                         (
+                            "incoming_pr_frequency",
+                            PyValue::Float(e.incoming_pr_frequency),
+                        ),
+                        (
+                            "outgoing_pr_frequency",
+                            PyValue::Float(e.outgoing_pr_frequency),
+                        ),
+                        ("burst_active", PyValue::Bool(e.burst_active)),
+                        ("burst_activated", PyValue::Float(e.burst_activated)),
+                        ("pr_burst_active", PyValue::Bool(e.pr_burst_active)),
+                        ("pr_burst_activated", PyValue::Float(e.pr_burst_activated)),
+                        (
                             "clients",
                             e.clients
                                 .map(|v| PyValue::Int(i128::from(v)))
@@ -702,6 +726,24 @@ fn parse_interface_stats(value: &PyValue) -> Result<Vec<InterfaceStatEntry>, Rpc
                     .and_then(py_f64)
                     .unwrap_or(0.0),
                 outgoing_announce_frequency: dict_get(m, "outgoing_announce_frequency")
+                    .and_then(py_f64)
+                    .unwrap_or(0.0),
+                incoming_pr_frequency: dict_get(m, "incoming_pr_frequency")
+                    .and_then(py_f64)
+                    .unwrap_or(0.0),
+                outgoing_pr_frequency: dict_get(m, "outgoing_pr_frequency")
+                    .and_then(py_f64)
+                    .unwrap_or(0.0),
+                burst_active: dict_get(m, "burst_active")
+                    .and_then(py_bool)
+                    .unwrap_or(false),
+                burst_activated: dict_get(m, "burst_activated")
+                    .and_then(py_f64)
+                    .unwrap_or(0.0),
+                pr_burst_active: dict_get(m, "pr_burst_active")
+                    .and_then(py_bool)
+                    .unwrap_or(false),
+                pr_burst_activated: dict_get(m, "pr_burst_activated")
                     .and_then(py_f64)
                     .unwrap_or(0.0),
                 clients: match dict_get(m, "clients") {
@@ -1635,6 +1677,89 @@ mod tests {
             RpcResponse::PathTable(entries) => {
                 assert_eq!(entries.len(), 1);
                 assert_eq!(entries[0].hops, 3);
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    fn interface_stat_entry() -> InterfaceStatEntry {
+        InterfaceStatEntry {
+            id: 7,
+            name: "TestIf".to_string(),
+            rx_bytes: 100,
+            tx_bytes: 200,
+            rx_rate: 10,
+            tx_rate: 20,
+            online: true,
+            bitrate: 115_200,
+            mtu: 500,
+            mode: "Gateway".to_string(),
+            role: "normal".to_string(),
+            announce_queue: Some(2),
+            held_announces: 3,
+            incoming_announce_frequency: 4.0,
+            outgoing_announce_frequency: 5.0,
+            incoming_pr_frequency: 6.0,
+            outgoing_pr_frequency: 7.0,
+            burst_active: true,
+            burst_activated: 1_700_000_001.0,
+            pr_burst_active: true,
+            pr_burst_activated: 1_700_000_002.0,
+            clients: Some(4),
+            announce_rate_target: Some(3600.0),
+            announce_rate_grace: Some(5),
+            announce_rate_penalty: Some(30.0),
+            announce_cap: 2.0,
+            ifac_size: 0,
+            tx_drops: 1,
+        }
+    }
+
+    #[test]
+    fn test_interface_stats_response_roundtrip_includes_125_fields() {
+        let resp = RpcResponse::InterfaceStats(vec![interface_stat_entry()]);
+        let encoded = encode_response(&resp).unwrap();
+        let decoded =
+            decode_response_for_request(&encoded, &RpcRequest::GetInterfaceStats).unwrap();
+        match decoded {
+            RpcResponse::InterfaceStats(entries) => {
+                assert_eq!(entries.len(), 1);
+                let entry = &entries[0];
+                assert_eq!(entry.incoming_pr_frequency, 6.0);
+                assert_eq!(entry.outgoing_pr_frequency, 7.0);
+                assert!(entry.burst_active);
+                assert_eq!(entry.burst_activated, 1_700_000_001.0);
+                assert!(entry.pr_burst_active);
+                assert_eq!(entry.pr_burst_activated, 1_700_000_002.0);
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn test_interface_stats_parser_defaults_missing_125_fields() {
+        let legacy = py_dict(vec![(
+            "interfaces",
+            PyValue::List(vec![py_dict(vec![
+                ("name", PyValue::String("LegacyIf".to_string())),
+                ("rxb", PyValue::Int(1)),
+                ("txb", PyValue::Int(2)),
+                ("status", PyValue::Bool(true)),
+            ])]),
+        )]);
+        let encoded = encode_python_pickle(&legacy).unwrap();
+        let decoded =
+            decode_response_for_request(&encoded, &RpcRequest::GetInterfaceStats).unwrap();
+        match decoded {
+            RpcResponse::InterfaceStats(entries) => {
+                assert_eq!(entries.len(), 1);
+                let entry = &entries[0];
+                assert_eq!(entry.incoming_pr_frequency, 0.0);
+                assert_eq!(entry.outgoing_pr_frequency, 0.0);
+                assert!(!entry.burst_active);
+                assert_eq!(entry.burst_activated, 0.0);
+                assert!(!entry.pr_burst_active);
+                assert_eq!(entry.pr_burst_activated, 0.0);
             }
             _ => panic!("wrong variant"),
         }

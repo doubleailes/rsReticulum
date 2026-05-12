@@ -252,7 +252,13 @@ fn interface_stats_from_rpc(e: InterfaceStatRpcEntry) -> schema::InterfaceStats 
         txb: e.tx_bytes,
         incoming_announce_frequency: e.incoming_announce_frequency,
         outgoing_announce_frequency: e.outgoing_announce_frequency,
+        incoming_pr_frequency: e.incoming_pr_frequency,
+        outgoing_pr_frequency: e.outgoing_pr_frequency,
         held_announces: e.held_announces,
+        burst_active: e.burst_active,
+        burst_activated: e.burst_activated,
+        pr_burst_active: e.pr_burst_active,
+        pr_burst_activated: e.pr_burst_activated,
         status: e.online,
         mode,
         bitrate: Some(e.bitrate),
@@ -330,7 +336,13 @@ mod tests {
                 txb: 7,
                 incoming_announce_frequency: 0.0,
                 outgoing_announce_frequency: 0.0,
+                incoming_pr_frequency: 0.0,
+                outgoing_pr_frequency: 0.0,
                 held_announces: 0,
+                burst_active: false,
+                burst_activated: 0.0,
+                pr_burst_active: false,
+                pr_burst_activated: 0.0,
                 status: true,
                 mode: 0x01,
                 bitrate: Some(1_000_000),
@@ -465,6 +477,12 @@ mod tests {
                                 held_announces: 1,
                                 incoming_announce_frequency: 0.5,
                                 outgoing_announce_frequency: 0.25,
+                                incoming_pr_frequency: 3.0,
+                                outgoing_pr_frequency: 1.5,
+                                burst_active: true,
+                                burst_activated: 1_700_000_001.0,
+                                pr_burst_active: true,
+                                pr_burst_activated: 1_700_000_002.0,
                                 clients: None,
                                 announce_rate_target: None,
                                 announce_rate_grace: None,
@@ -562,6 +580,34 @@ mod tests {
             Some(0x06),
             "Gateway mode maps to Python MODE_GATEWAY=0x06"
         );
+        let incoming_pr = iface_map
+            .iter()
+            .find(|(k, _)| k.as_str() == Some("incoming_pr_frequency"))
+            .unwrap()
+            .1
+            .as_f64();
+        assert_eq!(incoming_pr, Some(3.0));
+        let outgoing_pr = iface_map
+            .iter()
+            .find(|(k, _)| k.as_str() == Some("outgoing_pr_frequency"))
+            .unwrap()
+            .1
+            .as_f64();
+        assert_eq!(outgoing_pr, Some(1.5));
+        let burst_active = iface_map
+            .iter()
+            .find(|(k, _)| k.as_str() == Some("burst_active"))
+            .unwrap()
+            .1
+            .as_bool();
+        assert_eq!(burst_active, Some(true));
+        let pr_burst_active = iface_map
+            .iter()
+            .find(|(k, _)| k.as_str() == Some("pr_burst_active"))
+            .unwrap()
+            .1
+            .as_bool();
+        assert_eq!(pr_burst_active, Some(true));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

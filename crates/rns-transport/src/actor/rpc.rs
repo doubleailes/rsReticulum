@@ -30,6 +30,7 @@ impl TransportActor {
                 TransportQueryResponse::PathTable(entries)
             }
             TransportQuery::GetInterfaceStats => {
+                let now = now_f64();
                 let stats: Vec<InterfaceStatRpcEntry> = self
                     .interfaces
                     .iter()
@@ -66,7 +67,23 @@ impl TransportActor {
                             incoming_announce_frequency: entry
                                 .ingress
                                 .incoming_announce_frequency(),
-                            outgoing_announce_frequency: 0.0,
+                            outgoing_announce_frequency: entry
+                                .ingress
+                                .outgoing_announce_frequency(),
+                            incoming_pr_frequency: entry.ingress.incoming_pr_frequency(),
+                            outgoing_pr_frequency: entry.ingress.outgoing_pr_frequency(),
+                            burst_active: entry.ingress.is_burst_active(),
+                            burst_activated: activation_epoch(
+                                now,
+                                entry.ingress.is_burst_active(),
+                                entry.ingress.burst_activated(),
+                            ),
+                            pr_burst_active: entry.ingress.is_pr_burst_active(),
+                            pr_burst_activated: activation_epoch(
+                                now,
+                                entry.ingress.is_pr_burst_active(),
+                                entry.ingress.pr_burst_activated(),
+                            ),
                             clients: None,
                             announce_rate_target: entry.announce_rate_target,
                             announce_rate_grace: entry.announce_rate_grace,
@@ -520,5 +537,13 @@ impl TransportActor {
                 TransportQueryResponse::IntResult(purged as i64)
             }
         }
+    }
+}
+
+fn activation_epoch(now: f64, active: bool, activated: std::time::Instant) -> f64 {
+    if active {
+        now - activated.elapsed().as_secs_f64()
+    } else {
+        0.0
     }
 }

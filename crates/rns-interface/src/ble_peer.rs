@@ -5702,6 +5702,7 @@ pub async fn spawn_ble_peer_interface(
 
     Ok(InterfaceHandle {
         id,
+        parent_id: None,
         name,
         mode: config.mode,
         direction: InterfaceDirection {

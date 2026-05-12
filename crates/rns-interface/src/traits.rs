@@ -9,6 +9,9 @@ pub type InterfaceId = u64;
 /// Handle returned by every `spawn_*`: write channel, status flag, and read task.
 pub struct InterfaceHandle {
     pub id: InterfaceId,
+    /// Parent interface for dynamically spawned children such as accepted TCP,
+    /// Backbone or I2P peers.
+    pub parent_id: Option<InterfaceId>,
     pub name: String,
     pub mode: InterfaceMode,
     pub direction: InterfaceDirection,
@@ -154,21 +157,39 @@ pub fn optimise_mtu(bitrate: u64) -> Option<u32> {
 pub const NAME_HASH_LENGTH: usize = 10;
 
 // Ingress control constants — must match Reticulum reference.
-pub const IA_FREQ_SAMPLES: usize = 128;
-pub const OA_FREQ_SAMPLES: usize = 128;
+pub const IA_FREQ_SAMPLES: usize = 48;
+pub const OA_FREQ_SAMPLES: usize = 48;
+pub const IP_FREQ_SAMPLES: usize = 48;
+pub const OP_FREQ_SAMPLES: usize = 48;
+pub const AR_MINFREQ_HZ: f64 = 0.1;
+pub const PR_MINFREQ_HZ: f64 = 0.1;
+pub const AR_FREQ_DECAY: f64 = 1.0 / AR_MINFREQ_HZ;
+pub const PR_FREQ_DECAY: f64 = 1.0 / PR_MINFREQ_HZ;
 pub const MAX_HELD_ANNOUNCES: usize = 256;
 /// Duration a new interface stays in "new" state (seconds).
 pub const IC_NEW_TIME: f64 = 7200.0;
 /// Burst threshold for new interfaces (announces/sec).
-pub const IC_BURST_FREQ_NEW: f64 = 6.0;
+pub const IC_BURST_FREQ_NEW: f64 = 3.0;
 /// Burst threshold for established interfaces (announces/sec).
-pub const IC_BURST_FREQ: f64 = 35.0;
+pub const IC_BURST_FREQ: f64 = 10.0;
+/// Burst threshold for new interfaces (path requests/sec).
+pub const IC_PR_BURST_FREQ_NEW: f64 = 3.0;
+/// Burst threshold for established interfaces (path requests/sec).
+pub const IC_PR_BURST_FREQ: f64 = 8.0;
 /// Burst detection window duration (seconds).
-pub const IC_BURST_HOLD: f64 = 60.0;
+pub const IC_BURST_HOLD: f64 = 15.0;
 /// Penalty duration after a detected burst (seconds).
 pub const IC_BURST_PENALTY: f64 = 15.0;
 /// Interval between released held announces (seconds).
-pub const IC_HELD_RELEASE_INTERVAL: f64 = 2.0;
+pub const IC_HELD_RELEASE_INTERVAL: f64 = 5.0;
+/// Minimum samples required before incoming frequency is considered defined.
+pub const IC_DEQUE_MIN_SAMPLE: usize = 2;
+/// Minimum samples required for burst clearing / PR egress limiting.
+pub const IC_BURST_MIN_SAMPLES: usize = 6;
+/// Optional outgoing path-request limiter threshold (requests/sec).
+pub const EC_PR_FREQ: f64 = 5.0;
+/// Whether outgoing path-request limiting is active by default.
+pub const EGRESS_CONTROL: bool = false;
 
 #[derive(Debug, thiserror::Error)]
 pub enum InterfaceError {
@@ -239,13 +260,25 @@ mod tests {
 
     #[test]
     fn test_ingress_control_constants() {
-        assert_eq!(IA_FREQ_SAMPLES, 128);
-        assert_eq!(OA_FREQ_SAMPLES, 128);
-        assert_eq!(IC_BURST_FREQ, 35.0);
-        assert_eq!(IC_BURST_FREQ_NEW, 6.0);
-        assert_eq!(IC_BURST_HOLD, 60.0);
+        assert_eq!(IA_FREQ_SAMPLES, 48);
+        assert_eq!(OA_FREQ_SAMPLES, 48);
+        assert_eq!(IP_FREQ_SAMPLES, 48);
+        assert_eq!(OP_FREQ_SAMPLES, 48);
+        assert_eq!(AR_MINFREQ_HZ, 0.1);
+        assert_eq!(PR_MINFREQ_HZ, 0.1);
+        assert_eq!(AR_FREQ_DECAY, 10.0);
+        assert_eq!(PR_FREQ_DECAY, 10.0);
+        assert_eq!(IC_BURST_FREQ, 10.0);
+        assert_eq!(IC_BURST_FREQ_NEW, 3.0);
+        assert_eq!(IC_PR_BURST_FREQ, 8.0);
+        assert_eq!(IC_PR_BURST_FREQ_NEW, 3.0);
+        assert_eq!(IC_BURST_HOLD, 15.0);
         assert_eq!(IC_BURST_PENALTY, 15.0);
         assert_eq!(IC_NEW_TIME, 7200.0);
-        assert_eq!(IC_HELD_RELEASE_INTERVAL, 2.0);
+        assert_eq!(IC_HELD_RELEASE_INTERVAL, 5.0);
+        assert_eq!(IC_DEQUE_MIN_SAMPLE, 2);
+        assert_eq!(IC_BURST_MIN_SAMPLES, 6);
+        assert_eq!(EC_PR_FREQ, 5.0);
+        assert!(!EGRESS_CONTROL);
     }
 }

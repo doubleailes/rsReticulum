@@ -291,6 +291,7 @@ pub async fn spawn_backbone_server(
 
                     let handle = InterfaceHandle {
                         id: client_id,
+                        parent_id: Some(id),
                         name: client_name,
                         mode,
                         direction: InterfaceDirection {
@@ -323,6 +324,7 @@ pub async fn spawn_backbone_server(
 
     Ok(InterfaceHandle {
         id,
+        parent_id: None,
         name,
         mode,
         direction: InterfaceDirection {
@@ -490,6 +492,7 @@ pub async fn spawn_backbone_client(
 
     Ok(InterfaceHandle {
         id,
+        parent_id: None,
         name,
         mode,
         direction: InterfaceDirection {

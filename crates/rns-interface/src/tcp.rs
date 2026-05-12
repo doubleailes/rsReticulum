@@ -391,6 +391,7 @@ pub async fn spawn_tcp_client(
     let bitrate: u64 = 10_000_000;
     Ok(InterfaceHandle {
         id,
+        parent_id: None,
         name,
         mode,
         direction: InterfaceDirection {
@@ -419,6 +420,7 @@ pub async fn spawn_tcp_client(
 async fn spawn_tcp_accepted(
     stream: TcpStream,
     id: InterfaceId,
+    parent_id: InterfaceId,
     name: String,
     transport_tx: mpsc::Sender<TransportMessage>,
     kiss_framing: bool,
@@ -459,6 +461,7 @@ async fn spawn_tcp_accepted(
     let bitrate: u64 = 10_000_000;
     InterfaceHandle {
         id,
+        parent_id: Some(parent_id),
         name,
         mode,
         direction: InterfaceDirection {
@@ -510,6 +513,7 @@ pub async fn spawn_tcp_server(
                     let handle = spawn_tcp_accepted(
                         stream,
                         client_id,
+                        id,
                         client_name,
                         transport_tx.clone(),
                         kiss_framing,
@@ -533,6 +537,7 @@ pub async fn spawn_tcp_server(
     let bitrate: u64 = 10_000_000;
     Ok(InterfaceHandle {
         id,
+        parent_id: None,
         name,
         mode,
         direction: InterfaceDirection {
