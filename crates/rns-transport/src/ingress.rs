@@ -532,7 +532,7 @@ mod tests {
         assert_eq!(IC_BURST_PENALTY, 15.0);
         assert_eq!(IC_HELD_RELEASE_INTERVAL, 5.0);
         assert_eq!(EC_PR_FREQ, 5.0);
-        assert!(!EGRESS_CONTROL);
+        const { assert!(!EGRESS_CONTROL) };
     }
 
     #[test]

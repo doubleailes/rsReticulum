@@ -279,6 +279,6 @@ mod tests {
         assert_eq!(IC_DEQUE_MIN_SAMPLE, 2);
         assert_eq!(IC_BURST_MIN_SAMPLES, 6);
         assert_eq!(EC_PR_FREQ, 5.0);
-        assert!(!EGRESS_CONTROL);
+        const { assert!(!EGRESS_CONTROL) };
     }
 }

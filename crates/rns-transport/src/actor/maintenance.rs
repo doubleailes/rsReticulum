@@ -272,16 +272,16 @@ impl TransportActor {
 
         if !self.path_table.has_path(&destination_hash) {
             should_request = true;
-        } else if !path_request_throttle && expired_link.taken_hops == 0 {
-            should_request = true;
-        } else if !path_request_throttle && self.path_table.hops_to(&destination_hash) == Some(1) {
-            should_request = true;
-            blocked_interface = Some(expired_link.receiving_interface);
-            self.mark_failed_link_path_unresponsive(&expired_link);
-        } else if !path_request_throttle && expired_link.taken_hops == 1 {
-            should_request = true;
-            blocked_interface = Some(expired_link.receiving_interface);
-            self.mark_failed_link_path_unresponsive(&expired_link);
+        } else if !path_request_throttle {
+            if expired_link.taken_hops == 0 {
+                should_request = true;
+            } else if self.path_table.hops_to(&destination_hash) == Some(1)
+                || expired_link.taken_hops == 1
+            {
+                should_request = true;
+                blocked_interface = Some(expired_link.receiving_interface);
+                self.mark_failed_link_path_unresponsive(&expired_link);
+            }
         }
 
         if !should_request {

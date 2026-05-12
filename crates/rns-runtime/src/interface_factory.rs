@@ -1014,7 +1014,6 @@ impl InterfacePostInit {
             held_release_interval: section.get_float("ic_held_release_interval"),
             ec_pr_freq: section.get_float("ec_pr_freq"),
             egress_control: section.get_bool("egress_control"),
-            ..Default::default()
         };
         Self {
             outgoing: section.get_bool("outgoing").unwrap_or(true),
