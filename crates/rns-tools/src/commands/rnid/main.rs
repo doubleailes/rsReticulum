@@ -1,6 +1,6 @@
 //! rnid-rs - identity create/inspect/sign/verify/encrypt/decrypt.
 //!
-//! Python reference: `RNS/Utilities/rnid.py` from Reticulum 1.2.4.
+//! Python reference: `RNS/Utilities/rnid.py` from Reticulum 1.2.5.
 
 mod rsg;
 
@@ -26,7 +26,7 @@ use rns_transport::messages::{
 #[cfg(feature = "hardware")]
 mod hw_commands;
 
-const RETICULUM_COMPAT_VERSION: &str = "1.2.4";
+const RETICULUM_COMPAT_VERSION: &str = "1.2.5";
 const DEFAULT_ASPECTS: &str = "rns.id";
 const PUB_EXT: &str = "pub";
 const SIG_EXT: &str = "rsg";
@@ -159,6 +159,10 @@ struct Args {
     #[arg(short = 'B', long)]
     base32: bool,
 
+    /// Use hex-encoded input and output.
+    #[arg(long)]
+    hex: bool,
+
     /// Print version and exit.
     #[arg(long)]
     version: bool,
@@ -271,8 +275,12 @@ async fn run(mut args: Args) -> ExitCode {
         eprintln!("The -i, -g, -m and -M args are mutually exclusive");
         return ExitCode::from(1);
     }
-    if args.base64 && args.base32 {
-        eprintln!("The -b and -B args are mutually exclusive");
+    let encoding_count = [args.base64, args.base32, args.hex]
+        .into_iter()
+        .filter(|flag| *flag)
+        .count();
+    if encoding_count > 1 {
+        eprintln!("The -b, -B and --hex args are mutually exclusive");
         return ExitCode::from(1);
     }
 
@@ -858,19 +866,6 @@ fn sign_file(identity: &Identity, args: &Args) -> ExitCode {
             return ExitCode::from(6);
         }
     };
-    let Some(output_path) = args
-        .write
-        .clone()
-        .or_else(|| Some(append_extension(input_path, SIG_EXT)))
-    else {
-        eprintln!("Signing requested, but no output specified");
-        return ExitCode::from(253);
-    };
-    if let Err(e) = ensure_output_allowed(&output_path, args.force) {
-        eprintln!("{e}");
-        return ExitCode::from(11);
-    }
-
     let signature = if args.raw {
         match rsg::create_raw_signature(identity, input) {
             Ok(signature) => signature.to_vec(),
@@ -888,6 +883,37 @@ fn sign_file(identity: &Identity, args: &Args) -> ExitCode {
             }
         }
     };
+
+    if !args.raw && (args.base64 || args.base32 || args.hex) {
+        let encoded = if args.base64 {
+            URL_SAFE.encode(&signature)
+        } else if args.base32 {
+            encode_base32(&signature)
+        } else {
+            hex::encode(&signature)
+        };
+        println!("\n{}\n", wrap_rsg(encoded.as_bytes()));
+        println!(
+            "Signed file {} with {}",
+            input_path.display(),
+            pretty_hash(&identity.hash)
+        );
+        return ExitCode::SUCCESS;
+    }
+
+    let Some(output_path) = args
+        .write
+        .clone()
+        .or_else(|| Some(append_extension(input_path, SIG_EXT)))
+    else {
+        eprintln!("Signing requested, but no output specified");
+        return ExitCode::from(253);
+    };
+    if let Err(e) = ensure_output_allowed(&output_path, args.force) {
+        eprintln!("{e}");
+        return ExitCode::from(11);
+    }
+
     if let Err(e) = write_output(&output_path, &signature, args.stdout) {
         eprintln!("{e}");
         return ExitCode::from(253);
@@ -1299,6 +1325,36 @@ fn encode_key_text(bytes: &[u8], args: &Args) -> String {
     } else {
         hex::encode(bytes)
     }
+}
+
+fn wrap_rsg(rsg: &[u8]) -> String {
+    const HEADER: &[u8] = b"#### Start of rsg data ";
+    const FOOTER: &[u8] = b" End of rsg data ####";
+    const ROW_WIDTH: usize = 64;
+
+    let mut header = String::from_utf8_lossy(HEADER).into_owned();
+    while header.len() < ROW_WIDTH {
+        header.push('#');
+    }
+
+    let mut footer = String::new();
+    while footer.len() + FOOTER.len() < ROW_WIDTH {
+        footer.push('#');
+    }
+    footer.push_str(&String::from_utf8_lossy(FOOTER));
+
+    let mut wrapped = String::new();
+    wrapped.push_str(&header);
+    wrapped.push('\n');
+    for chunk in rsg.chunks(ROW_WIDTH) {
+        wrapped.push_str(&String::from_utf8_lossy(chunk));
+        for _ in chunk.len()..ROW_WIDTH {
+            wrapped.push('=');
+        }
+        wrapped.push('\n');
+    }
+    wrapped.push_str(&footer);
+    wrapped
 }
 
 fn encode_base32(bytes: &[u8]) -> String {

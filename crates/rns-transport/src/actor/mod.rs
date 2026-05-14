@@ -777,7 +777,7 @@ impl TransportActor {
     }
 
     /// Pin all cached announces made by `identity_hash`. Exposed via
-    /// `RetainIdentity` for Python 1.2.4 rnid parity.
+    /// `RetainIdentity` for Python 1.2.5 rnid parity.
     pub(super) fn retain_identity(&mut self, identity_hash: &[u8; 16]) -> bool {
         let mut retained = false;
         for entry in self.recent_announces.values_mut() {

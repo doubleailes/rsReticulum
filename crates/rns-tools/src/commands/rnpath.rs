@@ -27,7 +27,7 @@ const REMOTE_TIMEOUT_SECS: u64 = 30;
 const REMOTE_HOPS: u8 = 8;
 const MGMT_APP: &str = "rnstransport.remote.management";
 const BLACKHOLE_APP: &str = "rnstransport.info.blackhole";
-const RETICULUM_COMPAT_VERSION: &str = "1.2.4";
+const RETICULUM_COMPAT_VERSION: &str = "1.2.5";
 
 #[derive(Parser)]
 #[command(

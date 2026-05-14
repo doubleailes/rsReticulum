@@ -291,7 +291,7 @@ mod tests {
     use super::*;
 
     fn message() -> &'static [u8] {
-        b"Reticulum 1.2.4 rsg test payload"
+        b"Reticulum 1.2.5 rsg test payload"
     }
 
     fn pack_value(value: Value) -> Vec<u8> {

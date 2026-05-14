@@ -135,7 +135,12 @@ fn rnid_flag_conflicts_are_rejected() {
     let tmp = TempDir::new("rnid-flag-conflicts");
 
     let output = rnid(&tmp, ["-b", "-B"]);
-    assert_failure(&output, Some(1), "-b and -B", "base64/base32 conflict");
+    assert_failure(
+        &output,
+        Some(1),
+        "-b, -B and --hex",
+        "base64/base32 conflict",
+    );
 
     let generated = tmp.join("identity");
     let output = rnid(
