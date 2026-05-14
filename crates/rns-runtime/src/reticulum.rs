@@ -2669,19 +2669,42 @@ pub async fn spawn_backbone_server_runtime(
     Ok(id)
 }
 
+/// Settings for a runtime-spawned BLE RNode interface.
+#[cfg(feature = "ble")]
+pub struct BleRnodeRuntimeArgs<'a> {
+    /// Interface name registered with the transport actor.
+    pub name: &'a str,
+    /// BLE device path or address.
+    pub port: &'a str,
+    /// Radio frequency in Hz.
+    pub frequency: u32,
+    /// Radio bandwidth in Hz.
+    pub bandwidth: u32,
+    /// LoRa spreading factor.
+    pub spreading_factor: u8,
+    /// LoRa coding rate denominator.
+    pub coding_rate: u8,
+    /// Transmit power in dBm.
+    pub tx_power: i8,
+}
+
 /// Returns `(interface_id, online_flag)`; `online_flag` flips to `true`
 /// after the first successful connect.
 #[cfg(feature = "ble")]
 pub async fn spawn_ble_rnode_runtime(
     handle: &ReticulumHandle,
-    name: &str,
-    port: &str,
-    frequency: u32,
-    bandwidth: u32,
-    spreading_factor: u8,
-    coding_rate: u8,
-    tx_power: i8,
+    args: BleRnodeRuntimeArgs<'_>,
 ) -> Result<(u64, std::sync::Arc<std::sync::atomic::AtomicBool>), String> {
+    let BleRnodeRuntimeArgs {
+        name,
+        port,
+        frequency,
+        bandwidth,
+        spreading_factor,
+        coding_rate,
+        tx_power,
+    } = args;
+
     let id = handle
         .id_gen
         .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -2776,15 +2799,19 @@ pub async fn spawn_rnode_runtime(
 #[cfg(feature = "ble")]
 pub async fn spawn_ble_rnode_runtime_native(
     handle: &ReticulumHandle,
-    name: &str,
-    port: &str,
-    frequency: u32,
-    bandwidth: u32,
-    spreading_factor: u8,
-    coding_rate: u8,
-    tx_power: i8,
+    args: BleRnodeRuntimeArgs<'_>,
     tcp_port: u16,
 ) -> Result<(u64, std::sync::Arc<std::sync::atomic::AtomicBool>), String> {
+    let BleRnodeRuntimeArgs {
+        name,
+        port,
+        frequency,
+        bandwidth,
+        spreading_factor,
+        coding_rate,
+        tx_power,
+    } = args;
+
     let id = handle
         .id_gen
         .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
