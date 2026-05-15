@@ -34,7 +34,7 @@ impl TransportActor {
             packet.raw.clone()
         };
 
-        let (parsed, data_offset) = match rns_wire::header::PacketHeader::unpack(&raw) {
+        let (mut parsed, data_offset) = match rns_wire::header::PacketHeader::unpack(&raw) {
             Ok((header, offset)) => (header, offset),
             Err(e) => {
                 tracing::warn!(
@@ -88,6 +88,8 @@ impl TransportActor {
                 return;
             }
         }
+
+        parsed.hops = self.adjusted_inbound_hops(parsed.hops, packet.interface_id);
 
         tracing::debug!(
             pkt_type = ?parsed.flags.packet_type,
@@ -371,7 +373,7 @@ impl TransportActor {
                 let now = now_f64();
                 let mut rebroadcast_raw = raw.to_vec();
                 if rebroadcast_raw.len() >= 2 {
-                    rebroadcast_raw[1] = header.hops.saturating_add(1);
+                    rebroadcast_raw[1] = header.hops;
                 }
                 let announce_entry = crate::announce::AnnounceEntry {
                     timestamp: now,
@@ -443,6 +445,7 @@ impl TransportActor {
                 announce_emitted,
                 "ignoring replayed or stale announce"
             );
+            return;
         }
 
         // Diagnostics + identity cache. `retained` pins survive re-announce so
@@ -722,7 +725,7 @@ impl TransportActor {
                 let target_interface = path.interface_id;
                 let mut forwarded = raw.to_vec();
                 if forwarded.len() >= 2 {
-                    forwarded[1] = header.hops.saturating_add(1);
+                    forwarded[1] = header.hops;
                 }
                 self.send_to_interface(target_interface, &forwarded);
                 trace!(
@@ -775,7 +778,7 @@ impl TransportActor {
             let next_hop = path.next_hop;
             let mut forwarded = raw.to_vec();
             if forwarded.len() >= 2 {
-                forwarded[1] = header.hops.saturating_add(1);
+                forwarded[1] = header.hops;
             }
             self.send_to_interface(target_interface, &forwarded);
 
@@ -878,10 +881,10 @@ impl TransportActor {
         // Link-request proofs route back via the link_table to the interface
         // the original request arrived on.
         //
-        // Hop-count note: proofs start at hops=0 at the destination. Python
-        // auto-increments hops on receipt; we do not, so the equivalence is
-        // `hops+1 == remaining_hops` here and we bump hops on forward so the
-        // next relay sees the expected value.
+        // Proofs start at hops=0 at the destination. We normalise inbound
+        // hops before dispatch, matching Python Transport's increment-on-
+        // receive rule, so the proof must equal the remaining hops recorded
+        // when the request was forwarded.
         if header.context == rns_wire::context::PacketContext::Lrproof {
             if self.is_transport_enabled || from_local_client || for_local_client_link {
                 if let Some(link_entry) = self.link_table.get(&header.destination_hash) {
@@ -892,15 +895,11 @@ impl TransportActor {
                     // Require that the proof arrived on the same interface we
                     // forwarded the request to; a mismatch is either a routing
                     // change or a spoof and must not be relayed.
-                    let hops_match = if expected_hops == 0 {
-                        header.hops == 0
-                    } else {
-                        header.hops.saturating_add(1) == expected_hops
-                    };
+                    let hops_match = header.hops == expected_hops;
                     if hops_match && _interface_id == outbound_interface {
                         let mut forwarded = raw.to_vec();
                         if forwarded.len() >= 2 {
-                            forwarded[1] = header.hops.saturating_add(1);
+                            forwarded[1] = header.hops;
                         }
                         if let Some(entry) = self.link_table.get_mut(&header.destination_hash) {
                             entry.validated = true;
@@ -909,7 +908,7 @@ impl TransportActor {
                         debug!(
                             link_id = hex::encode(header.destination_hash),
                             via_interface = target_interface,
-                            hops = header.hops + 1,
+                            hops = header.hops,
                             "link proof (LRPROOF) routed via link table"
                         );
                         return;
@@ -918,7 +917,7 @@ impl TransportActor {
                             link_id = hex::encode(header.destination_hash),
                             expected_hops,
                             actual_hops = header.hops,
-                            "link proof hop mismatch, not transporting (expected hops+1 == remaining_hops)"
+                            "link proof hop mismatch, not transporting"
                         );
                     } else {
                         warn!(
@@ -966,7 +965,11 @@ impl TransportActor {
                         );
                     } else {
                         let target_interface = reverse_entry.receiving_interface;
-                        self.send_to_interface(target_interface, raw);
+                        let mut forwarded = raw.to_vec();
+                        if forwarded.len() >= 2 {
+                            forwarded[1] = header.hops;
+                        }
+                        self.send_to_interface(target_interface, &forwarded);
                         trace!(
                             dest = hex::encode(header.destination_hash),
                             via_interface = target_interface,
@@ -976,7 +979,11 @@ impl TransportActor {
                     }
                 } else {
                     let target_interface = reverse_entry.receiving_interface;
-                    self.send_to_interface(target_interface, raw);
+                    let mut forwarded = raw.to_vec();
+                    if forwarded.len() >= 2 {
+                        forwarded[1] = header.hops;
+                    }
+                    self.send_to_interface(target_interface, &forwarded);
                     trace!(
                         dest = hex::encode(header.destination_hash),
                         via_interface = target_interface,
@@ -1040,7 +1047,7 @@ impl TransportActor {
 
         let mut forwarded = raw.to_vec();
         if forwarded.len() >= 2 {
-            forwarded[1] = header.hops.saturating_add(1);
+            forwarded[1] = header.hops;
         }
         if let Some(entry) = self.link_table.get_mut(&header.destination_hash) {
             entry.timestamp = now_f64();
@@ -1049,7 +1056,7 @@ impl TransportActor {
         trace!(
             link_id = hex::encode(header.destination_hash),
             via_interface = target_interface,
-            hops = header.hops.saturating_add(1),
+            hops = header.hops,
             packet_kind,
             "link packet routed via link table"
         );

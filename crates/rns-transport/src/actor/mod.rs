@@ -600,6 +600,30 @@ impl TransportActor {
             .is_some_and(|entry| entry.role == InterfaceRole::LocalClient)
     }
 
+    fn is_shared_instance_peer_interface(&self, id: InterfaceId) -> bool {
+        self.interfaces
+            .get(&id)
+            .is_some_and(|entry| entry.role == InterfaceRole::SharedInstancePeer)
+    }
+
+    fn adjusted_inbound_hops(&self, raw_hops: u8, interface_id: InterfaceId) -> u8 {
+        let mut hops = raw_hops.saturating_add(1);
+
+        // Python Transport increments every inbound packet, then subtracts for
+        // local shared-instance clients and for a leaf's shared-instance peer
+        // interface. That keeps local clients spoofed as zero-hop while normal
+        // external neighbours become one-hop paths.
+        if self.has_local_client_interfaces() {
+            if self.is_local_client_interface(interface_id) {
+                hops = hops.saturating_sub(1);
+            }
+        } else if self.is_shared_instance_peer_interface(interface_id) {
+            hops = hops.saturating_sub(1);
+        }
+
+        hops
+    }
+
     fn has_local_client_interfaces(&self) -> bool {
         self.interfaces
             .values()
@@ -1788,16 +1812,16 @@ mod tests {
             q: None,
         });
 
-        // Path table should have an entry
+        // Path table stores Python-parity inbound-adjusted hops.
         assert!(actor.path_table.has_path(&dest_hash));
-        assert_eq!(actor.path_table.hops_to(&dest_hash), Some(3));
+        assert_eq!(actor.path_table.hops_to(&dest_hash), Some(4));
 
         // Flush deferred announces (rebroadcast is now deferred via announce table)
         actor.flush_pending_announces();
 
-        // Interface 2 should have received the rebroadcast (with hops incremented)
+        // Interface 2 should receive the adjusted hop value for the next leg.
         let rebroadcast = rx2.try_recv().unwrap();
-        assert_eq!(rebroadcast[1], 4); // hops incremented from 3 to 4
+        assert_eq!(rebroadcast[1], 4);
     }
 
     #[test]
@@ -2046,7 +2070,7 @@ mod tests {
     #[test]
     fn test_lrproof_routing_direct_attached_destination() {
         // Scenario: Initiator -> relay -> directly attached destination.
-        // The relay's path to the destination has remaining_hops=0, and the
+        // The relay's path to the destination has remaining_hops=1, and the
         // destination emits a fresh LRPROOF with hops=0.
         let (mut relay, _tx) = TransportActor::new();
         relay.is_transport_enabled = true;
@@ -2063,7 +2087,7 @@ mod tests {
                 timestamp: now_f64(),
                 next_hop: None,
                 interface_id: 2,
-                remaining_hops: 0,
+                remaining_hops: 1,
                 destination_hash: [0xCD; 16],
                 established: false,
                 validated: false,
@@ -2084,7 +2108,7 @@ mod tests {
 
         let routed = rx1
             .try_recv()
-            .expect("zero-hop LRPROOF should route back to initiator");
+            .expect("direct-attached LRPROOF should route back to initiator");
         assert_eq!(
             routed[1], 1,
             "forwarded direct-attached proof should be one hop from initiator"
@@ -2700,6 +2724,12 @@ mod tests {
             make_announce_for_with_random_blob(&identity, "test.replay.same", 3, blob);
         let (raw_replay, _) =
             make_announce_for_with_random_blob(&identity, "test.replay.same", 1, blob);
+        let (htx, mut hrx) = mpsc::channel(8);
+        actor.announce_handlers.push(AnnounceHandlerRegistration {
+            aspect_filter: None,
+            receive_path_responses: false,
+            tx: htx,
+        });
 
         actor.on_inbound(InboundPacket {
             raw: raw_first,
@@ -2708,6 +2738,9 @@ mod tests {
             snr: None,
             q: None,
         });
+        let first_event = hrx.try_recv().expect("fresh announce should dispatch");
+        assert_eq!(first_event.hops, 4);
+
         actor.on_inbound(InboundPacket {
             raw: raw_replay,
             interface_id: 2,
@@ -2717,10 +2750,19 @@ mod tests {
         });
 
         let path = actor.path_table.get(&dest_hash).unwrap();
-        assert_eq!(path.hops, 3);
+        assert_eq!(path.hops, 4);
         assert_eq!(path.interface_id, 1);
         assert_eq!(path.random_blobs.len(), 1);
         assert!(path.has_random_blob(&blob));
+        assert_eq!(
+            actor.recent_announces.get(&dest_hash).unwrap().hops,
+            4,
+            "replayed announces must not refresh recent announce state"
+        );
+        assert!(
+            hrx.try_recv().is_err(),
+            "replayed announces must not dispatch announce handlers"
+        );
         assert_eq!(
             actor
                 .announce_table
@@ -2766,7 +2808,7 @@ mod tests {
             q: None,
         });
         let path = actor.path_table.get(&dest_hash).unwrap();
-        assert_eq!(path.hops, 3);
+        assert_eq!(path.hops, 4);
         assert_eq!(path.interface_id, 2);
         assert!(path.has_random_blob(&old_blob));
         assert!(path.has_random_blob(&equal_new_blob));
@@ -2779,7 +2821,7 @@ mod tests {
             q: None,
         });
         let path = actor.path_table.get(&dest_hash).unwrap();
-        assert_eq!(path.hops, 5);
+        assert_eq!(path.hops, 6);
         assert_eq!(path.interface_id, 1);
         assert!(path.has_random_blob(&higher_new_blob));
     }
@@ -2815,7 +2857,7 @@ mod tests {
             q: None,
         });
         let path = actor.path_table.get(&dest_hash).unwrap();
-        assert_eq!(path.hops, 1);
+        assert_eq!(path.hops, 2);
         assert_eq!(path.interface_id, 1);
         assert!(!path.has_random_blob(&older_blob));
 
@@ -2828,7 +2870,7 @@ mod tests {
             q: None,
         });
         let path = actor.path_table.get(&dest_hash).unwrap();
-        assert_eq!(path.hops, 5);
+        assert_eq!(path.hops, 6);
         assert_eq!(path.interface_id, 2);
         assert!(path.has_random_blob(&older_blob));
     }
@@ -2867,7 +2909,7 @@ mod tests {
         });
 
         let path = actor.path_table.get(&dest_hash).unwrap();
-        assert_eq!(path.hops, 5);
+        assert_eq!(path.hops, 6);
         assert_eq!(path.interface_id, 2);
         assert_eq!(
             actor.path_table.get_state(&dest_hash),
@@ -3226,7 +3268,7 @@ mod tests {
         assert!(actor.path_table.has_path(&dest_hash));
         let path = actor.path_table.get(&dest_hash).unwrap();
         assert_eq!(path.next_hop, Some(transport_id));
-        assert_eq!(path.hops, 2);
+        assert_eq!(path.hops, 3);
         assert_eq!(path.interface_id, 1);
     }
 
@@ -3252,7 +3294,7 @@ mod tests {
             path.next_hop, None,
             "Header1 announce should have no next_hop"
         );
-        assert_eq!(path.hops, 0);
+        assert_eq!(path.hops, 1);
     }
 
     #[test]
@@ -3262,7 +3304,7 @@ mod tests {
         actor.interfaces.insert(1, entry1);
 
         // Step 1: Receive Header2 announce (from dest via transport relay)
-        // Use hops=2 so the path records hops=2 (triggers Header2 wrapping)
+        // Use raw hops=2 so the path records inbound-adjusted hops=3.
         let transport_id = [0xCC; 16];
         let (announce_raw, dest_hash, _identity) =
             make_header2_announce(transport_id, "test.chain", 2);
@@ -6011,7 +6053,7 @@ mod tests {
             header.flags.packet_type,
             rns_wire::flags::PacketType::Announce
         );
-        assert_eq!(header.hops, 1);
+        assert_eq!(header.hops, 0);
     }
 
     #[test]
