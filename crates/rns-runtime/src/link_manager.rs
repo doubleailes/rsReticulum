@@ -88,6 +88,12 @@ pub struct LinkResourceProof {
     pub resource_hash: [u8; 32],
 }
 
+#[derive(Debug, Clone)]
+pub enum LinkPayloadSendReceipt {
+    Packet(LinkPacketSendReceipt),
+    Resource(LinkResourceSendReceipt),
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum ChannelSendError {
     #[error("link not found")]
@@ -132,6 +138,12 @@ pub enum LinkManagerCommand {
         payload: Vec<u8>,
         auto_compress: bool,
         result_tx: Option<oneshot::Sender<Result<LinkResourceSendReceipt, LinkSendError>>>,
+    },
+    SendLinkPayload {
+        link_id: [u8; 16],
+        payload: Vec<u8>,
+        auto_compress: bool,
+        result_tx: Option<oneshot::Sender<Result<LinkPayloadSendReceipt, LinkSendError>>>,
     },
     CloseLink {
         link_id: [u8; 16],
@@ -417,6 +429,18 @@ impl LinkManager {
                 result_tx,
             } => {
                 let result = self.send_link_resource(&link_id, payload, auto_compress);
+                if let Some(tx) = result_tx {
+                    let _ = tx.send(result);
+                }
+                true
+            }
+            LinkManagerCommand::SendLinkPayload {
+                link_id,
+                payload,
+                auto_compress,
+                result_tx,
+            } => {
+                let result = self.send_link_payload(&link_id, payload, auto_compress);
                 if let Some(tx) = result_tx {
                     let _ = tx.send(result);
                 }
@@ -2279,6 +2303,29 @@ impl LinkManager {
             link_id: *link_id,
             resource_hash,
         })
+    }
+
+    pub fn send_link_payload(
+        &mut self,
+        link_id: &[u8; 16],
+        payload: Vec<u8>,
+        auto_compress: bool,
+    ) -> Result<LinkPayloadSendReceipt, LinkSendError> {
+        let active = self
+            .active_links
+            .get(link_id)
+            .ok_or(LinkSendError::LinkNotFound)?;
+        if active.link.state != LinkState::Active {
+            return Err(LinkSendError::LinkNotActive);
+        }
+
+        if payload.len() <= active.link.mdu {
+            self.send_link_packet(link_id, &payload)
+                .map(LinkPayloadSendReceipt::Packet)
+        } else {
+            self.send_link_resource(link_id, payload, auto_compress)
+                .map(LinkPayloadSendReceipt::Resource)
+        }
     }
 
     pub fn process_destination_packet(&self, raw: &[u8], identity: &Identity) -> Option<Vec<u8>> {
