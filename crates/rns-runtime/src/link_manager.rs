@@ -64,6 +64,30 @@ pub struct ChannelSendReceipt {
     pub packet_hash: [u8; 32],
 }
 
+#[derive(Debug, Clone)]
+pub struct LinkPacketSendReceipt {
+    pub link_id: [u8; 16],
+    pub packet_hash: [u8; 32],
+}
+
+#[derive(Debug, Clone)]
+pub struct LinkResourceSendReceipt {
+    pub link_id: [u8; 16],
+    pub resource_hash: [u8; 32],
+}
+
+#[derive(Debug, Clone)]
+pub struct LinkPacketProof {
+    pub link_id: [u8; 16],
+    pub packet_hash: [u8; 32],
+}
+
+#[derive(Debug, Clone)]
+pub struct LinkResourceProof {
+    pub link_id: [u8; 16],
+    pub resource_hash: [u8; 32],
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum ChannelSendError {
     #[error("link not found")]
@@ -78,11 +102,36 @@ pub enum ChannelSendError {
     TransportUnavailable,
 }
 
+#[derive(Debug, thiserror::Error)]
+pub enum LinkSendError {
+    #[error("link not found")]
+    LinkNotFound,
+    #[error("link is not active")]
+    LinkNotActive,
+    #[error("link session keys are unavailable")]
+    NoSessionKeys,
+    #[error("transport channel is full or closed")]
+    TransportUnavailable,
+    #[error("resource transfer could not be started")]
+    ResourceStartFailed,
+}
+
 pub enum LinkManagerCommand {
     SendChannelMessage {
         link_id: [u8; 16],
         message: Box<dyn MessageBase>,
         result_tx: Option<oneshot::Sender<Result<ChannelSendReceipt, ChannelSendError>>>,
+    },
+    SendLinkPacket {
+        link_id: [u8; 16],
+        payload: Vec<u8>,
+        result_tx: Option<oneshot::Sender<Result<LinkPacketSendReceipt, LinkSendError>>>,
+    },
+    SendLinkResource {
+        link_id: [u8; 16],
+        payload: Vec<u8>,
+        auto_compress: bool,
+        result_tx: Option<oneshot::Sender<Result<LinkResourceSendReceipt, LinkSendError>>>,
     },
     CloseLink {
         link_id: [u8; 16],
@@ -162,6 +211,10 @@ pub struct LinkManager {
     link_identity_gate: Option<LinkIdentityGate>,
     /// Decrypted link-packet stream (LXMF DIRECT).
     link_packet_tx: Option<mpsc::Sender<(Vec<u8>, [u8; 16])>>,
+    /// Valid proof for an application link packet sent through this manager.
+    link_packet_proof_tx: Option<mpsc::Sender<LinkPacketProof>>,
+    /// Valid proof for an application resource sent through this manager.
+    outbound_resource_proof_tx: Option<mpsc::Sender<LinkResourceProof>>,
     /// Decrypted channel envelopes as `(link_id, msg_type, payload)`.
     channel_message_tx: Option<mpsc::Sender<LinkChannelMessage>>,
     /// Fires when an active link is closed or torn down.
@@ -199,6 +252,8 @@ impl LinkManager {
             link_identified_tx: None,
             link_identity_gate: None,
             link_packet_tx: None,
+            link_packet_proof_tx: None,
+            outbound_resource_proof_tx: None,
             channel_message_tx: None,
             link_closed_tx: None,
             inbound_raw_tx: None,
@@ -245,6 +300,8 @@ impl LinkManager {
             link_identified_tx: None,
             link_identity_gate: None,
             link_packet_tx: None,
+            link_packet_proof_tx: None,
+            outbound_resource_proof_tx: None,
             channel_message_tx: None,
             link_closed_tx: None,
             inbound_raw_tx: None,
@@ -337,6 +394,29 @@ impl LinkManager {
                 result_tx,
             } => {
                 let result = self.send_channel_message(&link_id, message.as_ref());
+                if let Some(tx) = result_tx {
+                    let _ = tx.send(result);
+                }
+                true
+            }
+            LinkManagerCommand::SendLinkPacket {
+                link_id,
+                payload,
+                result_tx,
+            } => {
+                let result = self.send_link_packet(&link_id, &payload);
+                if let Some(tx) = result_tx {
+                    let _ = tx.send(result);
+                }
+                true
+            }
+            LinkManagerCommand::SendLinkResource {
+                link_id,
+                payload,
+                auto_compress,
+                result_tx,
+            } => {
+                let result = self.send_link_resource(&link_id, payload, auto_compress);
                 if let Some(tx) = result_tx {
                     let _ = tx.send(result);
                 }
@@ -1418,6 +1498,8 @@ impl LinkManager {
                             .is_some_and(|transfer| transfer.handle_proof(data));
                         if complete {
                             active.outbound_resources.remove(&rh);
+                            let mut started_next_segment = false;
+                            let completed_resource_hash = queue_key.unwrap_or(rh);
                             if let Some(key) = queue_key {
                                 let (next, empty) = if let Some(queue) =
                                     active.outbound_split_queues.get_mut(&key)
@@ -1437,7 +1519,16 @@ impl LinkManager {
                                         &link_id,
                                         next,
                                     );
+                                    started_next_segment = true;
                                 }
+                            }
+                            if !started_next_segment
+                                && let Some(ref tx) = self.outbound_resource_proof_tx
+                            {
+                                let _ = tx.try_send(LinkResourceProof {
+                                    link_id,
+                                    resource_hash: completed_resource_hash,
+                                });
                             }
                         }
                     }
@@ -1933,8 +2024,10 @@ impl LinkManager {
         }
 
         let rtt = active.link.rtt_secs();
+        let mut matched_channel_sequence = false;
         if let Some(channel) = active.channel.as_mut() {
             if let Some(sequence) = channel.delivered_by_packet_hash(&packet_hash, rtt) {
+                matched_channel_sequence = true;
                 active.link.keepalive.record_proof();
                 tracing::debug!(
                     link_id = hex::encode(link_id),
@@ -1943,6 +2036,12 @@ impl LinkManager {
                     "channel packet delivery proof accepted"
                 );
             }
+        }
+        if !matched_channel_sequence && let Some(ref tx) = self.link_packet_proof_tx {
+            let _ = tx.try_send(LinkPacketProof {
+                link_id,
+                packet_hash,
+            });
         }
     }
 
@@ -2000,6 +2099,14 @@ impl LinkManager {
 
     pub fn set_link_packet_channel(&mut self, tx: mpsc::Sender<(Vec<u8>, [u8; 16])>) {
         self.link_packet_tx = Some(tx);
+    }
+
+    pub fn set_link_packet_proof_channel(&mut self, tx: mpsc::Sender<LinkPacketProof>) {
+        self.link_packet_proof_tx = Some(tx);
+    }
+
+    pub fn set_outbound_resource_proof_channel(&mut self, tx: mpsc::Sender<LinkResourceProof>) {
+        self.outbound_resource_proof_tx = Some(tx);
     }
 
     pub fn set_channel_message_channel(&mut self, tx: mpsc::Sender<LinkChannelMessage>) {
@@ -2089,6 +2196,88 @@ impl LinkManager {
             link_id: *link_id,
             sequence: prepared.sequence,
             packet_hash,
+        })
+    }
+
+    pub fn send_link_packet(
+        &mut self,
+        link_id: &[u8; 16],
+        payload: &[u8],
+    ) -> Result<LinkPacketSendReceipt, LinkSendError> {
+        let active = self
+            .active_links
+            .get(link_id)
+            .ok_or(LinkSendError::LinkNotFound)?;
+        if active.link.state != LinkState::Active {
+            return Err(LinkSendError::LinkNotActive);
+        }
+
+        let encrypted = active
+            .link
+            .encrypt(payload)
+            .map_err(|_| LinkSendError::NoSessionKeys)?;
+        let transport_tx = self.transport_tx.clone();
+        let permit = transport_tx
+            .try_reserve()
+            .map_err(|_| LinkSendError::TransportUnavailable)?;
+
+        let header = rns_wire::header::PacketHeader {
+            flags: rns_wire::flags::PacketFlags {
+                header_type: rns_wire::flags::HeaderType::Header1,
+                context_flag: false,
+                transport_type: rns_wire::flags::TransportType::Broadcast,
+                destination_type: rns_wire::flags::DestinationType::Link,
+                packet_type: rns_wire::flags::PacketType::Data,
+            },
+            hops: 0,
+            transport_id: None,
+            destination_hash: *link_id,
+            context: rns_wire::context::PacketContext::None,
+        };
+        let mut raw = header.pack();
+        raw.extend_from_slice(&encrypted);
+        let packet_hash = rns_wire::hash::packet_hash(&raw, header.flags.header_type);
+
+        let active = self
+            .active_links
+            .get_mut(link_id)
+            .ok_or(LinkSendError::LinkNotFound)?;
+        active.link.record_tx(raw.len());
+        permit.send(TransportMessage::Outbound(OutboundRequest {
+            raw: Bytes::from(raw),
+            destination_hash: *link_id,
+        }));
+
+        Ok(LinkPacketSendReceipt {
+            link_id: *link_id,
+            packet_hash,
+        })
+    }
+
+    pub fn send_link_resource(
+        &mut self,
+        link_id: &[u8; 16],
+        payload: Vec<u8>,
+        auto_compress: bool,
+    ) -> Result<LinkResourceSendReceipt, LinkSendError> {
+        let active = self
+            .active_links
+            .get(link_id)
+            .ok_or(LinkSendError::LinkNotFound)?;
+        if active.link.state != LinkState::Active {
+            return Err(LinkSendError::LinkNotActive);
+        }
+        if active.link.session_keys().is_none() {
+            return Err(LinkSendError::NoSessionKeys);
+        }
+
+        let resource_hash = self
+            .start_resource_transfer(link_id, payload, auto_compress)
+            .ok_or(LinkSendError::ResourceStartFailed)?;
+
+        Ok(LinkResourceSendReceipt {
+            link_id: *link_id,
+            resource_hash,
         })
     }
 
@@ -3103,6 +3292,145 @@ mod tests {
 
         assert_eq!(lm.get_channel(&link_id).unwrap().outstanding_count(), 0);
         assert!(lm.get_channel(&link_id).unwrap().is_ready_to_send());
+    }
+
+    #[test]
+    fn send_link_packet_emits_plain_link_data_and_proof_event() {
+        let (initiator_link, responder_link, _identity_key) = handshaken_link_pair_with_identity();
+        let link_id = responder_link.link_id;
+
+        let (transport_tx, mut transport_rx) = mpsc::channel(16);
+        let (_event_tx, event_rx) = mpsc::channel(16);
+        let mut lm = LinkManager::new(transport_tx, event_rx, [0xC1; 16], None);
+        let (proof_tx, mut proof_rx) = mpsc::channel(4);
+        lm.set_link_packet_proof_channel(proof_tx);
+        lm.active_links.insert(
+            link_id,
+            ActiveLink {
+                link: responder_link,
+                _interface_id: 1,
+                channel: None,
+                inbound_resources: HashMap::new(),
+                outbound_resources: HashMap::new(),
+                outbound_split_queues: HashMap::new(),
+                inbound_split_resources: HashMap::new(),
+                segment_routing: HashMap::new(),
+            },
+        );
+
+        let receipt = lm
+            .send_link_packet(&link_id, b"backchannel payload")
+            .expect("link packet queued");
+        let outbound = transport_rx.try_recv().expect("link packet outbound");
+        let TransportMessage::Outbound(request) = outbound else {
+            panic!("expected outbound link packet");
+        };
+        let (sent_header, sent_offset) =
+            rns_wire::header::PacketHeader::unpack(&request.raw).unwrap();
+        assert_eq!(sent_header.context, rns_wire::context::PacketContext::None);
+        assert_eq!(sent_header.destination_hash, link_id);
+        assert_eq!(
+            receipt.packet_hash,
+            rns_wire::hash::packet_hash(&request.raw, sent_header.flags.header_type)
+        );
+        assert_eq!(
+            initiator_link.decrypt(&request.raw[sent_offset..]).unwrap(),
+            b"backchannel payload"
+        );
+
+        let proof_data = initiator_link
+            .prove_packet_with_link_key(&receipt.packet_hash)
+            .unwrap();
+        let proof_header = rns_wire::header::PacketHeader {
+            flags: rns_wire::flags::PacketFlags {
+                header_type: rns_wire::flags::HeaderType::Header1,
+                context_flag: false,
+                transport_type: rns_wire::flags::TransportType::Broadcast,
+                destination_type: rns_wire::flags::DestinationType::Link,
+                packet_type: rns_wire::flags::PacketType::Proof,
+            },
+            hops: 0,
+            transport_id: None,
+            destination_hash: link_id,
+            context: rns_wire::context::PacketContext::None,
+        };
+        let mut proof_raw = proof_header.pack();
+        proof_raw.extend_from_slice(&proof_data);
+        lm.handle_inbound_packet(&proof_raw, 1);
+
+        let proof = proof_rx.try_recv().expect("link packet proof event");
+        assert_eq!(proof.link_id, link_id);
+        assert_eq!(proof.packet_hash, receipt.packet_hash);
+    }
+
+    #[test]
+    fn send_link_resource_emits_resource_proof_event() {
+        let (_initiator_link, responder_link, _identity_key) = handshaken_link_pair_with_identity();
+        let link_id = responder_link.link_id;
+
+        let (transport_tx, mut transport_rx) = mpsc::channel(16);
+        let (_event_tx, event_rx) = mpsc::channel(16);
+        let mut lm = LinkManager::new(transport_tx, event_rx, [0xC2; 16], None);
+        let (proof_tx, mut proof_rx) = mpsc::channel(4);
+        lm.set_outbound_resource_proof_channel(proof_tx);
+        lm.active_links.insert(
+            link_id,
+            ActiveLink {
+                link: responder_link,
+                _interface_id: 1,
+                channel: None,
+                inbound_resources: HashMap::new(),
+                outbound_resources: HashMap::new(),
+                outbound_split_queues: HashMap::new(),
+                inbound_split_resources: HashMap::new(),
+                segment_routing: HashMap::new(),
+            },
+        );
+
+        let receipt = lm
+            .send_link_resource(&link_id, b"resource payload".to_vec(), false)
+            .expect("resource started");
+        let outbound = transport_rx.try_recv().expect("resource ADV outbound");
+        let TransportMessage::Outbound(request) = outbound else {
+            panic!("expected outbound resource ADV");
+        };
+        let (adv_header, _) = rns_wire::header::PacketHeader::unpack(&request.raw).unwrap();
+        assert_eq!(
+            adv_header.context,
+            rns_wire::context::PacketContext::ResourceAdv
+        );
+
+        let proof_data = {
+            let active = lm.active_links.get(&link_id).unwrap();
+            let transfer = active
+                .outbound_resources
+                .get(&receipt.resource_hash)
+                .expect("outbound resource tracked");
+            let mut proof = Vec::new();
+            proof.extend_from_slice(&transfer.resource.resource_hash);
+            proof.extend_from_slice(&transfer.resource.expected_proof);
+            proof
+        };
+        let proof_header = rns_wire::header::PacketHeader {
+            flags: rns_wire::flags::PacketFlags {
+                header_type: rns_wire::flags::HeaderType::Header1,
+                context_flag: false,
+                transport_type: rns_wire::flags::TransportType::Broadcast,
+                destination_type: rns_wire::flags::DestinationType::Link,
+                packet_type: rns_wire::flags::PacketType::Proof,
+            },
+            hops: 0,
+            transport_id: None,
+            destination_hash: link_id,
+            context: rns_wire::context::PacketContext::ResourcePrf,
+        };
+        let mut proof_raw = proof_header.pack();
+        proof_raw.extend_from_slice(&proof_data);
+        lm.handle_inbound_packet(&proof_raw, 1);
+
+        let proof = proof_rx.try_recv().expect("resource proof event");
+        assert_eq!(proof.link_id, link_id);
+        assert_eq!(proof.resource_hash, receipt.resource_hash);
     }
 
     #[test]
