@@ -7,6 +7,7 @@ use std::path::Path;
 use rmpv::Value;
 use serde::{Deserialize, Serialize};
 
+use crate::constants::PERSIST_RANDOM_BLOBS;
 use crate::hashlist::PacketHashlist;
 use crate::path_table::PathTable;
 
@@ -129,6 +130,26 @@ pub struct PythonCachedAnnounce {
     pub interface_reference: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+pub struct PythonTunnelEntry {
+    pub tunnel_id: [u8; 32],
+    pub interface_hash: Option<[u8; 32]>,
+    pub paths: Vec<PythonTunnelPath>,
+    pub expires: f64,
+}
+
+#[derive(Debug, Clone)]
+pub struct PythonTunnelPath {
+    pub destination_hash: [u8; 16],
+    pub timestamp: f64,
+    pub received_from: [u8; 16],
+    pub hops: u8,
+    pub expires: f64,
+    pub random_blobs: Vec<[u8; 10]>,
+    pub interface_hash: Option<[u8; 32]>,
+    pub packet_hash: [u8; 32],
+}
+
 pub fn interface_hash_from_name(name: &str) -> [u8; 32] {
     rns_crypto::sha::full_hash(name.as_bytes())
 }
@@ -243,9 +264,29 @@ pub fn save_python_announce_cache_for_paths<'a, I>(
 where
     I: IntoIterator<Item = &'a crate::actor::RecentAnnounce>,
 {
+    save_python_announce_cache_for_paths_and_tunnels(
+        path_entries,
+        None,
+        announces,
+        interface_names,
+        announce_cache_dir,
+    )
+}
+
+pub fn save_python_announce_cache_for_paths_and_tunnels<'a, I>(
+    path_entries: &PathTable,
+    tunnel_table: Option<&crate::tunnel::TunnelTable>,
+    announces: I,
+    interface_names: &HashMap<u64, String>,
+    announce_cache_dir: &Path,
+) -> Result<(), PersistenceError>
+where
+    I: IntoIterator<Item = &'a crate::actor::RecentAnnounce>,
+{
     std::fs::create_dir_all(announce_cache_dir).map_err(PersistenceError::Io)?;
     let announces_by_dest: HashMap<[u8; 16], &crate::actor::RecentAnnounce> =
         announces.into_iter().map(|a| (a.dest_hash, a)).collect();
+    let mut written = std::collections::HashSet::new();
 
     for (dest_hash, path_entry) in path_entries.iter() {
         let Some(packet_hash) = path_entry.packet_hash else {
@@ -261,17 +302,59 @@ where
             .get(&path_entry.interface_id)
             .map(|name| Value::String(name.as_str().into()))
             .unwrap_or(Value::Nil);
-        let value = Value::Array(vec![
-            Value::Binary(announce.raw_packet.clone()),
+        write_python_cached_announce(
+            announce_cache_dir,
+            &packet_hash,
+            announce.raw_packet.clone(),
             interface_reference,
-        ]);
-        let mut serialized = Vec::new();
-        rmpv::encode::write_value(&mut serialized, &value)
-            .map_err(|e| PersistenceError::Serialize(e.to_string()))?;
-        let path = announce_cache_dir.join(hex::encode(packet_hash));
-        atomic_write_bytes(&path, &serialized)?;
+        )?;
+        written.insert(packet_hash);
+    }
+
+    if let Some(tunnel_table) = tunnel_table {
+        for tunnel in tunnel_table.iter().map(|(_, tunnel)| tunnel) {
+            let interface_reference = interface_names
+                .get(&tunnel.interface_id)
+                .map(|name| Value::String(name.as_str().into()))
+                .unwrap_or(Value::Nil);
+            for (dest_hash, tunnel_path) in &tunnel.tunnel_paths {
+                let Some(packet_hash) = tunnel_path.packet_hash else {
+                    continue;
+                };
+                if written.contains(&packet_hash) {
+                    continue;
+                }
+                let Some(announce) = announces_by_dest.get(dest_hash) else {
+                    continue;
+                };
+                if announce.raw_packet.is_empty() {
+                    continue;
+                }
+                write_python_cached_announce(
+                    announce_cache_dir,
+                    &packet_hash,
+                    announce.raw_packet.clone(),
+                    interface_reference.clone(),
+                )?;
+                written.insert(packet_hash);
+            }
+        }
     }
     Ok(())
+}
+
+fn write_python_cached_announce(
+    announce_cache_dir: &Path,
+    packet_hash: &[u8; 32],
+    raw_packet: Vec<u8>,
+    interface_reference: Value,
+) -> Result<(), PersistenceError> {
+    let value = Value::Array(vec![Value::Binary(raw_packet), interface_reference]);
+    let mut serialized = Vec::new();
+    rmpv::encode::write_value(&mut serialized, &value)
+        .map_err(|e| PersistenceError::Serialize(e.to_string()))?;
+    let path = announce_cache_dir.join(hex::encode(packet_hash));
+    atomic_write_bytes(&path, &serialized)
 }
 
 pub fn load_python_cached_announce(
@@ -310,6 +393,142 @@ pub fn load_python_cached_announce(
         raw_packet,
         interface_reference,
     }))
+}
+
+pub fn save_python_tunnel_table(
+    table: &crate::tunnel::TunnelTable,
+    interface_names: &HashMap<u64, String>,
+    path: &Path,
+) -> Result<(), PersistenceError> {
+    let mut tunnel_values = Vec::new();
+    for (_, tunnel) in table.iter() {
+        let interface_hash = interface_names
+            .get(&tunnel.interface_id)
+            .map(|name| Value::Binary(interface_hash_from_name(name).to_vec()))
+            .unwrap_or(Value::Nil);
+
+        let mut path_values = Vec::new();
+        for (dest_hash, tunnel_path) in &tunnel.tunnel_paths {
+            let Some(packet_hash) = tunnel_path.packet_hash else {
+                continue;
+            };
+            let received_from = tunnel_path.next_hop.unwrap_or(*dest_hash);
+            let random_blob_start = tunnel_path
+                .random_blobs
+                .len()
+                .saturating_sub(PERSIST_RANDOM_BLOBS);
+            let random_blobs = tunnel_path
+                .random_blobs
+                .iter()
+                .skip(random_blob_start)
+                .map(|blob| Value::Binary(blob.to_vec()))
+                .collect::<Vec<_>>();
+            path_values.push(Value::Array(vec![
+                Value::Binary(dest_hash.to_vec()),
+                Value::F64(tunnel_path.timestamp),
+                Value::Binary(received_from.to_vec()),
+                Value::Integer((tunnel_path.hops as u64).into()),
+                Value::F64(tunnel_path.expires),
+                Value::Array(random_blobs),
+                interface_hash.clone(),
+                Value::Binary(packet_hash.to_vec()),
+            ]));
+        }
+
+        tunnel_values.push(Value::Array(vec![
+            Value::Binary(tunnel.tunnel_id.to_vec()),
+            interface_hash,
+            Value::Array(path_values),
+            Value::F64(tunnel.expires),
+        ]));
+    }
+
+    let mut serialized = Vec::new();
+    rmpv::encode::write_value(&mut serialized, &Value::Array(tunnel_values))
+        .map_err(|e| PersistenceError::Serialize(e.to_string()))?;
+    atomic_write_bytes(path, &serialized)
+}
+
+pub fn load_python_tunnel_table(path: &Path) -> Result<Vec<PythonTunnelEntry>, PersistenceError> {
+    let data = std::fs::read(path).map_err(PersistenceError::Io)?;
+    let value = rmpv::decode::read_value(&mut std::io::Cursor::new(data))
+        .map_err(|e| PersistenceError::Deserialize(e.to_string()))?;
+    let entries = match value {
+        Value::Array(entries) => entries,
+        other => {
+            return Err(PersistenceError::Deserialize(format!(
+                "expected tunnels array, got {other:?}"
+            )));
+        }
+    };
+
+    let mut out = Vec::new();
+    for entry in entries {
+        let fields = match entry {
+            Value::Array(fields) => fields,
+            _ => continue,
+        };
+        if fields.len() < 4 {
+            continue;
+        }
+        let Some(tunnel_id) = value_bin_array::<32>(&fields[0]) else {
+            continue;
+        };
+        let interface_hash = match &fields[1] {
+            Value::Nil => None,
+            value => value_bin_array::<32>(value),
+        };
+        let paths = match &fields[2] {
+            Value::Array(path_entries) => path_entries
+                .iter()
+                .filter_map(|path_entry| {
+                    let Value::Array(path_fields) = path_entry else {
+                        return None;
+                    };
+                    if path_fields.len() < 8 {
+                        return None;
+                    }
+                    let destination_hash = value_bin_array::<16>(&path_fields[0])?;
+                    let timestamp = value_f64(&path_fields[1]).unwrap_or(0.0);
+                    let received_from = value_bin_array::<16>(&path_fields[2])?;
+                    let hops = value_u8(&path_fields[3])?;
+                    let expires = value_f64(&path_fields[4]).unwrap_or(0.0);
+                    let random_blobs = match &path_fields[5] {
+                        Value::Array(values) => values
+                            .iter()
+                            .filter_map(value_bin_array::<10>)
+                            .collect::<Vec<_>>(),
+                        _ => Vec::new(),
+                    };
+                    let interface_hash = match &path_fields[6] {
+                        Value::Nil => None,
+                        value => value_bin_array::<32>(value),
+                    };
+                    let packet_hash = value_bin_array::<32>(&path_fields[7])?;
+                    Some(PythonTunnelPath {
+                        destination_hash,
+                        timestamp,
+                        received_from,
+                        hops,
+                        expires,
+                        random_blobs,
+                        interface_hash,
+                        packet_hash,
+                    })
+                })
+                .collect::<Vec<_>>(),
+            _ => Vec::new(),
+        };
+        let expires = value_f64(&fields[3]).unwrap_or(0.0);
+        out.push(PythonTunnelEntry {
+            tunnel_id,
+            interface_hash,
+            paths,
+            expires,
+        });
+    }
+
+    Ok(out)
 }
 
 fn value_bin_array<const N: usize>(value: &Value) -> Option<[u8; N]> {
@@ -693,14 +912,24 @@ pub struct PersistedTunnelEntry {
     /// stale `interface_id` once the matching interface registers.
     #[serde(default)]
     pub interface_name: Option<String>,
+    /// Python-compatible stable interface hash for remapping canonical
+    /// `tunnels` entries across restarts.
+    #[serde(default)]
+    pub interface_hash: Option<Vec<u8>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PersistedTunnelPath {
     pub destination_hash: Vec<u8>,
+    #[serde(default)]
+    pub next_hop: Option<Vec<u8>>,
     pub hops: u8,
     pub expires: f64,
     pub timestamp: f64,
+    #[serde(default)]
+    pub random_blobs: Vec<Vec<u8>>,
+    #[serde(default)]
+    pub packet_hash: Option<Vec<u8>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -710,8 +939,8 @@ pub struct PersistedTunnelTable {
 }
 
 impl PersistedTunnelTable {
-    pub const CURRENT_VERSION: u32 = 2;
-    pub const SUPPORTED_VERSIONS: &'static [u32] = &[1, 2];
+    pub const CURRENT_VERSION: u32 = 3;
+    pub const SUPPORTED_VERSIONS: &'static [u32] = &[1, 2, 3];
 }
 
 pub fn save_tunnel_table(
@@ -729,9 +958,19 @@ pub fn save_tunnel_table(
                 .iter()
                 .map(|(dest, tp)| PersistedTunnelPath {
                     destination_hash: dest.to_vec(),
+                    next_hop: tp.next_hop.map(|h| h.to_vec()),
                     hops: tp.hops,
                     expires: tp.expires,
                     timestamp: tp.timestamp,
+                    random_blobs: {
+                        let start = tp.random_blobs.len().saturating_sub(PERSIST_RANDOM_BLOBS);
+                        tp.random_blobs
+                            .iter()
+                            .skip(start)
+                            .map(|b| b.to_vec())
+                            .collect()
+                    },
+                    packet_hash: tp.packet_hash.map(|h| h.to_vec()),
                 })
                 .collect();
             Some(PersistedTunnelEntry {
@@ -740,6 +979,9 @@ pub fn save_tunnel_table(
                 expires: entry.expires,
                 paths,
                 interface_name: Some(interface_name),
+                interface_hash: interface_names
+                    .get(&entry.interface_id)
+                    .map(|name| interface_hash_from_name(name).to_vec()),
             })
         })
         .collect();
@@ -932,6 +1174,88 @@ mod tests {
         assert_eq!(
             cached.interface_reference.as_deref(),
             Some("Interface[Test]")
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn save_load_python_tunnel_table_and_tunnel_announce_cache() {
+        let destination_hash = [0xAB; 16];
+        let next_hop = [0xBC; 16];
+        let packet_hash = [0xCD; 32];
+        let tunnel_id = [0xDE; 32];
+        let mut paths = HashMap::new();
+        paths.insert(
+            destination_hash,
+            crate::tunnel::TunnelPath {
+                timestamp: 1234.5,
+                next_hop: Some(next_hop),
+                hops: 3,
+                expires: 9876.5,
+                random_blobs: vec![[0x44; 10]],
+                packet_hash: Some(packet_hash),
+            },
+        );
+        let mut tunnels = crate::tunnel::TunnelTable::new();
+        tunnels.insert(crate::tunnel::TunnelEntry {
+            tunnel_id,
+            interface_id: 7,
+            tunnel_paths: paths,
+            expires: 9999.5,
+        });
+        let mut names = HashMap::new();
+        names.insert(7, "Interface[Tunnel]".to_string());
+
+        let dir = std::env::temp_dir().join("reticulum_rs_test_python_tunnels");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let tunnels_path = dir.join("tunnels");
+
+        save_python_tunnel_table(&tunnels, &names, &tunnels_path).unwrap();
+        let loaded = load_python_tunnel_table(&tunnels_path).unwrap();
+
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].tunnel_id, tunnel_id);
+        assert_eq!(
+            loaded[0].interface_hash,
+            Some(interface_hash_from_name("Interface[Tunnel]"))
+        );
+        assert_eq!(loaded[0].expires, 9999.5);
+        assert_eq!(loaded[0].paths.len(), 1);
+        assert_eq!(loaded[0].paths[0].destination_hash, destination_hash);
+        assert_eq!(loaded[0].paths[0].received_from, next_hop);
+        assert_eq!(loaded[0].paths[0].hops, 3);
+        assert_eq!(loaded[0].paths[0].packet_hash, packet_hash);
+
+        let announces = [crate::actor::RecentAnnounce {
+            dest_hash: destination_hash,
+            hops: 3,
+            app_data: None,
+            timestamp: 1234.5,
+            public_key: None,
+            ratchet: None,
+            raw_packet: vec![0xFE; 42],
+            retained: false,
+            name_hash: [0xAB; 10],
+        }];
+        let empty_paths = PathTable::new();
+        let cache_dir = dir.join("cache").join("announces");
+        save_python_announce_cache_for_paths_and_tunnels(
+            &empty_paths,
+            Some(&tunnels),
+            announces.iter(),
+            &names,
+            &cache_dir,
+        )
+        .unwrap();
+        let cached = load_python_cached_announce(&cache_dir, &packet_hash)
+            .unwrap()
+            .unwrap();
+        assert_eq!(cached.raw_packet, vec![0xFE; 42]);
+        assert_eq!(
+            cached.interface_reference.as_deref(),
+            Some("Interface[Tunnel]")
         );
 
         let _ = std::fs::remove_dir_all(&dir);

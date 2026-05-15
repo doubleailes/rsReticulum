@@ -198,6 +198,19 @@ impl AnnounceData {
         packet_dest_hash: &[u8; 16],
         known_public_key: Option<&[u8; 64]>,
     ) -> Result<Identity, AnnounceError> {
+        let identity = self.verify_signature(packet_dest_hash)?;
+        self.validate_destination_binding(packet_dest_hash, &identity, known_public_key)?;
+        Ok(identity)
+    }
+
+    /// Verify the announce signature without checking destination-hash
+    /// binding or first-seen key continuity.
+    ///
+    /// Reticulum transport performs this lightweight precheck before announce
+    /// ingress limiting, then runs full binding validation before learning the
+    /// path. Keeping this as a distinct step lets transport match that order
+    /// without duplicating announce wire-format logic.
+    pub fn verify_signature(&self, packet_dest_hash: &[u8; 16]) -> Result<Identity, AnnounceError> {
         let identity = Identity::from_public_key(&self.public_key)
             .map_err(|_| AnnounceError::InvalidPublicKey)?;
 
@@ -224,6 +237,17 @@ impl AnnounceData {
             return Err(AnnounceError::SignatureInvalid);
         }
 
+        Ok(identity)
+    }
+
+    /// Validate destination-hash binding and first-seen public-key continuity
+    /// after [`verify_signature`] has succeeded.
+    pub fn validate_destination_binding(
+        &self,
+        packet_dest_hash: &[u8; 16],
+        identity: &Identity,
+        known_public_key: Option<&[u8; 64]>,
+    ) -> Result<(), AnnounceError> {
         // Destination hash = SHA-256(name_hash || identity_hash) truncated to 16 bytes.
         let expected_hash = {
             let mut material = Vec::with_capacity(26);
@@ -256,7 +280,7 @@ impl AnnounceData {
             }
         }
 
-        Ok(identity)
+        Ok(())
     }
 }
 

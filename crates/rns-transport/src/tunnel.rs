@@ -16,9 +16,11 @@ pub struct TunnelEntry {
 #[derive(Debug, Clone)]
 pub struct TunnelPath {
     pub timestamp: f64,
+    pub next_hop: Option<[u8; 16]>,
     pub hops: u8,
     pub expires: f64,
     pub random_blobs: Vec<[u8; 10]>,
+    pub packet_hash: Option<[u8; 32]>,
 }
 
 pub struct TunnelTable {
@@ -62,6 +64,18 @@ impl TunnelTable {
 
     pub fn iter_mut(&mut self) -> impl Iterator<Item = (&[u8; 32], &mut TunnelEntry)> {
         self.entries.iter_mut()
+    }
+
+    pub fn get_mut_by_interface(&mut self, interface_id: InterfaceId) -> Option<&mut TunnelEntry> {
+        self.entries
+            .values_mut()
+            .find(|entry| entry.interface_id == interface_id)
+    }
+
+    pub fn tunnel_paths(&self) -> impl Iterator<Item = (&[u8; 16], &TunnelPath)> {
+        self.entries
+            .values()
+            .flat_map(|entry| entry.tunnel_paths.iter())
     }
 
     pub fn cull_expired(&mut self) -> usize {

@@ -30,6 +30,7 @@ impl TransportActor {
             self.path_table.cull_expired_batch(100);
             self.reverse_table.cull_expired_batch(100);
             self.tunnel_table.cull_expired_batch(50);
+            self.cull_stale_tunnel_paths(now);
 
             // Drop entries pointing to interfaces that have gone away —
             // those routes could never be used anyway.
@@ -426,6 +427,42 @@ impl TransportActor {
                     q: None,
                 });
             }
+        }
+    }
+
+    pub(super) fn cull_stale_tunnel_paths(&mut self, now: f64) {
+        let mut removed = 0usize;
+        for (tunnel_id, tunnel) in self.tunnel_table.iter_mut() {
+            let stale: Vec<[u8; 16]> = tunnel
+                .tunnel_paths
+                .iter()
+                .filter_map(|(dest_hash, tunnel_path)| {
+                    if now > tunnel_path.timestamp + TUNNEL_PATH_TIMEOUT as f64 {
+                        return Some(*dest_hash);
+                    }
+
+                    let active = self.path_table.get(dest_hash)?;
+                    let current_timebase =
+                        path_timebase_from_random_blobs(active.random_blobs.iter());
+                    let tunnel_timebase =
+                        path_timebase_from_random_blobs(tunnel_path.random_blobs.iter());
+                    (current_timebase > tunnel_timebase).then_some(*dest_hash)
+                })
+                .collect();
+
+            for dest_hash in stale {
+                tunnel.tunnel_paths.remove(&dest_hash);
+                removed += 1;
+                debug!(
+                    dest = hex::encode(dest_hash),
+                    tunnel = hex::encode(&tunnel_id[..16]),
+                    "removed stale tunnel path"
+                );
+            }
+        }
+
+        if removed > 0 {
+            self.state_dirty = true;
         }
     }
 

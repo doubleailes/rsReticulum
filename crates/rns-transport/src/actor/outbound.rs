@@ -650,10 +650,19 @@ impl TransportActor {
             if let Some(existing) = self.path_table.get(dest_hash) {
                 let old_hops = existing.hops;
                 let old_expires = existing.expires;
-                // Only overwrite a live path if the tunnel copy is at least
-                // as short, or the live entry is already stale.
                 if tunnel_path.hops <= old_hops || now > old_expires {
-                    should_add = true;
+                    let current_timebase =
+                        path_timebase_from_random_blobs(existing.random_blobs.iter());
+                    let tunnel_timebase =
+                        path_timebase_from_random_blobs(tunnel_path.random_blobs.iter());
+                    if tunnel_timebase >= current_timebase {
+                        should_add = true;
+                    } else {
+                        debug!(
+                            dest = hex::encode(dest_hash),
+                            "did not restore tunnel path: existing path is more recent"
+                        );
+                    }
                 } else {
                     debug!(
                         dest = hex::encode(dest_hash),
@@ -672,12 +681,12 @@ impl TransportActor {
             if should_add {
                 let entry = crate::path_table::PathEntry {
                     timestamp: now,
-                    next_hop: None,
+                    next_hop: tunnel_path.next_hop,
                     hops: tunnel_path.hops,
                     expires: tunnel_path.expires,
                     random_blobs: tunnel_path.random_blobs.iter().copied().collect(),
                     interface_id,
-                    packet_hash: None,
+                    packet_hash: tunnel_path.packet_hash,
                 };
                 self.path_table.insert(*dest_hash, entry);
                 self.state_dirty = true;
@@ -703,6 +712,7 @@ impl TransportActor {
                     );
                 }
             }
+            self.state_dirty = true;
         }
     }
 }

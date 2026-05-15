@@ -1359,6 +1359,18 @@ mod tests {
     }
 
     fn make_link_data_packet(link_id: [u8; 16], hops: u8) -> Bytes {
+        make_link_data_packet_with_context(
+            link_id,
+            hops,
+            rns_wire::context::PacketContext::Resource,
+        )
+    }
+
+    fn make_link_data_packet_with_context(
+        link_id: [u8; 16],
+        hops: u8,
+        context: rns_wire::context::PacketContext,
+    ) -> Bytes {
         let flags = rns_wire::flags::PacketFlags {
             header_type: rns_wire::flags::HeaderType::Header1,
             context_flag: false,
@@ -1371,7 +1383,7 @@ mod tests {
             hops,
             transport_id: None,
             destination_hash: link_id,
-            context: rns_wire::context::PacketContext::Resource,
+            context,
         };
         let mut raw = header.pack();
         raw.extend_from_slice(&[0xDA; 32]);
@@ -1634,9 +1646,11 @@ mod tests {
             dest,
             crate::tunnel::TunnelPath {
                 timestamp: now_f64(),
+                next_hop: None,
                 hops: 2,
                 expires: now_f64() + 600.0,
                 random_blobs: vec![],
+                packet_hash: None,
             },
         );
         actor.tunnel_table.insert(crate::tunnel::TunnelEntry {
@@ -1990,7 +2004,7 @@ mod tests {
         assert_eq!(forwarded_header.transport_id, None);
     }
 
-    fn make_lrproof_packet(link_id: [u8; 16], hops: u8) -> Bytes {
+    fn make_lrproof_packet_with_payload(link_id: [u8; 16], hops: u8, payload: &[u8]) -> Bytes {
         let flags = rns_wire::flags::PacketFlags {
             header_type: rns_wire::flags::HeaderType::Header1,
             context_flag: false,
@@ -2006,9 +2020,37 @@ mod tests {
             context: rns_wire::context::PacketContext::Lrproof,
         };
         let mut raw = header.pack();
-        // Add fake proof data (signature + peer pubkey)
-        raw.extend_from_slice(&[0xAA; 96]);
+        raw.extend_from_slice(payload);
         Bytes::from(raw)
+    }
+
+    fn make_lrproof_packet(
+        link_id: [u8; 16],
+        hops: u8,
+        destination_identity: &rns_identity::identity::Identity,
+        signalling: Option<[u8; 3]>,
+    ) -> Bytes {
+        let destination_public_key = destination_identity.get_public_key();
+        let mut destination_ed25519 = [0u8; 32];
+        destination_ed25519.copy_from_slice(&destination_public_key[32..64]);
+        let responder_x25519_pub = [0x42; 32];
+
+        let mut signed_data = Vec::new();
+        signed_data.extend_from_slice(&link_id);
+        signed_data.extend_from_slice(&responder_x25519_pub);
+        signed_data.extend_from_slice(&destination_ed25519);
+        if let Some(signalling) = signalling {
+            signed_data.extend_from_slice(&signalling);
+        }
+        let signature = destination_identity.sign(&signed_data).unwrap();
+
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&signature);
+        payload.extend_from_slice(&responder_x25519_pub);
+        if let Some(signalling) = signalling {
+            payload.extend_from_slice(&signalling);
+        }
+        make_lrproof_packet_with_payload(link_id, hops, &payload)
     }
 
     #[test]
@@ -2029,12 +2071,15 @@ mod tests {
         // Create a link_table entry as if the relay forwarded a LINKREQUEST
         // from interface 1 (initiator side) to interface 2 (destination side)
         let link_id = [0x77; 16];
+        let destination_hash = [0xCC; 16];
+        let destination_identity = rns_identity::identity::Identity::new();
+        insert_announce_for(&mut relay, destination_hash, &destination_identity);
         let link_entry = crate::link_table::LinkEntry {
             timestamp: now_f64(),
             next_hop: Some([0xBB; 16]),
             interface_id: 2,   // next-hop interface (toward destination)
             remaining_hops: 1, // 1 hop from relay to destination
-            destination_hash: [0xCC; 16],
+            destination_hash,
             established: false,
             validated: false,
             proof_timeout: now_f64() + 120.0,
@@ -2045,7 +2090,7 @@ mod tests {
 
         // Destination sends LRPROOF with hops=0 (new proof, not incremented).
         // Proof arrives at relay on interface 2 (the destination side).
-        let proof = make_lrproof_packet(link_id, 0);
+        let proof = make_lrproof_packet(link_id, 0, &destination_identity, Some([1, 0, 0]));
         relay.on_inbound(InboundPacket {
             raw: proof,
             interface_id: 2, // arrived from destination side
@@ -2087,6 +2132,9 @@ mod tests {
         relay.interfaces.insert(2, entry2);
 
         let link_id = [0x79; 16];
+        let destination_hash = [0xCD; 16];
+        let destination_identity = rns_identity::identity::Identity::new();
+        insert_announce_for(&mut relay, destination_hash, &destination_identity);
         relay.link_table.insert(
             link_id,
             crate::link_table::LinkEntry {
@@ -2094,7 +2142,7 @@ mod tests {
                 next_hop: None,
                 interface_id: 2,
                 remaining_hops: 1,
-                destination_hash: [0xCD; 16],
+                destination_hash,
                 established: false,
                 validated: false,
                 proof_timeout: now_f64() + 120.0,
@@ -2103,7 +2151,7 @@ mod tests {
             },
         );
 
-        let proof = make_lrproof_packet(link_id, 0);
+        let proof = make_lrproof_packet(link_id, 0, &destination_identity, None);
         relay.on_inbound(InboundPacket {
             raw: proof,
             interface_id: 2,
@@ -2120,6 +2168,150 @@ mod tests {
             "forwarded direct-attached proof should be one hop from initiator"
         );
         assert!(relay.link_table.get(&link_id).unwrap().validated);
+    }
+
+    #[test]
+    fn test_lrproof_transit_rejects_invalid_signature() {
+        let (mut relay, _tx) = TransportActor::new();
+        relay.is_transport_enabled = true;
+
+        let (entry1, mut rx1) = make_test_interface("to_initiator");
+        let (entry2, _rx2) = make_test_interface("to_destination");
+        relay.interfaces.insert(1, entry1);
+        relay.interfaces.insert(2, entry2);
+
+        let link_id = [0x7C; 16];
+        let destination_hash = [0xDC; 16];
+        let destination_identity = rns_identity::identity::Identity::new();
+        insert_announce_for(&mut relay, destination_hash, &destination_identity);
+        relay.link_table.insert(
+            link_id,
+            crate::link_table::LinkEntry {
+                timestamp: now_f64(),
+                next_hop: None,
+                interface_id: 2,
+                remaining_hops: 1,
+                destination_hash,
+                established: false,
+                validated: false,
+                proof_timeout: now_f64() + 120.0,
+                receiving_interface: 1,
+                taken_hops: 0,
+            },
+        );
+
+        let mut proof =
+            make_lrproof_packet(link_id, 0, &destination_identity, Some([4, 5, 6])).to_vec();
+        let last = proof.len() - 1;
+        proof[last] ^= 0x01;
+        relay.on_inbound(InboundPacket {
+            raw: Bytes::from(proof),
+            interface_id: 2,
+            rssi: None,
+            snr: None,
+            q: None,
+        });
+
+        assert!(
+            rx1.try_recv().is_err(),
+            "invalid LRPROOF must not be forwarded"
+        );
+        assert!(
+            !relay.link_table.get(&link_id).unwrap().validated,
+            "invalid LRPROOF must not mark link-table entry validated"
+        );
+    }
+
+    #[test]
+    fn test_lrproof_transit_requires_known_destination_identity() {
+        let (mut relay, _tx) = TransportActor::new();
+        relay.is_transport_enabled = true;
+
+        let (entry1, mut rx1) = make_test_interface("to_initiator");
+        let (entry2, _rx2) = make_test_interface("to_destination");
+        relay.interfaces.insert(1, entry1);
+        relay.interfaces.insert(2, entry2);
+
+        let link_id = [0x7D; 16];
+        let destination_hash = [0xDD; 16];
+        let destination_identity = rns_identity::identity::Identity::new();
+        relay.link_table.insert(
+            link_id,
+            crate::link_table::LinkEntry {
+                timestamp: now_f64(),
+                next_hop: None,
+                interface_id: 2,
+                remaining_hops: 1,
+                destination_hash,
+                established: false,
+                validated: false,
+                proof_timeout: now_f64() + 120.0,
+                receiving_interface: 1,
+                taken_hops: 0,
+            },
+        );
+
+        relay.on_inbound(InboundPacket {
+            raw: make_lrproof_packet(link_id, 0, &destination_identity, None),
+            interface_id: 2,
+            rssi: None,
+            snr: None,
+            q: None,
+        });
+
+        assert!(
+            rx1.try_recv().is_err(),
+            "LRPROOF without known destination identity must not be forwarded"
+        );
+        assert!(!relay.link_table.get(&link_id).unwrap().validated);
+    }
+
+    #[test]
+    fn test_lrproof_transit_rejects_malformed_lengths() {
+        for (idx, payload_len) in [95usize, 97, 98, 100].into_iter().enumerate() {
+            let (mut relay, _tx) = TransportActor::new();
+            relay.is_transport_enabled = true;
+
+            let (entry1, mut rx1) = make_test_interface("to_initiator");
+            let (entry2, _rx2) = make_test_interface("to_destination");
+            relay.interfaces.insert(1, entry1);
+            relay.interfaces.insert(2, entry2);
+
+            let mut link_id = [0x7E; 16];
+            link_id[15] = idx as u8;
+            let destination_hash = [0xDE; 16];
+            let destination_identity = rns_identity::identity::Identity::new();
+            insert_announce_for(&mut relay, destination_hash, &destination_identity);
+            relay.link_table.insert(
+                link_id,
+                crate::link_table::LinkEntry {
+                    timestamp: now_f64(),
+                    next_hop: None,
+                    interface_id: 2,
+                    remaining_hops: 1,
+                    destination_hash,
+                    established: false,
+                    validated: false,
+                    proof_timeout: now_f64() + 120.0,
+                    receiving_interface: 1,
+                    taken_hops: 0,
+                },
+            );
+
+            relay.on_inbound(InboundPacket {
+                raw: make_lrproof_packet_with_payload(link_id, 0, &vec![0xAA; payload_len]),
+                interface_id: 2,
+                rssi: None,
+                snr: None,
+                q: None,
+            });
+
+            assert!(
+                rx1.try_recv().is_err(),
+                "malformed LRPROOF length {payload_len} must not be forwarded"
+            );
+            assert!(!relay.link_table.get(&link_id).unwrap().validated);
+        }
     }
 
     #[test]
@@ -2172,6 +2364,67 @@ mod tests {
             .try_recv()
             .expect("destination link data should route to initiator side");
         assert_eq!(to_initiator[1], 1);
+    }
+
+    #[test]
+    fn test_link_table_forwarding_inserts_hash_after_claim() {
+        let (mut relay, _tx) = TransportActor::new();
+        relay.is_transport_enabled = true;
+
+        let (entry1, _rx1) = make_test_interface("to_initiator");
+        let (entry2, mut rx2) = make_test_interface("to_destination");
+        relay.interfaces.insert(1, entry1);
+        relay.interfaces.insert(2, entry2);
+
+        let link_id = [0x7F; 16];
+        relay.link_table.insert(
+            link_id,
+            crate::link_table::LinkEntry {
+                timestamp: now_f64(),
+                next_hop: None,
+                interface_id: 2,
+                remaining_hops: 1,
+                destination_hash: [0xDF; 16],
+                established: true,
+                validated: true,
+                proof_timeout: now_f64() + 120.0,
+                receiving_interface: 1,
+                taken_hops: 1,
+            },
+        );
+
+        let raw =
+            make_link_data_packet_with_context(link_id, 0, rns_wire::context::PacketContext::None);
+        let packet_hash = rns_wire::hash::packet_hash(&raw, rns_wire::flags::HeaderType::Header1);
+        assert!(
+            !relay.packet_hashlist.contains(&packet_hash),
+            "link-table packets must not be inserted before routing claims them"
+        );
+
+        relay.on_inbound(InboundPacket {
+            raw: raw.clone(),
+            interface_id: 1,
+            rssi: None,
+            snr: None,
+            q: None,
+        });
+        assert!(
+            relay.packet_hashlist.contains(&packet_hash),
+            "claimed link-table packet hash must be inserted after forwarding"
+        );
+        rx2.try_recv().expect("first link packet should forward");
+
+        relay.on_inbound(InboundPacket {
+            raw,
+            interface_id: 1,
+            rssi: None,
+            snr: None,
+            q: None,
+        });
+        assert!(
+            rx2.try_recv().is_err(),
+            "duplicate link-table packet should be dropped after hash insertion"
+        );
     }
 
     #[test]
@@ -2230,6 +2483,9 @@ mod tests {
         relay_b.interfaces.insert(2, entry_b2);
 
         let link_id = [0x88; 16];
+        let destination_hash = [0xEE; 16];
+        let destination_identity = rns_identity::identity::Identity::new();
+        insert_announce_for(&mut relay_b, destination_hash, &destination_identity);
         relay_b.link_table.insert(
             link_id,
             crate::link_table::LinkEntry {
@@ -2237,7 +2493,7 @@ mod tests {
                 next_hop: Some([0xDD; 16]),
                 interface_id: 2, // toward destination
                 remaining_hops: 1,
-                destination_hash: [0xEE; 16],
+                destination_hash,
                 established: false,
                 validated: false,
                 proof_timeout: now_f64() + 120.0,
@@ -2255,6 +2511,7 @@ mod tests {
         relay_a.interfaces.insert(1, entry_a1);
         relay_a.interfaces.insert(2, entry_a2);
 
+        insert_announce_for(&mut relay_a, destination_hash, &destination_identity);
         relay_a.link_table.insert(
             link_id,
             crate::link_table::LinkEntry {
@@ -2262,7 +2519,7 @@ mod tests {
                 next_hop: Some([0xCC; 16]),
                 interface_id: 2, // toward RelayB
                 remaining_hops: 2,
-                destination_hash: [0xEE; 16],
+                destination_hash,
                 established: false,
                 validated: false,
                 proof_timeout: now_f64() + 120.0,
@@ -2273,7 +2530,7 @@ mod tests {
 
         // Proof travels back: Destination → RelayB → RelayA.
         // Destination sends proof with hops=0.
-        let proof = make_lrproof_packet(link_id, 0);
+        let proof = make_lrproof_packet(link_id, 0, &destination_identity, Some([1, 2, 3]));
         relay_b.on_inbound(InboundPacket {
             raw: proof,
             interface_id: 2, // from destination
@@ -3402,6 +3659,174 @@ mod tests {
     }
 
     #[test]
+    fn test_tunnel_learned_header2_announce_records_full_metadata() {
+        let (mut actor, _tx) = TransportActor::new();
+        let (entry1, _rx1) = make_test_interface("iface1");
+        actor.interfaces.insert(1, entry1);
+
+        let tunnel_id = [0x31; 32];
+        actor.tunnel_table.insert(crate::tunnel::TunnelEntry {
+            tunnel_id,
+            interface_id: 1,
+            tunnel_paths: std::collections::HashMap::new(),
+            expires: now_f64() + 600.0,
+        });
+
+        let transport_id = [0xAA; 16];
+        let (raw, dest_hash, _identity) =
+            make_header2_announce(transport_id, "test.tunnel.h2announce", 2);
+        let expected_packet_hash =
+            rns_wire::hash::packet_hash(&raw, rns_wire::flags::HeaderType::Header2);
+
+        actor.on_inbound(InboundPacket {
+            raw,
+            interface_id: 1,
+            rssi: None,
+            snr: None,
+            q: None,
+        });
+
+        let tunnel = actor.tunnel_table.get(&tunnel_id).unwrap();
+        let tunnel_path = tunnel.tunnel_paths.get(&dest_hash).unwrap();
+        assert_eq!(tunnel_path.next_hop, Some(transport_id));
+        assert_eq!(tunnel_path.hops, 3);
+        assert_eq!(tunnel_path.packet_hash, Some(expected_packet_hash));
+        assert!(
+            !tunnel_path.random_blobs.is_empty(),
+            "tunnel path must preserve announce random blobs for freshness comparisons"
+        );
+    }
+
+    #[test]
+    fn test_restore_tunnel_path_preserves_next_hop_and_packet_hash() {
+        let (mut actor, _tx) = TransportActor::new();
+
+        let tunnel_id = [0x32; 32];
+        let dest_hash = [0x44; 16];
+        let next_hop = [0x55; 16];
+        let packet_hash = [0x66; 32];
+        let random_blob = random_blob(0x77, 100);
+        let mut tunnel_paths = std::collections::HashMap::new();
+        tunnel_paths.insert(
+            dest_hash,
+            crate::tunnel::TunnelPath {
+                timestamp: now_f64(),
+                next_hop: Some(next_hop),
+                hops: 4,
+                expires: now_f64() + 600.0,
+                random_blobs: vec![random_blob],
+                packet_hash: Some(packet_hash),
+            },
+        );
+        actor.tunnel_table.insert(crate::tunnel::TunnelEntry {
+            tunnel_id,
+            interface_id: 0,
+            tunnel_paths,
+            expires: now_f64() + 600.0,
+        });
+
+        actor.restore_tunnel_paths(&tunnel_id, 9);
+
+        let restored = actor.path_table.get(&dest_hash).unwrap();
+        assert_eq!(restored.next_hop, Some(next_hop));
+        assert_eq!(restored.packet_hash, Some(packet_hash));
+        assert_eq!(restored.interface_id, 9);
+        assert!(restored.has_random_blob(&random_blob));
+    }
+
+    #[test]
+    fn test_restore_tunnel_path_drops_older_than_active_path() {
+        let (mut actor, _tx) = TransportActor::new();
+
+        let tunnel_id = [0x33; 32];
+        let dest_hash = [0x45; 16];
+        let mut active = crate::path_table::PathEntry::new(None, 4, 1, InterfaceMode::Gateway);
+        let active_blob = random_blob(0x80, 200);
+        active.add_random_blob(active_blob);
+        actor.path_table.insert(dest_hash, active);
+
+        let tunnel_blob = random_blob(0x81, 100);
+        let mut tunnel_paths = std::collections::HashMap::new();
+        tunnel_paths.insert(
+            dest_hash,
+            crate::tunnel::TunnelPath {
+                timestamp: now_f64(),
+                next_hop: Some([0x99; 16]),
+                hops: 4,
+                expires: now_f64() + 600.0,
+                random_blobs: vec![tunnel_blob],
+                packet_hash: Some([0x88; 32]),
+            },
+        );
+        actor.tunnel_table.insert(crate::tunnel::TunnelEntry {
+            tunnel_id,
+            interface_id: 0,
+            tunnel_paths,
+            expires: now_f64() + 600.0,
+        });
+
+        actor.restore_tunnel_paths(&tunnel_id, 9);
+
+        let active_after = actor.path_table.get(&dest_hash).unwrap();
+        assert_eq!(active_after.interface_id, 1);
+        assert!(active_after.has_random_blob(&active_blob));
+        assert!(
+            actor
+                .tunnel_table
+                .get(&tunnel_id)
+                .unwrap()
+                .tunnel_paths
+                .get(&dest_hash)
+                .is_none(),
+            "older tunnel path should be pruned after losing freshness comparison"
+        );
+    }
+
+    #[test]
+    fn test_maintenance_culls_stale_tunnel_paths() {
+        let (mut actor, _tx) = TransportActor::new();
+
+        let tunnel_id = [0x34; 32];
+        let stale_dest = [0x46; 16];
+        let fresh_dest = [0x47; 16];
+        let mut tunnel_paths = std::collections::HashMap::new();
+        tunnel_paths.insert(
+            stale_dest,
+            crate::tunnel::TunnelPath {
+                timestamp: now_f64() - TUNNEL_PATH_TIMEOUT as f64 - 1.0,
+                next_hop: None,
+                hops: 1,
+                expires: now_f64() + 600.0,
+                random_blobs: vec![],
+                packet_hash: Some([0x46; 32]),
+            },
+        );
+        tunnel_paths.insert(
+            fresh_dest,
+            crate::tunnel::TunnelPath {
+                timestamp: now_f64(),
+                next_hop: None,
+                hops: 1,
+                expires: now_f64() + 600.0,
+                random_blobs: vec![],
+                packet_hash: Some([0x47; 32]),
+            },
+        );
+        actor.tunnel_table.insert(crate::tunnel::TunnelEntry {
+            tunnel_id,
+            interface_id: 1,
+            tunnel_paths,
+            expires: now_f64() + 600.0,
+        });
+
+        actor.cull_stale_tunnel_paths(now_f64());
+
+        let tunnel = actor.tunnel_table.get(&tunnel_id).unwrap();
+        assert!(!tunnel.tunnel_paths.contains_key(&stale_dest));
+        assert!(tunnel.tunnel_paths.contains_key(&fresh_dest));
+    }
+
+    #[test]
     fn test_header1_announce_learns_path_no_next_hop() {
         let (mut actor, _tx) = TransportActor::new();
         let (entry1, _rx1) = make_test_interface("iface1");
@@ -4326,6 +4751,172 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_invalid_announces_do_not_trip_ingress_hold() {
+        let (mut actor, _tx) = TransportActor::new();
+        actor.is_transport_enabled = true;
+
+        let (entry_in, _rx_in) = make_test_interface("invalid_flood_iface");
+        actor.interfaces.insert(1, entry_in);
+
+        for _ in 0..50 {
+            let (raw, _dest) = make_valid_announce("test.invalid.flood", 1);
+            let mut raw = raw.to_vec();
+            let last = raw.len() - 1;
+            raw[last] ^= 0x01;
+            actor.on_inbound(crate::messages::InboundPacket {
+                raw: Bytes::from(raw),
+                interface_id: 1,
+                rssi: None,
+                snr: None,
+                q: None,
+            });
+        }
+
+        let entry = actor.interfaces.get(&1).unwrap();
+        assert!(
+            !entry.ingress.is_burst_active(),
+            "signature-invalid announces must be dropped before ingress accounting"
+        );
+        assert_eq!(entry.ingress.held_count(), 0);
+        assert_eq!(actor.path_table.iter().count(), 0);
+    }
+
+    #[test]
+    fn test_known_reannounce_bypasses_ingress_hold() {
+        let (mut actor, _tx) = TransportActor::new();
+        actor.is_transport_enabled = true;
+
+        let (entry_in, _rx_in) = make_test_interface("known_reannounce_iface");
+        actor.interfaces.insert(1, entry_in);
+
+        let identity = rns_identity::identity::Identity::new();
+        let old_blob = random_blob(0x91, 10);
+        let (first_raw, dest_hash) =
+            make_announce_for_with_random_blob(&identity, "test.known.ingress", 1, old_blob);
+        actor.on_inbound(crate::messages::InboundPacket {
+            raw: first_raw,
+            interface_id: 1,
+            rssi: None,
+            snr: None,
+            q: None,
+        });
+        assert!(actor.path_table.has_path(&dest_hash));
+
+        for _ in 0..50 {
+            let (raw, _dest) = make_valid_announce("test.known.flood", 1);
+            actor.on_inbound(crate::messages::InboundPacket {
+                raw,
+                interface_id: 1,
+                rssi: None,
+                snr: None,
+                q: None,
+            });
+        }
+        let held_before = actor.interfaces.get(&1).unwrap().ingress.held_count();
+        assert!(actor.interfaces.get(&1).unwrap().ingress.is_burst_active());
+
+        let new_blob = random_blob(0x92, 11);
+        let (reannounce_raw, _) =
+            make_announce_for_with_random_blob(&identity, "test.known.ingress", 1, new_blob);
+        actor.on_inbound(crate::messages::InboundPacket {
+            raw: reannounce_raw,
+            interface_id: 1,
+            rssi: None,
+            snr: None,
+            q: None,
+        });
+
+        assert_eq!(
+            actor.interfaces.get(&1).unwrap().ingress.held_count(),
+            held_before,
+            "known re-announces must not be held during ingress burst"
+        );
+        assert!(
+            actor
+                .path_table
+                .get(&dest_hash)
+                .unwrap()
+                .has_random_blob(&new_blob),
+            "known re-announce must refresh the active path"
+        );
+    }
+
+    #[test]
+    fn test_known_path_response_bypasses_ingress_hold_but_unknown_is_held() {
+        let (mut actor, _tx) = TransportActor::new();
+        actor.is_transport_enabled = true;
+
+        let (entry_in, _rx_in) = make_test_interface("path_response_ingress_iface");
+        actor.interfaces.insert(1, entry_in);
+
+        let identity = rns_identity::identity::Identity::new();
+        let (first_raw, known_dest) = make_announce_for(&identity, "test.known.path_response", 1);
+        actor.on_inbound(crate::messages::InboundPacket {
+            raw: first_raw,
+            interface_id: 1,
+            rssi: None,
+            snr: None,
+            q: None,
+        });
+        assert!(actor.path_table.has_path(&known_dest));
+
+        for _ in 0..50 {
+            let (raw, _dest) = make_valid_announce("test.path_response.flood", 1);
+            actor.on_inbound(crate::messages::InboundPacket {
+                raw,
+                interface_id: 1,
+                rssi: None,
+                snr: None,
+                q: None,
+            });
+        }
+        assert!(actor.interfaces.get(&1).unwrap().ingress.is_burst_active());
+        let held_before = actor.interfaces.get(&1).unwrap().ingress.held_count();
+
+        let (known_response, _) = make_announce_for_context(
+            &identity,
+            "test.known.path_response",
+            1,
+            rns_wire::context::PacketContext::PathResponse,
+        );
+        actor.on_inbound(crate::messages::InboundPacket {
+            raw: known_response,
+            interface_id: 1,
+            rssi: None,
+            snr: None,
+            q: None,
+        });
+        assert_eq!(
+            actor.interfaces.get(&1).unwrap().ingress.held_count(),
+            held_before,
+            "known path responses must not be held during ingress burst"
+        );
+
+        let other_identity = rns_identity::identity::Identity::new();
+        let (unknown_response, unknown_dest) = make_announce_for_context(
+            &other_identity,
+            "test.unknown.path_response",
+            1,
+            rns_wire::context::PacketContext::PathResponse,
+        );
+        actor.on_inbound(crate::messages::InboundPacket {
+            raw: unknown_response,
+            interface_id: 1,
+            rssi: None,
+            snr: None,
+            q: None,
+        });
+        assert!(
+            actor.interfaces.get(&1).unwrap().ingress.held_count() > held_before,
+            "unsolicited unknown path responses remain subject to ingress hold"
+        );
+        assert!(
+            !actor.path_table.has_path(&unknown_dest),
+            "held unknown path response must not install a route immediately"
+        );
+    }
+
     /// `broadcast_announce_on_interfaces` must enqueue rather than send
     /// directly, and `process_announce_queues` must drain one entry per
     /// gate-open while pushing `announce_allowed_at` forward by the
@@ -4548,9 +5139,11 @@ mod tests {
             dest_hash,
             crate::tunnel::TunnelPath {
                 timestamp: now_f64(),
+                next_hop: None,
                 hops: 2,
                 expires: now_f64() + 600.0,
                 random_blobs: vec![],
+                packet_hash: None,
             },
         );
 

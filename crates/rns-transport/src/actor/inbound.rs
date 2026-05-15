@@ -135,13 +135,73 @@ impl TransportActor {
             return;
         }
 
-        // Per-interface ingress control. Record the announce and, if the
-        // interface is burst-limiting, hold it for later release by the
-        // maintenance tick rather than processing now.
-        //
-        // Bypass the hold when the announce answers an outstanding path
-        // request: the announce *is* the resolution, and delaying it there
-        // would stall the requester for no gain.
+        let (announce_data, validated_identity) = {
+            if data_offset >= raw.len() {
+                tracing::warn!(
+                    dest = hex::encode(header.destination_hash),
+                    "announce missing payload, dropping"
+                );
+                return;
+            }
+
+            let payload = &raw[data_offset..];
+            let has_ratchet = header.flags.context_flag;
+            tracing::debug!(
+                dest = hex::encode(header.destination_hash),
+                payload_len = payload.len(),
+                has_ratchet = has_ratchet,
+                header_type = ?header.flags.header_type,
+                "announce payload received"
+            );
+            match rns_identity::announce::AnnounceData::unpack(payload, has_ratchet) {
+                Ok(announce_data) => {
+                    tracing::debug!(
+                        dest = hex::encode(header.destination_hash),
+                        app_data_len = announce_data.app_data.as_ref().map(|d| d.len()),
+                        has_ratchet_key = announce_data.ratchet.is_some(),
+                        "announce unpacked"
+                    );
+                    match announce_data.verify_signature(&header.destination_hash) {
+                        Ok(validated_identity) => {
+                            if self.blackhole_table.is_blackholed(&validated_identity.hash) {
+                                trace!(
+                                    identity = hex::encode(validated_identity.hash),
+                                    dest = hex::encode(header.destination_hash),
+                                    "announce from blackholed identity, dropping"
+                                );
+                                return;
+                            }
+                            (announce_data, validated_identity)
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                dest = hex::encode(header.destination_hash),
+                                payload_len = payload.len(),
+                                error = %e,
+                                "announce validation failed, dropping"
+                            );
+                            return;
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        dest = hex::encode(header.destination_hash),
+                        payload_len = payload.len(),
+                        has_ratchet = has_ratchet,
+                        error = %e,
+                        "announce unpack failed, dropping"
+                    );
+                    return;
+                }
+            }
+        };
+
+        // Python validates the announce signature before ingress accounting,
+        // and only holds still-unknown destinations. Known re-announces and
+        // path responses for paths we already know must continue refreshing
+        // route state during an ingress burst.
+        let announced_destination_known = self.path_table.get(&header.destination_hash).is_some();
         let answers_path_request = self.path_requests.contains_key(&header.destination_hash)
             || self
                 .discovery_path_requests
@@ -149,6 +209,7 @@ impl TransportActor {
         if let Some(entry) = self.interfaces.get_mut(&interface_id) {
             entry.ingress.received_announce();
             if !is_from_local_client
+                && !announced_destination_known
                 && !answers_path_request
                 && entry.ingress.should_ingress_limit()
             {
@@ -166,6 +227,36 @@ impl TransportActor {
                 return;
             }
         }
+
+        let known_public_key = self
+            .recent_announces
+            .get(&header.destination_hash)
+            .and_then(|entry| entry.public_key);
+        if let Err(e) = announce_data.validate_destination_binding(
+            &header.destination_hash,
+            &validated_identity,
+            known_public_key.as_ref(),
+        ) {
+            tracing::warn!(
+                dest = hex::encode(header.destination_hash),
+                error = %e,
+                "announce validation failed, dropping"
+            );
+            return;
+        }
+
+        tracing::debug!(
+            dest = hex::encode(header.destination_hash),
+            app_data_present = announce_data.app_data.is_some(),
+            "announce validated"
+        );
+
+        let announce_app_data = announce_data.app_data.clone();
+        let announce_public_key = Some(validated_identity.get_public_key());
+        let announce_ratchet = announce_data.ratchet;
+        let announce_name_hash = announce_data.name_hash;
+        let announce_identity_hash = Some(validated_identity.hash);
+        let announce_random_hash = announce_data.random_hash;
 
         let mut rate_blocked = false;
 
@@ -207,95 +298,6 @@ impl TransportActor {
             // `check_interface_rate` already stores its own timestamp state.
             self.rate_table.record(header.destination_hash);
         }
-
-        let (
-            announce_app_data,
-            announce_public_key,
-            announce_ratchet,
-            announce_name_hash,
-            announce_identity_hash,
-            announce_random_hash,
-        ) = {
-            if data_offset >= raw.len() {
-                tracing::warn!(
-                    dest = hex::encode(header.destination_hash),
-                    "announce missing payload, dropping"
-                );
-                return;
-            }
-
-            let payload = &raw[data_offset..];
-            let has_ratchet = header.flags.context_flag;
-            tracing::debug!(
-                dest = hex::encode(header.destination_hash),
-                payload_len = payload.len(),
-                has_ratchet = has_ratchet,
-                header_type = ?header.flags.header_type,
-                "announce payload received"
-            );
-            match rns_identity::announce::AnnounceData::unpack(payload, has_ratchet) {
-                Ok(announce_data) => {
-                    tracing::debug!(
-                        dest = hex::encode(header.destination_hash),
-                        app_data_len = announce_data.app_data.as_ref().map(|d| d.len()),
-                        has_ratchet_key = announce_data.ratchet.is_some(),
-                        "announce unpacked"
-                    );
-                    let known_public_key = self
-                        .recent_announces
-                        .get(&header.destination_hash)
-                        .and_then(|entry| entry.public_key);
-                    match announce_data.validate_with_known_key(
-                        &header.destination_hash,
-                        known_public_key.as_ref(),
-                    ) {
-                        Ok(validated_identity) => {
-                            if self.blackhole_table.is_blackholed(&validated_identity.hash) {
-                                trace!(
-                                    identity = hex::encode(validated_identity.hash),
-                                    dest = hex::encode(header.destination_hash),
-                                    "announce from blackholed identity, dropping"
-                                );
-                                return;
-                            }
-
-                            tracing::debug!(
-                                dest = hex::encode(header.destination_hash),
-                                app_data_present = announce_data.app_data.is_some(),
-                                "announce validated"
-                            );
-                            (
-                                announce_data.app_data.clone(),
-                                Some(validated_identity.get_public_key()),
-                                announce_data.ratchet,
-                                announce_data.name_hash,
-                                Some(validated_identity.hash),
-                                announce_data.random_hash,
-                            )
-                        }
-                        Err(e) => {
-                            tracing::warn!(
-                                dest = hex::encode(header.destination_hash),
-                                payload_len = payload.len(),
-                                error = %e,
-                                "announce validation failed, dropping"
-                            );
-                            return;
-                        }
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        dest = hex::encode(header.destination_hash),
-                        payload_len = payload.len(),
-                        has_ratchet = has_ratchet,
-                        error = %e,
-                        "announce unpack failed, dropping"
-                    );
-                    return;
-                }
-            }
-        };
 
         let iface_mode = self
             .interfaces
@@ -419,8 +421,23 @@ impl TransportActor {
             entry.random_blobs = random_blobs;
             // Store the announce packet hash so a later CacheRequest for this
             // destination can replay the exact announce bytes.
-            entry.packet_hash = Some(rns_wire::hash::packet_hash(raw, header.flags.header_type));
+            let announce_packet_hash = rns_wire::hash::packet_hash(raw, header.flags.header_type);
+            entry.packet_hash = Some(announce_packet_hash);
+            let tunnel_path = crate::tunnel::TunnelPath {
+                timestamp: entry.timestamp,
+                next_hop: entry.next_hop,
+                hops: entry.hops,
+                expires: entry.expires,
+                random_blobs: entry.random_blobs.iter().copied().collect(),
+                packet_hash: entry.packet_hash,
+            };
             self.path_table.insert(header.destination_hash, entry);
+            if let Some(tunnel) = self.tunnel_table.get_mut_by_interface(interface_id) {
+                tunnel
+                    .tunnel_paths
+                    .insert(header.destination_hash, tunnel_path);
+                tunnel.expires = now_f64() + TUNNEL_TIMEOUT as f64;
+            }
             self.state_dirty = true;
             // Wake any callers waiting on a path for this destination.
             self.fire_path_waiters(&header.destination_hash);
@@ -926,7 +943,9 @@ impl TransportActor {
             .get(&header.destination_hash)
             .is_some_and(|entry| self.is_local_client_interface(entry.receiving_interface));
 
-        if let Some(receipt) = self.receipt_table.get_mut(&header.destination_hash) {
+        if header.context != rns_wire::context::PacketContext::Lrproof
+            && let Some(receipt) = self.receipt_table.get_mut(&header.destination_hash)
+        {
             let rtt = receipt
                 .get_rtt()
                 .or_else(|| Some(receipt.sent_at.elapsed()));
@@ -971,12 +990,24 @@ impl TransportActor {
                     let expected_hops = link_entry.remaining_hops;
                     let outbound_interface = link_entry.interface_id;
                     let target_interface = link_entry.receiving_interface;
+                    let destination_hash = link_entry.destination_hash;
 
                     // Require that the proof arrived on the same interface we
                     // forwarded the request to; a mismatch is either a routing
                     // change or a spoof and must not be relayed.
                     let hops_match = header.hops == expected_hops;
                     if hops_match && _interface_id == outbound_interface {
+                        if !self.validate_transit_lrproof(raw, header, link_entry) {
+                            return;
+                        }
+                        let pkt_hash = rns_wire::hash::packet_hash(raw, header.flags.header_type);
+                        if !self.packet_hashlist.insert(pkt_hash) {
+                            trace!(
+                                link_id = hex::encode(header.destination_hash),
+                                "duplicate LRPROOF dropped after link-table claim"
+                            );
+                            return;
+                        }
                         let mut forwarded = raw.to_vec();
                         if forwarded.len() >= 2 {
                             forwarded[1] = header.hops;
@@ -985,6 +1016,9 @@ impl TransportActor {
                             entry.validated = true;
                         }
                         self.send_to_interface(target_interface, &forwarded);
+                        if !self.is_shared_instance {
+                            self.use_destination(&destination_hash);
+                        }
                         debug!(
                             link_id = hex::encode(header.destination_hash),
                             via_interface = target_interface,
@@ -1013,13 +1047,18 @@ impl TransportActor {
             // Fall through to local-pending-link delivery when link_table
             // didn't claim the proof.
             if let Some(tx) = self.destination_channels.get(&header.destination_hash) {
-                if let Err(e) = tx.try_send(crate::link_messages::DestinationEvent::InboundPacket {
-                    raw: raw.clone(),
-                    interface_id: _interface_id,
-                }) {
+                let delivered =
+                    tx.try_send(crate::link_messages::DestinationEvent::InboundPacket {
+                        raw: raw.clone(),
+                        interface_id: _interface_id,
+                    });
+                if let Err(e) = delivered {
                     self.channel_drops += 1;
                     warn!(dest = hex::encode(header.destination_hash), drops = self.channel_drops, err = %e,
                         "failed to deliver LRPROOF to local pending link (channel full)");
+                } else {
+                    let pkt_hash = rns_wire::hash::packet_hash(raw, header.flags.header_type);
+                    self.packet_hashlist.insert(pkt_hash);
                 }
             }
             return;
@@ -1162,6 +1201,25 @@ impl TransportActor {
         if forwarded.len() >= 2 {
             forwarded[1] = header.hops;
         }
+        let skip_hashlist = matches!(
+            header.context,
+            rns_wire::context::PacketContext::Keepalive
+                | rns_wire::context::PacketContext::Resource
+                | rns_wire::context::PacketContext::ResourceReq
+                | rns_wire::context::PacketContext::ResourcePrf
+                | rns_wire::context::PacketContext::CacheRequest
+                | rns_wire::context::PacketContext::Channel
+        );
+        if !skip_hashlist {
+            let pkt_hash = rns_wire::hash::packet_hash(raw, header.flags.header_type);
+            if !self.packet_hashlist.insert(pkt_hash) {
+                trace!(
+                    link_id = hex::encode(header.destination_hash),
+                    packet_kind, "duplicate link-table packet dropped after claim"
+                );
+                return true;
+            }
+        }
         if let Some(entry) = self.link_table.get_mut(&header.destination_hash) {
             entry.timestamp = now_f64();
         }
@@ -1174,5 +1232,87 @@ impl TransportActor {
             "link packet routed via link table"
         );
         true
+    }
+
+    fn validate_transit_lrproof(
+        &self,
+        raw: &[u8],
+        header: &rns_wire::header::PacketHeader,
+        link_entry: &crate::link_table::LinkEntry,
+    ) -> bool {
+        let payload_offset = header.size();
+        if raw.len() < payload_offset {
+            warn!(
+                link_id = hex::encode(header.destination_hash),
+                raw_len = raw.len(),
+                "link proof missing payload, not transporting"
+            );
+            return false;
+        }
+
+        let proof_data = &raw[payload_offset..];
+        if proof_data.len() != 96 && proof_data.len() != 99 {
+            warn!(
+                link_id = hex::encode(header.destination_hash),
+                proof_len = proof_data.len(),
+                "malformed link request proof length, not transporting"
+            );
+            return false;
+        }
+
+        let mut signature = [0u8; 64];
+        signature.copy_from_slice(&proof_data[..64]);
+        let responder_x25519_pub = &proof_data[64..96];
+        let signalling = if proof_data.len() == 99 {
+            &proof_data[96..99]
+        } else {
+            &[]
+        };
+
+        let Some(destination_public_key) = self
+            .recent_announces
+            .get(&link_entry.destination_hash)
+            .and_then(|announce| announce.public_key)
+        else {
+            warn!(
+                link_id = hex::encode(header.destination_hash),
+                destination = hex::encode(link_entry.destination_hash),
+                "link request proof has no known destination identity, not transporting"
+            );
+            return false;
+        };
+
+        let mut destination_ed25519 = [0u8; 32];
+        destination_ed25519.copy_from_slice(&destination_public_key[32..64]);
+        let verify_key =
+            match rns_crypto::ed25519::Ed25519PublicKey::from_bytes(&destination_ed25519) {
+                Ok(key) => key,
+                Err(err) => {
+                    warn!(
+                        link_id = hex::encode(header.destination_hash),
+                        destination = hex::encode(link_entry.destination_hash),
+                        error = %err,
+                        "link request proof destination identity is invalid, not transporting"
+                    );
+                    return false;
+                }
+            };
+
+        let mut signed_data = Vec::with_capacity(16 + 32 + 32 + signalling.len());
+        signed_data.extend_from_slice(&header.destination_hash);
+        signed_data.extend_from_slice(responder_x25519_pub);
+        signed_data.extend_from_slice(&destination_ed25519);
+        signed_data.extend_from_slice(signalling);
+
+        if verify_key.verify(&signed_data, &signature).is_ok() {
+            true
+        } else {
+            warn!(
+                link_id = hex::encode(header.destination_hash),
+                destination = hex::encode(link_entry.destination_hash),
+                "invalid link request proof signature, not transporting"
+            );
+            false
+        }
     }
 }
