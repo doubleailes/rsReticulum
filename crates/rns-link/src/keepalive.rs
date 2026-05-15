@@ -149,6 +149,17 @@ mod tests {
     use super::*;
     use std::thread;
 
+    fn instant_before_now(elapsed: Duration) -> Instant {
+        if let Some(instant) = Instant::now().checked_sub(elapsed) {
+            instant
+        } else {
+            thread::sleep(elapsed);
+            Instant::now()
+                .checked_sub(elapsed)
+                .expect("elapsed duration should be representable after waiting")
+        }
+    }
+
     #[test]
     fn test_rtt_scaling() {
         let mut ks = KeepaliveState::new(true);
@@ -225,11 +236,13 @@ mod tests {
     #[test]
     fn test_jitter_desynchronizes_keepalives() {
         let links: Vec<KeepaliveState> = (0..20)
-            .map(|_| {
+            .map(|i| {
                 let mut ks = KeepaliveState::new(true);
-                ks.update_from_rtt(Duration::from_millis(500));
+                ks.keepalive_interval = Duration::from_secs_f64(KEEPALIVE_MIN);
+                ks.jitter_offset = Duration::from_millis(500);
+                ks.jitter_negative = i % 2 == 0;
                 // Push last_inbound just past the interval boundary.
-                ks.last_inbound = Instant::now() - ks.keepalive_interval;
+                ks.last_inbound = instant_before_now(ks.keepalive_interval);
                 ks
             })
             .collect();
@@ -237,10 +250,12 @@ mod tests {
         let firing: usize = links.iter().filter(|ks| ks.should_send_keepalive()).count();
 
         let links_past: Vec<KeepaliveState> = (0..20)
-            .map(|_| {
+            .map(|i| {
                 let mut ks = KeepaliveState::new(true);
-                ks.update_from_rtt(Duration::from_millis(500));
-                ks.last_inbound = Instant::now() - ks.keepalive_interval * 2;
+                ks.keepalive_interval = Duration::from_secs_f64(KEEPALIVE_MIN);
+                ks.jitter_offset = Duration::from_millis(500);
+                ks.jitter_negative = i % 2 == 0;
+                ks.last_inbound = instant_before_now(Duration::from_secs(6));
                 ks
             })
             .collect();
