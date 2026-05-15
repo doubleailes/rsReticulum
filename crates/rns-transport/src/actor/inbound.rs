@@ -371,10 +371,12 @@ impl TransportActor {
                 && header.hops < PATHFINDER_M
             {
                 let now = now_f64();
-                let mut rebroadcast_raw = raw.to_vec();
-                if rebroadcast_raw.len() >= 2 {
-                    rebroadcast_raw[1] = header.hops;
-                }
+                let rebroadcast_raw = self.transport_announce_from_raw(
+                    raw,
+                    header.destination_hash,
+                    header.hops,
+                    rns_wire::context::PacketContext::None,
+                );
                 let announce_entry = crate::announce::AnnounceEntry {
                     timestamp: now,
                     retransmit_timeout: if is_from_local_client {
@@ -382,7 +384,11 @@ impl TransportActor {
                     } else {
                         now + rand_window()
                     },
-                    retries: 0,
+                    retries: if is_from_local_client {
+                        PATHFINDER_R
+                    } else {
+                        0
+                    },
                     received_from: header.transport_id.unwrap_or(header.destination_hash),
                     hops: header.hops,
                     packet_raw: rebroadcast_raw,
@@ -592,15 +598,6 @@ impl TransportActor {
             }
         }
 
-        // Reverse entries only exist to route proofs back through us, so a
-        // non-transport node has no reason to keep one unless it is acting for
-        // a local shared client.
-        if self.is_transport_enabled || from_local_client {
-            let pkt_hash = rns_wire::hash::truncated_packet_hash(raw, header.flags.header_type);
-            self.reverse_table
-                .insert(pkt_hash, interface_id, header.hops);
-        }
-
         if self.route_link_packet_via_link_table(raw, header, interface_id, "data") {
             return;
         }
@@ -672,28 +669,6 @@ impl TransportActor {
             return;
         }
 
-        if header.context == rns_wire::context::PacketContext::PathResponse {
-            let iface_mode = self
-                .interfaces
-                .get(&interface_id)
-                .map(|e| e.mode)
-                .unwrap_or(InterfaceMode::Gateway);
-            let entry = crate::path_table::PathEntry::new(
-                Some(header.destination_hash),
-                header.hops,
-                interface_id,
-                iface_mode,
-            );
-            self.path_table.insert(header.destination_hash, entry);
-            self.state_dirty = true;
-            self.fire_path_waiters(&header.destination_hash);
-            debug!(
-                dest = hex::encode(header.destination_hash),
-                "path learned from PathResponse"
-            );
-            return;
-        }
-
         if header.context == rns_wire::context::PacketContext::CacheRequest {
             self.handle_cache_request(raw, header, interface_id);
             return;
@@ -720,20 +695,29 @@ impl TransportActor {
             return;
         }
 
-        if self.is_transport_enabled || from_local_client || for_local_client {
-            if let Some(path) = self.path_table.get(&header.destination_hash) {
-                let target_interface = path.interface_id;
-                let mut forwarded = raw.to_vec();
-                if forwarded.len() >= 2 {
-                    forwarded[1] = header.hops;
-                }
-                self.send_to_interface(target_interface, &forwarded);
-                trace!(
-                    dest = hex::encode(header.destination_hash),
-                    via_interface = target_interface,
-                    "data packet forwarded"
-                );
+        if let Some((target_interface, forwarded)) = self.transport_forward_candidate(
+            raw,
+            header,
+            interface_id,
+            from_local_client,
+            for_local_client,
+        ) {
+            let pkt_hash = rns_wire::hash::truncated_packet_hash(raw, header.flags.header_type);
+            self.reverse_table.insert_with_outbound(
+                pkt_hash,
+                interface_id,
+                header.hops,
+                Some(target_interface),
+            );
+            self.send_to_interface(target_interface, &forwarded);
+            if let Some(path) = self.path_table.get_mut(&header.destination_hash) {
+                path.timestamp = now_f64();
             }
+            trace!(
+                dest = hex::encode(header.destination_hash),
+                via_interface = target_interface,
+                "data packet forwarded"
+            );
         }
     }
 
@@ -749,13 +733,17 @@ impl TransportActor {
             .get(&header.destination_hash)
             .is_some_and(|path| self.is_local_client_interface(path.interface_id));
 
-        if self.is_transport_enabled || from_local_client {
-            let pkt_hash = rns_wire::hash::truncated_packet_hash(raw, header.flags.header_type);
-            self.reverse_table
-                .insert(pkt_hash, interface_id, header.hops);
-        }
+        let link_request_for_this_instance = header.transport_id.is_none()
+            || header
+                .transport_id
+                .zip(self.transport_identity_hash)
+                .is_some_and(|(packet_transport_id, our_transport_id)| {
+                    packet_transport_id == our_transport_id
+                });
 
-        if self.local_destinations.contains(&header.destination_hash) {
+        if self.local_destinations.contains(&header.destination_hash)
+            && link_request_for_this_instance
+        {
             if let Some(tx) = self.destination_channels.get(&header.destination_hash) {
                 if let Err(e) = tx.try_send(crate::link_messages::DestinationEvent::LinkRequest {
                     raw: raw.clone(),
@@ -769,18 +757,22 @@ impl TransportActor {
             return;
         }
 
-        if let Some(path) = (self.is_transport_enabled || from_local_client || for_local_client)
-            .then(|| self.path_table.get(&header.destination_hash))
-            .flatten()
-        {
-            let target_interface = path.interface_id;
+        if let Some((target_interface, forwarded)) = self.transport_forward_candidate(
+            raw,
+            header,
+            interface_id,
+            from_local_client,
+            for_local_client,
+        ) {
+            let Some(path) = self.path_table.get(&header.destination_hash) else {
+                return;
+            };
             let remaining_hops = path.hops;
             let next_hop = path.next_hop;
-            let mut forwarded = raw.to_vec();
-            if forwarded.len() >= 2 {
-                forwarded[1] = header.hops;
-            }
             self.send_to_interface(target_interface, &forwarded);
+            if let Some(path) = self.path_table.get_mut(&header.destination_hash) {
+                path.timestamp = now_f64();
+            }
 
             // Cache the relay so the matching LRPROOF can be routed back to
             // the initiator without a fresh path lookup. Proof timeout scales
@@ -824,6 +816,94 @@ impl TransportActor {
                 via_interface = target_interface,
                 "link request forwarded"
             );
+        }
+    }
+
+    fn transport_forward_candidate(
+        &self,
+        raw: &[u8],
+        header: &rns_wire::header::PacketHeader,
+        interface_id: InterfaceId,
+        from_local_client: bool,
+        for_local_client: bool,
+    ) -> Option<(InterfaceId, Vec<u8>)> {
+        let path = self.path_table.get(&header.destination_hash)?;
+        if path.interface_id == interface_id && !for_local_client {
+            return None;
+        }
+
+        let may_forward_for_shared_client = from_local_client || for_local_client;
+        let addressed_to_us = header
+            .transport_id
+            .zip(self.transport_identity_hash)
+            .is_some_and(|(packet_transport_id, our_transport_id)| {
+                packet_transport_id == our_transport_id
+            });
+
+        // Upstream Transport only relays in-transport packets when the Header2
+        // transport id names this instance. Shared-instance local-client edges
+        // are the exception: they are allowed to use the local path cache even
+        // when packets arrive without normal transport wrapping.
+        if may_forward_for_shared_client && header.transport_id.is_some() && !addressed_to_us {
+            return None;
+        }
+
+        if !may_forward_for_shared_client {
+            if !self.is_transport_enabled || !addressed_to_us {
+                return None;
+            }
+        }
+
+        let forwarded = self.rewrite_forwarded_transport_packet(raw, header, path)?;
+        Some((path.interface_id, forwarded))
+    }
+
+    fn rewrite_forwarded_transport_packet(
+        &self,
+        raw: &[u8],
+        header: &rns_wire::header::PacketHeader,
+        path: &crate::path_table::PathEntry,
+    ) -> Option<Vec<u8>> {
+        let payload_offset = header.size();
+        if raw.len() < payload_offset {
+            return None;
+        }
+
+        if path.hops > 1 {
+            let next_hop = path.next_hop?;
+            let mut flags = header.flags;
+            flags.header_type = rns_wire::flags::HeaderType::Header2;
+            flags.transport_type = rns_wire::flags::TransportType::Transport;
+            let new_header = rns_wire::header::PacketHeader {
+                flags,
+                hops: header.hops,
+                transport_id: Some(next_hop),
+                destination_hash: header.destination_hash,
+                context: header.context,
+            };
+            let mut forwarded = new_header.pack();
+            forwarded.extend_from_slice(&raw[payload_offset..]);
+            Some(forwarded)
+        } else if path.hops == 1 {
+            let mut flags = header.flags;
+            flags.header_type = rns_wire::flags::HeaderType::Header1;
+            flags.transport_type = rns_wire::flags::TransportType::Broadcast;
+            let new_header = rns_wire::header::PacketHeader {
+                flags,
+                hops: header.hops,
+                transport_id: None,
+                destination_hash: header.destination_hash,
+                context: header.context,
+            };
+            let mut forwarded = new_header.pack();
+            forwarded.extend_from_slice(&raw[payload_offset..]);
+            Some(forwarded)
+        } else {
+            let mut forwarded = raw.to_vec();
+            if forwarded.len() >= 2 {
+                forwarded[1] = header.hops;
+            }
+            Some(forwarded)
         }
     }
 
@@ -1030,10 +1110,43 @@ impl TransportActor {
             return false;
         }
 
-        let target_interface = if interface_id == entry.receiving_interface {
-            entry.interface_id
+        let target_interface = if entry.interface_id == entry.receiving_interface {
+            if header.hops == entry.remaining_hops || header.hops == entry.taken_hops {
+                entry.interface_id
+            } else {
+                trace!(
+                    link_id = hex::encode(header.destination_hash),
+                    actual_hops = header.hops,
+                    remaining_hops = entry.remaining_hops,
+                    taken_hops = entry.taken_hops,
+                    "link packet hop mismatch, not transporting"
+                );
+                return true;
+            }
+        } else if interface_id == entry.receiving_interface {
+            if header.hops == entry.taken_hops {
+                entry.interface_id
+            } else {
+                trace!(
+                    link_id = hex::encode(header.destination_hash),
+                    actual_hops = header.hops,
+                    expected_hops = entry.taken_hops,
+                    "link packet initiator-side hop mismatch, not transporting"
+                );
+                return true;
+            }
         } else if interface_id == entry.interface_id {
-            entry.receiving_interface
+            if header.hops == entry.remaining_hops {
+                entry.receiving_interface
+            } else {
+                trace!(
+                    link_id = hex::encode(header.destination_hash),
+                    actual_hops = header.hops,
+                    expected_hops = entry.remaining_hops,
+                    "link packet destination-side hop mismatch, not transporting"
+                );
+                return true;
+            }
         } else {
             warn!(
                 link_id = hex::encode(header.destination_hash),

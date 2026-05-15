@@ -582,6 +582,7 @@ impl TransportActor {
                 if self.path_table.has_path(&dest) {
                     let _ = reply.send(true);
                 } else {
+                    self.on_path_request(dest);
                     let now = now_f64();
                     self.path_waiters
                         .entry(dest)
@@ -1417,26 +1418,6 @@ mod tests {
         Bytes::from(raw)
     }
 
-    fn make_link_request_packet(dest_hash: [u8; 16], hops: u8) -> Bytes {
-        let flags = rns_wire::flags::PacketFlags {
-            header_type: rns_wire::flags::HeaderType::Header1,
-            context_flag: false,
-            transport_type: rns_wire::flags::TransportType::Broadcast,
-            destination_type: rns_wire::flags::DestinationType::Single,
-            packet_type: rns_wire::flags::PacketType::LinkRequest,
-        };
-        let header = rns_wire::header::PacketHeader {
-            flags,
-            hops,
-            transport_id: None,
-            destination_hash: dest_hash,
-            context: rns_wire::context::PacketContext::None,
-        };
-        let mut raw = header.pack();
-        raw.extend_from_slice(&[0xCC; 32]);
-        Bytes::from(raw)
-    }
-
     fn make_test_interface(name: &str) -> (InterfaceEntry, mpsc::Receiver<Bytes>) {
         let (tx, rx) = mpsc::channel(64);
         let entry = InterfaceEntry {
@@ -1796,6 +1777,7 @@ mod tests {
         let (mut actor, _tx) = TransportActor::new();
         // Only transport-enabled nodes rebroadcast announces.
         actor.is_transport_enabled = true;
+        actor.transport_identity_hash = Some([0xAB; 16]);
         let (entry1, mut _rx1) = make_test_interface("iface1");
         let (entry2, mut rx2) = make_test_interface("iface2");
         actor.interfaces.insert(1, entry1);
@@ -1822,6 +1804,12 @@ mod tests {
         // Interface 2 should receive the adjusted hop value for the next leg.
         let rebroadcast = rx2.try_recv().unwrap();
         assert_eq!(rebroadcast[1], 4);
+        let (rebroadcast_header, _) = rns_wire::header::PacketHeader::unpack(&rebroadcast).unwrap();
+        assert_eq!(
+            rebroadcast_header.flags.header_type,
+            rns_wire::flags::HeaderType::Header2
+        );
+        assert_eq!(rebroadcast_header.transport_id, Some([0xAB; 16]));
     }
 
     #[test]
@@ -1858,6 +1846,8 @@ mod tests {
     fn test_data_forwarding() {
         let (mut actor, _tx) = TransportActor::new();
         actor.is_transport_enabled = true;
+        let transport_id = [0xAA; 16];
+        actor.transport_identity_hash = Some(transport_id);
 
         let (entry1, mut _rx1) = make_test_interface("iface1");
         let (entry2, mut rx2) = make_test_interface("iface2");
@@ -1874,8 +1864,8 @@ mod tests {
         );
         actor.path_table.insert(dest_hash, path_entry);
 
-        // Inject data on interface 1
-        let raw = make_data_packet(dest_hash, 1);
+        // Inject in-transport Header2 data addressed to this transport.
+        let raw = make_header2_data_packet(transport_id, dest_hash, 1, b"transported_data");
         actor.on_inbound(InboundPacket {
             raw: raw.clone(),
             interface_id: 1,
@@ -1886,7 +1876,15 @@ mod tests {
 
         // Interface 2 should have received the forwarded packet
         let forwarded = rx2.try_recv().unwrap();
-        assert_eq!(forwarded[1], 2); // hops incremented from 1 to 2
+        assert_eq!(forwarded[1], 2); // raw 1 -> inbound-adjusted 2
+        let (forwarded_header, offset) =
+            rns_wire::header::PacketHeader::unpack(&forwarded).unwrap();
+        assert_eq!(
+            forwarded_header.flags.header_type,
+            rns_wire::flags::HeaderType::Header2
+        );
+        assert_eq!(forwarded_header.transport_id, Some([0xBB; 16]));
+        assert_eq!(&forwarded[offset..], b"transported_data");
     }
 
     #[test]
@@ -1957,6 +1955,8 @@ mod tests {
     fn test_link_request_forwarding() {
         let (mut actor, _tx) = TransportActor::new();
         actor.is_transport_enabled = true;
+        let transport_id = [0xAA; 16];
+        actor.transport_identity_hash = Some(transport_id);
 
         let (entry1, _rx1) = make_test_interface("iface1");
         let (entry2, mut rx2) = make_test_interface("iface2");
@@ -1969,8 +1969,8 @@ mod tests {
             crate::path_table::PathEntry::new(Some([0xBB; 16]), 1, 2, InterfaceMode::Gateway);
         actor.path_table.insert(dest_hash, path_entry);
 
-        // Inject link request on interface 1
-        let raw = make_link_request_packet(dest_hash, 0);
+        // Inject in-transport link request on interface 1
+        let raw = make_header2_link_request_packet(transport_id, dest_hash, 0, &[0x42; 64]);
         actor.on_inbound(InboundPacket {
             raw,
             interface_id: 1,
@@ -1981,7 +1981,13 @@ mod tests {
 
         // Interface 2 should have received the forwarded link request
         let forwarded = rx2.try_recv().unwrap();
-        assert_eq!(forwarded[1], 1); // hops incremented from 0 to 1
+        assert_eq!(forwarded[1], 1); // raw 0 -> inbound-adjusted 1
+        let (forwarded_header, _) = rns_wire::header::PacketHeader::unpack(&forwarded).unwrap();
+        assert_eq!(
+            forwarded_header.flags.header_type,
+            rns_wire::flags::HeaderType::Header1
+        );
+        assert_eq!(forwarded_header.transport_id, None);
     }
 
     fn make_lrproof_packet(link_id: [u8; 16], hops: u8) -> Bytes {
@@ -2133,13 +2139,13 @@ mod tests {
                 timestamp: now_f64(),
                 next_hop: None,
                 interface_id: 2,
-                remaining_hops: 0,
+                remaining_hops: 1,
                 destination_hash: [0xCE; 16],
                 established: true,
                 validated: true,
                 proof_timeout: now_f64() + 120.0,
                 receiving_interface: 1,
-                taken_hops: 0,
+                taken_hops: 1,
             },
         );
 
@@ -2185,13 +2191,13 @@ mod tests {
                 timestamp: now_f64(),
                 next_hop: None,
                 interface_id: 2,
-                remaining_hops: 0,
+                remaining_hops: 1,
                 destination_hash: [0xCF; 16],
                 established: true,
                 validated: true,
                 proof_timeout: now_f64() + 120.0,
                 receiving_interface: 1,
-                taken_hops: 0,
+                taken_hops: 1,
             },
         );
 
@@ -2534,6 +2540,44 @@ mod tests {
             }
             _ => panic!("expected InboundPacket event"),
         }
+    }
+
+    #[test]
+    fn data_path_response_context_does_not_install_path() {
+        let (mut actor, _tx) = TransportActor::new();
+        let (entry1, _rx1) = make_test_interface("iface1");
+        actor.interfaces.insert(1, entry1);
+
+        let dest_hash = [0x3A; 16];
+        let flags = rns_wire::flags::PacketFlags {
+            header_type: rns_wire::flags::HeaderType::Header1,
+            context_flag: false,
+            transport_type: rns_wire::flags::TransportType::Broadcast,
+            destination_type: rns_wire::flags::DestinationType::Single,
+            packet_type: rns_wire::flags::PacketType::Data,
+        };
+        let header = rns_wire::header::PacketHeader {
+            flags,
+            hops: 0,
+            transport_id: None,
+            destination_hash: dest_hash,
+            context: rns_wire::context::PacketContext::PathResponse,
+        };
+        let mut raw = header.pack();
+        raw.extend_from_slice(b"not_an_announce");
+
+        actor.on_inbound(InboundPacket {
+            raw: Bytes::from(raw),
+            interface_id: 1,
+            rssi: None,
+            snr: None,
+            q: None,
+        });
+
+        assert!(
+            !actor.path_table.has_path(&dest_hash),
+            "only validated ANNOUNCE path responses may install paths"
+        );
     }
 
     #[test]
@@ -3017,6 +3061,31 @@ mod tests {
         Bytes::from(raw)
     }
 
+    fn make_header2_link_request_packet(
+        transport_id: [u8; 16],
+        dest_hash: [u8; 16],
+        hops: u8,
+        payload: &[u8],
+    ) -> Bytes {
+        let flags = rns_wire::flags::PacketFlags {
+            header_type: rns_wire::flags::HeaderType::Header2,
+            context_flag: false,
+            transport_type: rns_wire::flags::TransportType::Transport,
+            destination_type: rns_wire::flags::DestinationType::Single,
+            packet_type: rns_wire::flags::PacketType::LinkRequest,
+        };
+        let header = rns_wire::header::PacketHeader {
+            flags,
+            hops,
+            transport_id: Some(transport_id),
+            destination_hash: dest_hash,
+            context: rns_wire::context::PacketContext::None,
+        };
+        let mut raw = header.pack();
+        raw.extend_from_slice(payload);
+        Bytes::from(raw)
+    }
+
     fn make_header2_announce(
         transport_id: [u8; 16],
         app_name: &str,
@@ -3104,6 +3173,7 @@ mod tests {
 
         let transport_id = [0xAA; 16]; // hub identity
         let dest_hash = [0xBB; 16]; // final destination (NOT local)
+        actor.transport_identity_hash = Some(transport_id);
 
         // Set up path: dest_hash is reachable via interface 2
         let path_entry = crate::path_table::PathEntry::new(
@@ -3126,14 +3196,73 @@ mod tests {
             q: None,
         });
 
-        // Should be forwarded via interface 2 with hops incremented
+        // Should be forwarded via interface 2 with Python-style final-hop
+        // Header2 -> Header1 rewrite and inbound-adjusted hops.
         let forwarded = rx2.try_recv().unwrap();
-        assert_eq!(forwarded[1], 2); // hops: 1 → 2
-        // Verify it's still a Header2 packet
+        assert_eq!(forwarded[1], 2); // raw 1 -> inbound-adjusted 2
         let (hdr, offset) = rns_wire::header::PacketHeader::unpack(&forwarded).unwrap();
-        assert_eq!(hdr.flags.header_type, rns_wire::flags::HeaderType::Header2);
+        assert_eq!(hdr.flags.header_type, rns_wire::flags::HeaderType::Header1);
+        assert_eq!(hdr.transport_id, None);
         assert_eq!(hdr.destination_hash, dest_hash);
         assert_eq!(&forwarded[offset..], payload);
+    }
+
+    #[test]
+    fn test_header2_transport_packet_for_other_transport_is_dropped() {
+        let (mut actor, _tx) = TransportActor::new();
+        actor.is_transport_enabled = true;
+        actor.transport_identity_hash = Some([0xAA; 16]);
+
+        let (entry1, _rx1) = make_test_interface("iface_in");
+        let (entry2, mut rx2) = make_test_interface("iface_out");
+        actor.interfaces.insert(1, entry1);
+        actor.interfaces.insert(2, entry2);
+
+        let dest_hash = [0xBB; 16];
+        actor.path_table.insert(
+            dest_hash,
+            crate::path_table::PathEntry::new(None, 1, 2, InterfaceMode::Gateway),
+        );
+
+        let raw = make_header2_data_packet([0xCC; 16], dest_hash, 1, b"not_for_us");
+        actor.on_inbound(InboundPacket {
+            raw,
+            interface_id: 1,
+            rssi: None,
+            snr: None,
+            q: None,
+        });
+
+        assert!(rx2.try_recv().is_err());
+    }
+
+    #[test]
+    fn test_header2_packet_for_other_transport_is_not_forwarded_to_local_client() {
+        let (mut actor, _tx) = TransportActor::new();
+        actor.transport_identity_hash = Some([0xAA; 16]);
+
+        let (external, _external_rx) = make_test_interface("external");
+        let (mut local_client, mut local_rx) = make_test_interface("SharedInstanceServer/client");
+        local_client.role = InterfaceRole::LocalClient;
+        actor.interfaces.insert(1, external);
+        actor.interfaces.insert(2, local_client);
+
+        let dest_hash = [0xBC; 16];
+        actor.path_table.insert(
+            dest_hash,
+            crate::path_table::PathEntry::new(None, 0, 2, InterfaceMode::Gateway),
+        );
+
+        let raw = make_header2_data_packet([0xCC; 16], dest_hash, 0, b"wrong_transport");
+        actor.on_inbound(InboundPacket {
+            raw,
+            interface_id: 1,
+            rssi: None,
+            snr: None,
+            q: None,
+        });
+
+        assert!(local_rx.try_recv().is_err());
     }
 
     #[test]
@@ -3389,7 +3518,7 @@ mod tests {
     }
 
     #[test]
-    fn test_header1_data_transport_enabled_forwards() {
+    fn test_header1_data_transport_enabled_does_not_forward() {
         let (mut actor, _tx) = TransportActor::new();
         actor.is_transport_enabled = true;
 
@@ -3417,9 +3546,49 @@ mod tests {
             q: None,
         });
 
-        // Forwarded with hops incremented
+        // Python transport relays only in-transport Header2 packets addressed
+        // to the local transport identity. Header1 traffic is direct only.
+        assert!(rx2.try_recv().is_err());
+    }
+
+    #[test]
+    fn test_header2_link_request_final_hop_rewrites_to_header1() {
+        let (mut actor, _tx) = TransportActor::new();
+        actor.is_transport_enabled = true;
+
+        let (entry1, _rx1) = make_test_interface("iface_in");
+        let (entry2, mut rx2) = make_test_interface("iface_out");
+        actor.interfaces.insert(1, entry1);
+        actor.interfaces.insert(2, entry2);
+
+        let transport_id = [0xAA; 16];
+        let dest_hash = [0xBB; 16];
+        actor.transport_identity_hash = Some(transport_id);
+        actor.path_table.insert(
+            dest_hash,
+            crate::path_table::PathEntry::new(None, 1, 2, InterfaceMode::Gateway),
+        );
+
+        let payload = [0x42; 64];
+        let raw = make_header2_link_request_packet(transport_id, dest_hash, 1, &payload);
+        actor.on_inbound(InboundPacket {
+            raw,
+            interface_id: 1,
+            rssi: None,
+            snr: None,
+            q: None,
+        });
+
         let forwarded = rx2.try_recv().unwrap();
-        assert_eq!(forwarded[1], 1); // hops 0 → 1
+        let (hdr, offset) = rns_wire::header::PacketHeader::unpack(&forwarded).unwrap();
+        assert_eq!(hdr.flags.header_type, rns_wire::flags::HeaderType::Header1);
+        assert_eq!(
+            hdr.flags.packet_type,
+            rns_wire::flags::PacketType::LinkRequest
+        );
+        assert_eq!(hdr.transport_id, None);
+        assert_eq!(hdr.hops, 2);
+        assert_eq!(&forwarded[offset..], &payload);
     }
 
     #[test]
@@ -3460,6 +3629,8 @@ mod tests {
         let (mut client, _client_tx) = TransportActor::new();
 
         hub.is_transport_enabled = true; // Hub is transport node
+        let hub_transport_id = [0xA1; 16];
+        hub.transport_identity_hash = Some(hub_transport_id);
 
         // Wire interfaces (we'll manually relay between them)
         let (peer_iface, mut peer_rx) = make_test_interface("peer_tcp");
@@ -3532,7 +3703,7 @@ mod tests {
 
         // Hub rebroadcasts announce on other interfaces.
         let rebroadcast = hub_rx1.try_recv().unwrap();
-        assert_eq!(rebroadcast[1], 1); // hops: 0 → 1
+        assert_eq!(rebroadcast[1], 1); // hub's inbound-adjusted announce hops
 
         // Peer receives the rebroadcast.
         peer.on_inbound(InboundPacket {
@@ -3545,8 +3716,10 @@ mod tests {
 
         // Peer should know the path to client_dest_hash.
         assert!(peer.path_table.has_path(&client_dest_hash));
-        // The rebroadcast came as Header1 from the hub — no transport_id in the header
-        // so the peer's path has no next_hop.
+        assert_eq!(
+            peer.path_table.get(&client_dest_hash).unwrap().next_hop,
+            Some(hub_transport_id)
+        );
 
         // Peer sends LXMF Data to the client. Production would encrypt and
         // wrap into a Data packet; the test uses an opaque ciphertext.
@@ -3575,9 +3748,11 @@ mod tests {
             destination_hash: client_dest_hash,
         });
 
-        // Peer's interface sends Header1 because the path has no next_hop from
-        // announce relay.
+        // Peer's interface sends Header2 addressed to the hub learned from
+        // the transport announce.
         let peer_sent = peer_rx.try_recv().unwrap();
+        let (peer_sent_header, _) = rns_wire::header::PacketHeader::unpack(&peer_sent).unwrap();
+        assert_eq!(peer_sent_header.transport_id, Some(hub_transport_id));
 
         // Hub receives the Data from the peer.
         hub.on_inbound(InboundPacket {
@@ -3592,11 +3767,15 @@ mod tests {
         // interface 2, so process_data() forwards it.
         let hub_forwarded = hub_rx2.try_recv().unwrap();
 
-        // Verify hub forwarded as Header1 with hops incremented.
+        // Verify hub forwarded final hop as Header1 with inbound-adjusted hops.
         let (fwd_hdr, fwd_offset) = rns_wire::header::PacketHeader::unpack(&hub_forwarded).unwrap();
         assert_eq!(fwd_hdr.flags.packet_type, rns_wire::flags::PacketType::Data);
+        assert_eq!(
+            fwd_hdr.flags.header_type,
+            rns_wire::flags::HeaderType::Header1
+        );
         assert_eq!(fwd_hdr.destination_hash, client_dest_hash);
-        assert_eq!(fwd_hdr.hops, 1); // incremented from 0
+        assert_eq!(fwd_hdr.hops, 1);
         assert_eq!(&hub_forwarded[fwd_offset..], lxmf_ciphertext);
 
         // Client receives the forwarded Data.
@@ -3628,6 +3807,8 @@ mod tests {
     fn test_bidirectional_via_hub() {
         let (mut hub, _hub_tx) = TransportActor::new();
         hub.is_transport_enabled = true;
+        let hub_transport_id = [0xAA; 16];
+        hub.transport_identity_hash = Some(hub_transport_id);
 
         let (hub_iface1, mut hub_rx1) = make_test_interface("hub_to_tdeck");
         let (hub_iface2, mut hub_rx2) = make_test_interface("hub_to_rust");
@@ -3638,19 +3819,19 @@ mod tests {
         let tdeck_dest = [0x11; 16];
         let rust_dest = [0x22; 16];
 
-        // Path to T-Deck: via interface 1, direct
+        // Path to T-Deck: via interface 1, direct final hop
         hub.path_table.insert(
             tdeck_dest,
-            crate::path_table::PathEntry::new(None, 0, 1, InterfaceMode::Gateway),
+            crate::path_table::PathEntry::new(None, 1, 1, InterfaceMode::Gateway),
         );
-        // Path to Rust: via interface 2, direct
+        // Path to Rust: via interface 2, direct final hop
         hub.path_table.insert(
             rust_dest,
-            crate::path_table::PathEntry::new(None, 0, 2, InterfaceMode::Gateway),
+            crate::path_table::PathEntry::new(None, 1, 2, InterfaceMode::Gateway),
         );
 
         // T-Deck → Hub → Rust
-        let msg_a = make_data_packet(rust_dest, 0);
+        let msg_a = make_header2_data_packet(hub_transport_id, rust_dest, 0, b"a");
         hub.on_inbound(InboundPacket {
             raw: msg_a,
             interface_id: 1,
@@ -3665,7 +3846,7 @@ mod tests {
         assert_eq!(hdr_a.destination_hash, rust_dest);
 
         // Rust → Hub → T-Deck
-        let msg_b = make_data_packet(tdeck_dest, 0);
+        let msg_b = make_header2_data_packet(hub_transport_id, tdeck_dest, 0, b"b");
         hub.on_inbound(InboundPacket {
             raw: msg_b,
             interface_id: 2,
@@ -3684,6 +3865,8 @@ mod tests {
     fn test_packet_hash_dedup_header1_then_header2() {
         let (mut actor, _tx) = TransportActor::new();
         actor.is_transport_enabled = true;
+        let transport_id = [0xBB; 16];
+        actor.transport_identity_hash = Some(transport_id);
 
         let (entry1, _rx1) = make_test_interface("iface1");
         let (entry2, mut rx2) = make_test_interface("iface2");
@@ -3696,10 +3879,10 @@ mod tests {
             crate::path_table::PathEntry::new(Some([0xAA; 16]), 1, 2, InterfaceMode::Gateway),
         );
 
-        // Inject Header1 Data
-        let raw_h1 = make_data_packet(dest_hash, 0);
+        // Inject Header2 Data addressed to this transport.
+        let raw_h2 = make_header2_data_packet(transport_id, dest_hash, 0, b"dedupe");
         actor.on_inbound(InboundPacket {
-            raw: raw_h1.clone(),
+            raw: raw_h2.clone(),
             interface_id: 1,
             rssi: None,
             snr: None,
@@ -3709,9 +3892,9 @@ mod tests {
         // First packet should be forwarded
         assert!(rx2.try_recv().is_ok());
 
-        // Now inject the exact same packet again — should be deduplicated
+        // Now inject the exact same packet again — should be deduplicated.
         actor.on_inbound(InboundPacket {
-            raw: raw_h1,
+            raw: raw_h2,
             interface_id: 1,
             rssi: None,
             snr: None,
@@ -4991,6 +5174,48 @@ mod tests {
         let payload = &raw[offset..];
         assert_eq!(payload.len(), 32);
         assert_eq!(&payload[..16], &requested);
+    }
+
+    #[test]
+    fn explicit_path_request_sends_even_when_path_is_known() {
+        let (mut actor, _tx) = TransportActor::new();
+        let (gateway, mut gateway_rx) = make_test_interface("gateway");
+        actor.interfaces.insert(1, gateway);
+
+        let requested = [0x35; 16];
+        actor.path_table.insert(
+            requested,
+            crate::path_table::PathEntry::new(None, 1, 1, InterfaceMode::Gateway),
+        );
+
+        actor.on_path_request(requested);
+
+        let raw = gateway_rx
+            .try_recv()
+            .expect("explicit path refresh should still send");
+        let (_, offset) = rns_wire::header::PacketHeader::unpack(&raw).unwrap();
+        assert_eq!(&raw[offset..offset + 16], &requested);
+    }
+
+    #[test]
+    fn await_path_requests_unknown_path_before_waiting() {
+        let (mut actor, _tx) = TransportActor::new();
+        let (gateway, mut gateway_rx) = make_test_interface("gateway");
+        actor.interfaces.insert(1, gateway);
+
+        let requested = [0x34; 16];
+        let (reply, _reply_rx) = tokio::sync::oneshot::channel();
+        actor.handle_message(TransportMessage::AwaitPath {
+            dest: requested,
+            reply,
+        });
+
+        let raw = gateway_rx
+            .try_recv()
+            .expect("awaiting an unknown path should emit a path request");
+        let (_, offset) = rns_wire::header::PacketHeader::unpack(&raw).unwrap();
+        assert_eq!(&raw[offset..offset + 16], &requested);
+        assert!(actor.path_waiters.contains_key(&requested));
     }
 
     #[test]

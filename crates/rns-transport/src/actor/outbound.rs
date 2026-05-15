@@ -128,7 +128,7 @@ impl TransportActor {
                         "outbound: no path, broadcasting"
                     );
                     self.broadcast_on_interfaces(&request.raw, None);
-                    self.on_path_request(request.destination_hash);
+                    self.on_automatic_path_request(request.destination_hash);
                 }
             }
         }
@@ -596,20 +596,22 @@ impl TransportActor {
     }
 
     pub(super) fn on_path_request(&mut self, destination_hash: [u8; 16]) {
-        let now = now_f64();
+        self.broadcast_path_request(destination_hash);
+    }
 
-        if let Some(last) = self.path_requests.get(&destination_hash) {
-            if now - last < PATH_REQUEST_MI {
-                return;
-            }
-        }
-
-        self.path_requests.insert(destination_hash, now);
-
+    pub(super) fn on_automatic_path_request(&mut self, destination_hash: [u8; 16]) {
         if self.path_table.has_path(&destination_hash) {
             return;
         }
+        if let Some(last) = self.path_requests.get(&destination_hash) {
+            if now_f64() - last < PATH_REQUEST_MI {
+                return;
+            }
+        }
+        self.broadcast_path_request(destination_hash);
+    }
 
+    fn broadcast_path_request(&mut self, destination_hash: [u8; 16]) {
         let mut request_tag = [0u8; 16];
         {
             use rand::RngCore;

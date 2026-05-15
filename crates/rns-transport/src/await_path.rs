@@ -2,7 +2,8 @@
 //!
 //! Mirrors Python `Transport.await_path(destination_hash, timeout=None)`
 //! (RNS/Transport.py:2524). The helper sends an [`AwaitPath`] actor
-//! message and races the oneshot reply against a caller-supplied timeout.
+//! message and races the oneshot reply against a caller-supplied timeout. The
+//! actor emits the upstream-compatible path request before parking the waiter.
 //!
 //! [`AwaitPath`]: crate::messages::TransportMessage::AwaitPath
 

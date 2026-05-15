@@ -15,7 +15,7 @@ pub struct AnnounceEntry {
     pub received_from: [u8; 16],
     /// Hop count as observed on receipt.
     pub hops: u8,
-    /// Outbound packet bytes with the hop count already incremented.
+    /// Outbound packet bytes with the Python-parity inbound-adjusted hop count.
     pub packet_raw: Vec<u8>,
     /// Count of duplicate rebroadcasts heard from neighbours — used to suppress flooding.
     pub local_rebroadcasts: u32,
