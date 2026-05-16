@@ -3771,13 +3771,12 @@ mod tests {
         assert_eq!(active_after.interface_id, 1);
         assert!(active_after.has_random_blob(&active_blob));
         assert!(
-            actor
+            !actor
                 .tunnel_table
                 .get(&tunnel_id)
                 .unwrap()
                 .tunnel_paths
-                .get(&dest_hash)
-                .is_none(),
+                .contains_key(&dest_hash),
             "older tunnel path should be pruned after losing freshness comparison"
         );
     }

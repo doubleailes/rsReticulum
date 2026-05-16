@@ -453,7 +453,7 @@ async fn open_usb_serial(
 
             let cw = connected.clone();
             let vm = match JAVA_VM.get() {
-                Some(v) => v.clone(),
+                Some(v) => v,
                 None => return Err("JavaVM not initialized for USB write loop".into()),
             };
             let cr_w = conn_ref.clone();
@@ -487,7 +487,7 @@ async fn open_usb_serial(
 
             let cr = connected.clone();
             let vm2 = match JAVA_VM.get() {
-                Some(v) => v.clone(),
+                Some(v) => v,
                 None => return Err("JavaVM not initialized for USB read loop".into()),
             };
             tokio::task::spawn_blocking(move || {

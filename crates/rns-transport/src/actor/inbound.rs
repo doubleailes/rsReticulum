@@ -865,10 +865,8 @@ impl TransportActor {
             return None;
         }
 
-        if !may_forward_for_shared_client {
-            if !self.is_transport_enabled || !addressed_to_us {
-                return None;
-            }
+        if !may_forward_for_shared_client && (!self.is_transport_enabled || !addressed_to_us) {
+            return None;
         }
 
         let forwarded = self.rewrite_forwarded_transport_packet(raw, header, path)?;
