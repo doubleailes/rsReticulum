@@ -2862,7 +2862,7 @@ mod android_peripheral {
         if raw.is_null() {
             return String::new();
         }
-        let jstr: jni::objects::JString = unsafe { jni::objects::JObject::from(raw) }.into();
+        let jstr: jni::objects::JString = jni::objects::JObject::from(raw).into();
         env.get_string(jstr)
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_default()
@@ -2942,6 +2942,7 @@ mod android_peripheral {
     /// characteristic, optionally excluding `exclude_address` (used by the
     /// anti-loop filter to skip echoing a packet back to the peer it arrived
     /// from). Returns the number of subscribers we attempted to notify.
+    #[allow(dead_code)]
     pub fn broadcast_notify_tx(char_uuid: Uuid, data: &[u8], exclude_address: Option<&str>) -> i32 {
         with_env(|env| {
             let server_cls = find_app_class(env, "org.ratspeak.android.RatspeakBleServer")
@@ -4121,7 +4122,10 @@ mod windows_peripheral {
 /// own `CBCentralManager` and two managers in one process don't share
 /// peripheral caches on macOS); Android drives the same primitives via JNI
 /// in `RatspeakBlePeerClient.kt`.
-#[cfg(all(feature = "ble", not(any(target_os = "ios", target_os = "macos"))))]
+#[cfg(all(
+    feature = "ble",
+    not(any(target_os = "android", target_os = "ios", target_os = "macos"))
+))]
 struct MeshPeerConnection {
     peripheral: btleplug::platform::Peripheral,
     rx_char: btleplug::api::Characteristic,
@@ -4141,7 +4145,10 @@ struct MeshPeerConnection {
 ///
 /// Linux + Windows only — see [`MeshPeerConnection`] header for why Apple
 /// uses a parallel native path.
-#[cfg(all(feature = "ble", not(any(target_os = "ios", target_os = "macos"))))]
+#[cfg(all(
+    feature = "ble",
+    not(any(target_os = "android", target_os = "ios", target_os = "macos"))
+))]
 async fn connect_mesh_peer(
     adapter: &btleplug::platform::Adapter,
     peer: &BlePeer,
@@ -4289,7 +4296,10 @@ async fn connect_mesh_peer(
 /// to transport. Linux + Windows only — Apple's notify delegate pushes
 /// directly into `apple_peripheral::INBOUND_TX` so the global per-peer
 /// reassembler handles inbound without a per-connection task.
-#[cfg(all(feature = "ble", not(any(target_os = "ios", target_os = "macos"))))]
+#[cfg(all(
+    feature = "ble",
+    not(any(target_os = "android", target_os = "ios", target_os = "macos"))
+))]
 struct PeerReadLoopCtx {
     interface_id: InterfaceId,
     transport_tx: mpsc::Sender<TransportMessage>,
@@ -4301,7 +4311,10 @@ struct PeerReadLoopCtx {
     anti_loop: AntiLoopMap,
 }
 
-#[cfg(all(feature = "ble", not(any(target_os = "ios", target_os = "macos"))))]
+#[cfg(all(
+    feature = "ble",
+    not(any(target_os = "android", target_os = "ios", target_os = "macos"))
+))]
 async fn peer_read_loop(conn: MeshPeerConnection, ctx: PeerReadLoopCtx) {
     let PeerReadLoopCtx {
         interface_id,
@@ -4473,7 +4486,10 @@ async fn peer_read_loop(conn: MeshPeerConnection, ctx: PeerReadLoopCtx) {
 /// characteristic via btleplug. Linux + Windows only — Apple's outbound
 /// path lives inline in the spawn body and calls
 /// `ble_central_apple_connect::write_peer` per fragment.
-#[cfg(all(feature = "ble", not(any(target_os = "ios", target_os = "macos"))))]
+#[cfg(all(
+    feature = "ble",
+    not(any(target_os = "android", target_os = "ios", target_os = "macos"))
+))]
 async fn peer_write_loop(
     peripheral: btleplug::platform::Peripheral,
     rx_char: btleplug::api::Characteristic,
@@ -5201,7 +5217,6 @@ pub async fn spawn_ble_peer_interface(
         tokio::spawn(async move {
             let mut connected_addrs: HashMap<String, Arc<AtomicBool>> = HashMap::new();
             let mut scan_interval = SCAN_ACTIVE_INTERVAL;
-
             loop {
                 if !running_flag().load(Ordering::SeqCst) {
                     tracing::info!("Apple BLE mesh Central scan loop: shutdown signal, exiting");
@@ -5479,7 +5494,6 @@ pub async fn spawn_ble_peer_interface(
             // new peer powers on, long enough to catch low-duty-cycle adverts.
             const SCAN_TIMEOUT_MS: i64 = 3000;
             let mut connected_addrs: HashMap<String, Arc<AtomicBool>> = HashMap::new();
-            let mut scan_interval = SCAN_ACTIVE_INTERVAL;
 
             loop {
                 if !running_flag().load(Ordering::SeqCst) {
@@ -5518,12 +5532,12 @@ pub async fn spawn_ble_peer_interface(
                 .await
                 .unwrap_or_default();
 
-                scan_interval = if !scan_results.is_empty() || has_wanted_reconnects(&recently_disc)
-                {
-                    SCAN_ACTIVE_INTERVAL
-                } else {
-                    SCAN_IDLE_INTERVAL
-                };
+                let scan_interval =
+                    if !scan_results.is_empty() || has_wanted_reconnects(&recently_disc) {
+                        SCAN_ACTIVE_INTERVAL
+                    } else {
+                        SCAN_IDLE_INTERVAL
+                    };
 
                 for (addr, rssi, protocol) in &scan_results {
                     if connected_addrs.contains_key(addr) {
