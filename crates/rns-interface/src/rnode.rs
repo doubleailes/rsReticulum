@@ -344,6 +344,94 @@ fn read_rnode_stream(
     }
 }
 
+#[cfg(feature = "serial")]
+async fn open_configured_rnode_stream(
+    config: &RNodeConfig,
+    port_cfg: &PortConfig,
+) -> Result<RNodeStream, crate::traits::InterfaceError> {
+    let port = match port_cfg {
+        PortConfig::Serial { path, baud } => {
+            tracing::info!(
+                name = %config.name,
+                port = %path,
+                baud = baud,
+                "RNode serial interface opening"
+            );
+            RNodeStream::open_serial(path, *baud).map_err(|e| {
+                crate::traits::InterfaceError::SendFailed(format!("rnode serial open: {}", e))
+            })?
+        }
+        PortConfig::Tcp { addr } => {
+            tracing::info!(
+                name = %config.name,
+                addr = %addr,
+                "RNode TCP interface connecting"
+            );
+            let addr = addr.clone();
+            tokio::task::spawn_blocking(move || RNodeStream::connect_tcp(&addr))
+                .await
+                .map_err(|e| {
+                    crate::traits::InterfaceError::SendFailed(format!("rnode tcp spawn: {}", e))
+                })?
+                .map_err(|e| {
+                    crate::traits::InterfaceError::SendFailed(format!("rnode tcp connect: {}", e))
+                })?
+        }
+    };
+
+    tracing::info!(
+        name = %config.name,
+        endpoint = %port.description(),
+        freq = config.frequency,
+        bw = config.bandwidth,
+        sf = config.spreading_factor,
+        "RNode interface opened"
+    );
+
+    {
+        let mut detect_port = port.try_clone().map_err(|e| {
+            crate::traits::InterfaceError::SendFailed(format!("rnode clone: {}", e))
+        })?;
+        let detect_seq = build_detect_sequence();
+        use std::io::Write;
+        detect_port.write_all(&detect_seq).map_err(|e| {
+            crate::traits::InterfaceError::SendFailed(format!("rnode detect write: {}", e))
+        })?;
+        detect_port.flush().map_err(|e| {
+            crate::traits::InterfaceError::SendFailed(format!("rnode detect flush: {}", e))
+        })?;
+    }
+
+    {
+        let mut init_port = port.try_clone().map_err(|e| {
+            crate::traits::InterfaceError::SendFailed(format!("rnode clone: {}", e))
+        })?;
+        let mut init_seq = build_init_sequence(config);
+        init_seq.extend_from_slice(&build_airtime_sequence(config));
+        use std::io::Write;
+        init_port.write_all(&init_seq).map_err(|e| {
+            crate::traits::InterfaceError::SendFailed(format!("rnode init write: {}", e))
+        })?;
+        init_port.flush().map_err(|e| {
+            crate::traits::InterfaceError::SendFailed(format!("rnode init flush: {}", e))
+        })?;
+    }
+
+    Ok(port)
+}
+
+#[cfg(feature = "serial")]
+fn reconnect_delay() -> Duration {
+    #[cfg(test)]
+    {
+        Duration::from_millis(100)
+    }
+    #[cfg(not(test))]
+    {
+        Duration::from_secs(RECONNECT_WAIT)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct RNodeConfig {
     pub name: String,
@@ -599,75 +687,7 @@ pub async fn spawn_rnode_interface(
         crate::traits::InterfaceError::SendFailed(format!("rnode port parse: {}", e))
     })?;
 
-    let port = match &port_cfg {
-        PortConfig::Serial { path, baud } => {
-            tracing::info!(
-                name = %config.name,
-                port = %path,
-                baud = baud,
-                "RNode serial interface opening"
-            );
-            RNodeStream::open_serial(path, *baud).map_err(|e| {
-                crate::traits::InterfaceError::SendFailed(format!("rnode serial open: {}", e))
-            })?
-        }
-        PortConfig::Tcp { addr } => {
-            tracing::info!(
-                name = %config.name,
-                addr = %addr,
-                "RNode TCP interface connecting"
-            );
-            // TcpStream::connect is blocking; run it off the async executor.
-            let addr = addr.clone();
-            tokio::task::spawn_blocking(move || RNodeStream::connect_tcp(&addr))
-                .await
-                .map_err(|e| {
-                    crate::traits::InterfaceError::SendFailed(format!("rnode tcp spawn: {}", e))
-                })?
-                .map_err(|e| {
-                    crate::traits::InterfaceError::SendFailed(format!("rnode tcp connect: {}", e))
-                })?
-        }
-    };
-
-    tracing::info!(
-        name = %config.name,
-        endpoint = %port.description(),
-        freq = config.frequency,
-        bw = config.bandwidth,
-        sf = config.spreading_factor,
-        "RNode interface opened"
-    );
-
-    // Detect first so firmware version is known before init.
-    {
-        let mut detect_port = port.try_clone().map_err(|e| {
-            crate::traits::InterfaceError::SendFailed(format!("rnode clone: {}", e))
-        })?;
-        let detect_seq = build_detect_sequence();
-        use std::io::Write;
-        detect_port.write_all(&detect_seq).map_err(|e| {
-            crate::traits::InterfaceError::SendFailed(format!("rnode detect write: {}", e))
-        })?;
-        detect_port.flush().map_err(|e| {
-            crate::traits::InterfaceError::SendFailed(format!("rnode detect flush: {}", e))
-        })?;
-    }
-
-    {
-        let mut init_port = port.try_clone().map_err(|e| {
-            crate::traits::InterfaceError::SendFailed(format!("rnode clone: {}", e))
-        })?;
-        let mut init_seq = build_init_sequence(&config);
-        init_seq.extend_from_slice(&build_airtime_sequence(&config));
-        use std::io::Write;
-        init_port.write_all(&init_seq).map_err(|e| {
-            crate::traits::InterfaceError::SendFailed(format!("rnode init write: {}", e))
-        })?;
-        init_port.flush().map_err(|e| {
-            crate::traits::InterfaceError::SendFailed(format!("rnode init flush: {}", e))
-        })?;
-    }
+    let port = open_configured_rnode_stream(&config, &port_cfg).await?;
 
     let bitrate = calculate_bitrate(
         config.spreading_factor,
@@ -683,117 +703,176 @@ pub async fn spawn_rnode_interface(
     let online = Arc::new(AtomicBool::new(true));
     let shared_rxb = Arc::new(AtomicU64::new(0));
     let shared_txb = Arc::new(AtomicU64::new(0));
-    let (tx, mut rx) = mpsc::channel::<Bytes>(256);
+    let (tx, rx) = mpsc::channel::<Bytes>(256);
+    let rx = Arc::new(tokio::sync::Mutex::new(rx));
     let name = config.name.clone();
     let mode = config.mode;
     let flow_control = config.flow_control;
 
-    let port_write = port
-        .try_clone()
-        .map_err(|e| crate::traits::InterfaceError::SendFailed(format!("rnode clone: {}", e)))?;
-
-    let ready = Arc::new(AtomicBool::new(true));
-
-    let online_w = online.clone();
-    let ready_w = ready.clone();
-    let txb_w = shared_txb.clone();
-    tokio::spawn(async move {
-        let mut port_w = port_write;
-        while let Some(data) = rx.recv().await {
-            txb_w.fetch_add(data.len() as u64, std::sync::atomic::Ordering::Relaxed);
-            if flow_control {
-                while !ready_w.load(Ordering::SeqCst) {
-                    tokio::time::sleep(Duration::from_millis(10)).await;
-                    if !online_w.load(Ordering::SeqCst) {
-                        return;
-                    }
-                }
-            }
-            let framed = kiss::frame(&data);
-            let online_ref = online_w.clone();
-            let result = tokio::task::spawn_blocking(move || {
-                use std::io::Write;
-                port_w.write_all(&framed)?;
-                port_w.flush()?;
-                Ok::<_, std::io::Error>(port_w)
-            })
-            .await;
-            match result {
-                Ok(Ok(p)) => {
-                    port_w = p;
-                }
-                Ok(Err(e)) => {
-                    tracing::warn!(error = %e, "RNode write error");
-                    online_ref.store(false, Ordering::SeqCst);
-                    break;
-                }
-                Err(e) => {
-                    tracing::warn!(error = %e, "RNode write task panicked");
-                    break;
-                }
-            }
-        }
-    });
-
     let online_r = online.clone();
-    let ready_r = ready;
     let rxb_r = shared_rxb.clone();
+    let txb_r = shared_txb.clone();
+    let task_config = config.clone();
+    let task_port_cfg = port_cfg.clone();
+    let task_name = config.name.clone();
     let read_task = tokio::spawn(async move {
-        let mut port_r = port;
-        let mut deframer = kiss::RawKissDeframer::new();
-        let mut buf = [0u8; 1024];
-        let mut last_rssi: Option<f32> = None;
-        let mut last_snr: Option<f32> = None;
+        let mut next_port = Some(port);
 
         loop {
-            if !online_r.load(Ordering::SeqCst) {
-                break;
-            }
-            let result = tokio::task::spawn_blocking(move || read_rnode_stream(port_r, buf)).await;
+            let mut port_r = match next_port.take() {
+                Some(port) => port,
+                None => match open_configured_rnode_stream(&task_config, &task_port_cfg).await {
+                    Ok(port) => port,
+                    Err(e) => {
+                        online_r.store(false, Ordering::SeqCst);
+                        tracing::warn!(
+                            name = %task_name,
+                            error = %e,
+                            "RNode reconnect failed"
+                        );
+                        tokio::time::sleep(reconnect_delay()).await;
+                        continue;
+                    }
+                },
+            };
 
-            match result {
-                Ok(Ok((p, b, n))) => {
-                    port_r = p;
-                    buf = b;
-                    if n > 0 {
-                        for (cmd, frame) in deframer.feed(&buf[..n]) {
-                            match process_rnode_response(
-                                cmd,
-                                &frame,
-                                id,
-                                &mut last_rssi,
-                                &mut last_snr,
-                            ) {
-                                RNodeResponse::Packet(msg) => {
-                                    rxb_r.fetch_add(
-                                        frame.len() as u64,
-                                        std::sync::atomic::Ordering::Relaxed,
-                                    );
-                                    if transport_tx.send(msg).await.is_err() {
-                                        tracing::warn!(id, "transport channel closed");
-                                        online_r.store(false, Ordering::SeqCst);
-                                        return;
-                                    }
-                                }
-                                RNodeResponse::Ready(is_ready) => {
-                                    ready_r.store(is_ready, Ordering::SeqCst);
-                                }
-                                RNodeResponse::None => {}
+            online_r.store(true, Ordering::SeqCst);
+            let port_write = match port_r.try_clone() {
+                Ok(port) => port,
+                Err(e) => {
+                    tracing::warn!(error = %e, "RNode clone failed before reconnect");
+                    online_r.store(false, Ordering::SeqCst);
+                    tokio::time::sleep(reconnect_delay()).await;
+                    continue;
+                }
+            };
+
+            let ready = Arc::new(AtomicBool::new(true));
+            let (conn_tx, mut conn_rx) = mpsc::channel::<Bytes>(256);
+
+            let online_w = online_r.clone();
+            let ready_w = ready.clone();
+            let txb_w = txb_r.clone();
+            let write_handle = tokio::spawn(async move {
+                let mut port_w = port_write;
+                while let Some(data) = conn_rx.recv().await {
+                    txb_w.fetch_add(data.len() as u64, std::sync::atomic::Ordering::Relaxed);
+                    if flow_control {
+                        while !ready_w.load(Ordering::SeqCst) {
+                            tokio::time::sleep(Duration::from_millis(10)).await;
+                            if !online_w.load(Ordering::SeqCst) {
+                                return;
                             }
                         }
                     }
+                    let framed = kiss::frame(&data);
+                    let online_ref = online_w.clone();
+                    let result = tokio::task::spawn_blocking(move || {
+                        use std::io::Write;
+                        port_w.write_all(&framed)?;
+                        port_w.flush()?;
+                        Ok::<_, std::io::Error>(port_w)
+                    })
+                    .await;
+                    match result {
+                        Ok(Ok(p)) => {
+                            port_w = p;
+                        }
+                        Ok(Err(e)) => {
+                            tracing::warn!(error = %e, "RNode write error");
+                            online_ref.store(false, Ordering::SeqCst);
+                            break;
+                        }
+                        Err(e) => {
+                            tracing::warn!(error = %e, "RNode write task panicked");
+                            online_ref.store(false, Ordering::SeqCst);
+                            break;
+                        }
+                    }
                 }
-                Ok(Err((_p, e))) => {
-                    tracing::warn!(error = %e, "RNode read error");
-                    online_r.store(false, Ordering::SeqCst);
-                    return;
+            });
+
+            let rx_ref = rx.clone();
+            let fwd_handle = tokio::spawn(async move {
+                let mut guard = rx_ref.lock().await;
+                while let Some(data) = guard.recv().await {
+                    if conn_tx.send(data).await.is_err() {
+                        break;
+                    }
                 }
-                Err(e) => {
-                    tracing::warn!(error = %e, "RNode read task panicked");
-                    online_r.store(false, Ordering::SeqCst);
-                    return;
+            });
+
+            let mut deframer = kiss::RawKissDeframer::new();
+            let mut buf = [0u8; 1024];
+            let mut last_rssi: Option<f32> = None;
+            let mut last_snr: Option<f32> = None;
+            let mut transport_closed = false;
+
+            loop {
+                if !online_r.load(Ordering::SeqCst) {
+                    break;
+                }
+                let result =
+                    tokio::task::spawn_blocking(move || read_rnode_stream(port_r, buf)).await;
+
+                match result {
+                    Ok(Ok((p, b, n))) => {
+                        port_r = p;
+                        buf = b;
+                        if n > 0 {
+                            for (cmd, frame) in deframer.feed(&buf[..n]) {
+                                match process_rnode_response(
+                                    cmd,
+                                    &frame,
+                                    id,
+                                    &mut last_rssi,
+                                    &mut last_snr,
+                                ) {
+                                    RNodeResponse::Packet(msg) => {
+                                        rxb_r.fetch_add(
+                                            frame.len() as u64,
+                                            std::sync::atomic::Ordering::Relaxed,
+                                        );
+                                        if transport_tx.send(msg).await.is_err() {
+                                            tracing::warn!(id, "transport channel closed");
+                                            transport_closed = true;
+                                            break;
+                                        }
+                                    }
+                                    RNodeResponse::Ready(is_ready) => {
+                                        ready.store(is_ready, Ordering::SeqCst);
+                                    }
+                                    RNodeResponse::None => {}
+                                }
+                            }
+                            if transport_closed {
+                                break;
+                            }
+                        }
+                    }
+                    Ok(Err((_p, e))) => {
+                        tracing::warn!(error = %e, "RNode read error");
+                        break;
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "RNode read task panicked");
+                        break;
+                    }
                 }
             }
+
+            online_r.store(false, Ordering::SeqCst);
+            fwd_handle.abort();
+            let _ = fwd_handle.await;
+            write_handle.abort();
+            let _ = write_handle.await;
+
+            if transport_closed {
+                return;
+            }
+
+            tracing::info!(name = %task_name, "RNode reconnecting");
+            tokio::time::sleep(reconnect_delay()).await;
         }
     });
 
@@ -1018,6 +1097,7 @@ mod tests {
         });
 
         let stream = RNodeStream::connect_tcp(&addr.to_string()).unwrap();
+        let _clone = stream.try_clone().unwrap();
         accept.join().unwrap();
 
         match read_rnode_stream(stream, [0u8; 1024]) {
@@ -1042,5 +1122,68 @@ mod tests {
 
         drop(stream);
         accept.join().unwrap();
+    }
+
+    #[cfg(feature = "serial")]
+    #[tokio::test]
+    async fn test_rnode_tcp_reconnects_after_eof() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let config = RNodeConfig::new("rnode-tcp", &format!("tcp://{addr}"));
+        let expected_init_len = build_detect_sequence().len()
+            + build_init_sequence(&config).len()
+            + build_airtime_sequence(&config).len();
+        let (accepted_tx, mut accepted_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let server = std::thread::spawn(move || {
+            for attempt in 1..=2 {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+
+                let mut buf = [0u8; 512];
+                let mut total = 0usize;
+                while total < expected_init_len {
+                    match std::io::Read::read(&mut stream, &mut buf) {
+                        Ok(0) => break,
+                        Ok(n) => total += n,
+                        Err(_) => break,
+                    }
+                }
+                if attempt == 2 {
+                    accepted_tx.send(attempt).unwrap();
+                    std::thread::sleep(Duration::from_millis(500));
+                } else {
+                    let _ = stream.shutdown(std::net::Shutdown::Both);
+                    accepted_tx.send(attempt).unwrap();
+                }
+            }
+        });
+
+        let (transport_tx, _transport_rx) = mpsc::channel::<TransportMessage>(8);
+        let handle = spawn_rnode_interface(config, 77, transport_tx)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), accepted_rx.recv())
+                .await
+                .unwrap()
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(7), accepted_rx.recv())
+                .await
+                .unwrap()
+                .unwrap(),
+            2
+        );
+        assert!(handle.online.load(Ordering::SeqCst));
+
+        handle.read_task.abort();
+        drop(handle.tx);
+        server.join().unwrap();
     }
 }
