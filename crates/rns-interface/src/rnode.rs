@@ -111,6 +111,8 @@ pub const DEFAULT_TCP_PORT: u16 = 7633;
 
 #[cfg(feature = "serial")]
 const RNODE_READ_TIMEOUT_MS: u64 = 100;
+#[cfg(feature = "serial")]
+const RNODE_TCP_CONNECT_TIMEOUT_SECS: u64 = 5;
 
 // Transport abstraction
 
@@ -167,7 +169,29 @@ impl RNodeStream {
 
     /// Connect to a TCP socket (blocking).
     pub fn connect_tcp(addr: &str) -> std::io::Result<Self> {
-        let stream = std::net::TcpStream::connect(addr)?;
+        Self::connect_tcp_with_timeout(addr, Duration::from_secs(RNODE_TCP_CONNECT_TIMEOUT_SECS))
+    }
+
+    fn connect_tcp_with_timeout(addr: &str, timeout: Duration) -> std::io::Result<Self> {
+        use std::net::ToSocketAddrs;
+
+        let mut last_error = None;
+        for socket_addr in addr.to_socket_addrs()? {
+            match std::net::TcpStream::connect_timeout(&socket_addr, timeout) {
+                Ok(stream) => return Self::from_tcp_stream(stream),
+                Err(e) => last_error = Some(e),
+            }
+        }
+
+        Err(last_error.unwrap_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::AddrNotAvailable,
+                format!("no socket addresses resolved for {addr}"),
+            )
+        }))
+    }
+
+    fn from_tcp_stream(stream: std::net::TcpStream) -> std::io::Result<Self> {
         // Mirror the serial timeout so the read loop doesn't block forever.
         stream.set_read_timeout(Some(Duration::from_millis(RNODE_READ_TIMEOUT_MS)))?;
         Ok(Self::Tcp(stream))
@@ -873,5 +897,23 @@ mod tests {
             Ok(_) => panic!("closed TCP socket should be EOF"),
             Err((_stream, err)) => assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof),
         }
+    }
+
+    #[cfg(feature = "serial")]
+    #[test]
+    fn test_tcp_connect_accepts_timeout() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let accept = std::thread::spawn(move || {
+            let (_stream, _) = listener.accept().unwrap();
+        });
+
+        let stream =
+            RNodeStream::connect_tcp_with_timeout(&addr.to_string(), Duration::from_millis(500))
+                .unwrap();
+        assert!(stream.is_tcp());
+
+        drop(stream);
+        accept.join().unwrap();
     }
 }
