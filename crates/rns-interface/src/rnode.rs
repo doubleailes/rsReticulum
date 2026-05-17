@@ -3,9 +3,9 @@
 //! [`spawn_rnode_interface`] (feature `serial`); BLE: [`crate::ble_rnode`].
 //!
 //! Transport selection is driven by the `port` string in [`RNodeConfig`]:
-//!   - `/dev/ttyUSB0`, `COM3`, etc.  → serial (feature `serial` required)
-//!   - `tcp://192.168.1.1`           → TCP, default port 7633
-//!   - `tcp://192.168.1.1:9000`      → TCP, explicit port
+//!   - `/dev/ttyUSB0`, `COM3`, etc.  -> serial (feature `serial` required)
+//!   - `tcp://192.168.1.1`           -> TCP, default port 7633
+//!   - `tcp://192.168.1.1:9000`      -> TCP, explicit port
 
 use bytes::Bytes;
 
@@ -222,7 +222,7 @@ impl RNodeStream {
         let port = serialport::new(path, baud)
             .timeout(Duration::from_millis(RNODE_READ_TIMEOUT_MS))
             .open()
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+            .map_err(std::io::Error::other)?;
         Ok(Self::Serial(port))
     }
 
@@ -262,11 +262,7 @@ impl RNodeStream {
     /// - TCP: uses `TcpStream::try_clone` (both halves share the same fd).
     pub fn try_clone(&self) -> std::io::Result<Self> {
         match self {
-            Self::Serial(p) => {
-                Ok(Self::Serial(p.try_clone().map_err(|e| {
-                    std::io::Error::new(std::io::ErrorKind::Other, e)
-                })?))
-            }
+            Self::Serial(p) => Ok(Self::Serial(p.try_clone().map_err(std::io::Error::other)?)),
             Self::Tcp(s) => Ok(Self::Tcp(s.try_clone()?)),
         }
     }
@@ -313,11 +309,6 @@ impl std::io::Write for RNodeStream {
         }
     }
 }
-
-// Safety: TcpStream is Send; serialport's Box<dyn SerialPort> is Send on all
-// platforms the crate targets.
-#[cfg(feature = "serial")]
-unsafe impl Send for RNodeStream {}
 
 #[cfg(feature = "serial")]
 fn read_rnode_stream(
