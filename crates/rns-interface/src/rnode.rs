@@ -179,10 +179,11 @@ impl RNodeStream {
     /// - TCP: uses `TcpStream::try_clone` (both halves share the same fd).
     pub fn try_clone(&self) -> std::io::Result<Self> {
         match self {
-            Self::Serial(p) => Ok(Self::Serial(
-                p.try_clone()
-                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?,
-            )),
+            Self::Serial(p) => {
+                Ok(Self::Serial(p.try_clone().map_err(|e| {
+                    std::io::Error::new(std::io::ErrorKind::Other, e)
+                })?))
+            }
             Self::Tcp(s) => Ok(Self::Tcp(s.try_clone()?)),
         }
     }
@@ -190,14 +191,16 @@ impl RNodeStream {
     /// Human-readable description for log messages.
     pub fn description(&self) -> String {
         match self {
-            Self::Serial(p) => p
-                .name()
-                .unwrap_or_else(|| "<unknown serial>".to_string()),
+            Self::Serial(p) => p.name().unwrap_or_else(|| "<unknown serial>".to_string()),
             Self::Tcp(s) => s
                 .peer_addr()
                 .map(|a| a.to_string())
                 .unwrap_or_else(|_| "<unknown tcp>".to_string()),
         }
+    }
+
+    fn is_tcp(&self) -> bool {
+        matches!(self, Self::Tcp(_))
     }
 }
 
@@ -232,6 +235,31 @@ impl std::io::Write for RNodeStream {
 // platforms the crate targets.
 #[cfg(feature = "serial")]
 unsafe impl Send for RNodeStream {}
+
+#[cfg(feature = "serial")]
+fn read_rnode_stream(
+    mut stream: RNodeStream,
+    mut buf: [u8; 1024],
+) -> Result<(RNodeStream, [u8; 1024], usize), (RNodeStream, std::io::Error)> {
+    use std::io::Read;
+
+    match stream.read(&mut buf) {
+        Ok(0) if stream.is_tcp() => Err((
+            stream,
+            std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "RNode TCP socket closed"),
+        )),
+        Ok(n) => Ok((stream, buf, n)),
+        // Serial returns TimedOut; TCP returns WouldBlock on non-blocking
+        // or TimedOut on a read-timeout. Treat both as "no data yet".
+        Err(e)
+            if e.kind() == std::io::ErrorKind::TimedOut
+                || e.kind() == std::io::ErrorKind::WouldBlock =>
+        {
+            Ok((stream, buf, 0))
+        }
+        Err(e) => Err((stream, e)),
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct RNodeConfig {
@@ -484,8 +512,9 @@ pub async fn spawn_rnode_interface(
     id: InterfaceId,
     transport_tx: mpsc::Sender<TransportMessage>,
 ) -> Result<InterfaceHandle, crate::traits::InterfaceError> {
-    let port_cfg = PortConfig::parse(&config.port, config.baud_rate)
-        .map_err(|e| crate::traits::InterfaceError::SendFailed(format!("rnode port parse: {}", e)))?;
+    let port_cfg = PortConfig::parse(&config.port, config.baud_rate).map_err(|e| {
+        crate::traits::InterfaceError::SendFailed(format!("rnode port parse: {}", e))
+    })?;
 
     let port = match &port_cfg {
         PortConfig::Serial { path, baud } => {
@@ -495,8 +524,9 @@ pub async fn spawn_rnode_interface(
                 baud = baud,
                 "RNode serial interface opening"
             );
-            RNodeStream::open_serial(path, *baud)
-                .map_err(|e| crate::traits::InterfaceError::SendFailed(format!("rnode serial open: {}", e)))?
+            RNodeStream::open_serial(path, *baud).map_err(|e| {
+                crate::traits::InterfaceError::SendFailed(format!("rnode serial open: {}", e))
+            })?
         }
         PortConfig::Tcp { addr } => {
             tracing::info!(
@@ -508,8 +538,12 @@ pub async fn spawn_rnode_interface(
             let addr = addr.clone();
             tokio::task::spawn_blocking(move || RNodeStream::connect_tcp(&addr))
                 .await
-                .map_err(|e| crate::traits::InterfaceError::SendFailed(format!("rnode tcp spawn: {}", e)))?
-                .map_err(|e| crate::traits::InterfaceError::SendFailed(format!("rnode tcp connect: {}", e)))?
+                .map_err(|e| {
+                    crate::traits::InterfaceError::SendFailed(format!("rnode tcp spawn: {}", e))
+                })?
+                .map_err(|e| {
+                    crate::traits::InterfaceError::SendFailed(format!("rnode tcp connect: {}", e))
+                })?
         }
     };
 
@@ -632,22 +666,7 @@ pub async fn spawn_rnode_interface(
             if !online_r.load(Ordering::SeqCst) {
                 break;
             }
-            let result = tokio::task::spawn_blocking(move || {
-                use std::io::Read;
-                match port_r.read(&mut buf) {
-                    Ok(n) => Ok((port_r, buf, n)),
-                    // Serial returns TimedOut; TCP returns WouldBlock on non-blocking
-                    // or TimedOut on a read-timeout — treat both as "no data yet".
-                    Err(e)
-                        if e.kind() == std::io::ErrorKind::TimedOut
-                            || e.kind() == std::io::ErrorKind::WouldBlock =>
-                    {
-                        Ok((port_r, buf, 0))
-                    }
-                    Err(e) => Err((port_r, e)),
-                }
-            })
-            .await;
+            let result = tokio::task::spawn_blocking(move || read_rnode_stream(port_r, buf)).await;
 
             match result {
                 Ok(Ok((p, b, n))) => {
@@ -835,6 +854,24 @@ mod tests {
         match cfg {
             PortConfig::Tcp { addr } => assert_eq!(addr, "rnode.local:7633"),
             _ => panic!("expected Tcp variant"),
+        }
+    }
+
+    #[cfg(feature = "serial")]
+    #[test]
+    fn test_tcp_eof_is_read_error() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let accept = std::thread::spawn(move || {
+            let (_stream, _) = listener.accept().unwrap();
+        });
+
+        let stream = RNodeStream::connect_tcp(&addr.to_string()).unwrap();
+        accept.join().unwrap();
+
+        match read_rnode_stream(stream, [0u8; 1024]) {
+            Ok(_) => panic!("closed TCP socket should be EOF"),
+            Err((_stream, err)) => assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof),
         }
     }
 }
