@@ -61,19 +61,19 @@ Debian, Ubuntu, and Raspberry Pi OS:
 
 ```bash
 sudo apt update
-sudo apt install -y build-essential pkg-config libudev-dev
+sudo apt install -y build-essential pkg-config
 ```
 
 Fedora:
 
 ```bash
-sudo dnf install gcc make pkgconf-pkg-config systemd-devel
+sudo dnf install gcc make pkgconf-pkg-config
 ```
 
 Arch:
 
 ```bash
-sudo pacman -S --needed base-devel pkgconf systemd
+sudo pacman -S --needed base-devel pkgconf
 ```
 
 ##### Build the tools:
