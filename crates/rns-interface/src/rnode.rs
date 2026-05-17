@@ -113,6 +113,16 @@ pub const DEFAULT_TCP_PORT: u16 = 7633;
 const RNODE_READ_TIMEOUT_MS: u64 = 100;
 #[cfg(feature = "serial")]
 const RNODE_TCP_CONNECT_TIMEOUT_SECS: u64 = 5;
+#[cfg(feature = "serial")]
+const RNODE_TCP_KEEPIDLE_SECS: u64 = 5;
+#[cfg(feature = "serial")]
+const RNODE_TCP_KEEPINTVL_SECS: u64 = 2;
+#[cfg(feature = "serial")]
+const RNODE_TCP_KEEPCNT: u32 = 12;
+#[cfg(feature = "serial")]
+const RNODE_TCP_USER_TIMEOUT_SECS: u64 = 24;
+#[cfg(feature = "serial")]
+const RNODE_TCP_BUFFER_BYTES: usize = 131_072;
 
 // Transport abstraction
 
@@ -253,6 +263,15 @@ impl RNodeStream {
     fn from_tcp_stream(stream: std::net::TcpStream) -> std::io::Result<Self> {
         // Mirror the serial timeout so the read loop doesn't block forever.
         stream.set_read_timeout(Some(Duration::from_millis(RNODE_READ_TIMEOUT_MS)))?;
+        stream.set_nodelay(true)?;
+        crate::socket_tuning::set_keepalive_tuned_std(
+            &stream,
+            Duration::from_secs(RNODE_TCP_KEEPIDLE_SECS),
+            Duration::from_secs(RNODE_TCP_KEEPINTVL_SECS),
+            RNODE_TCP_KEEPCNT,
+            Duration::from_secs(RNODE_TCP_USER_TIMEOUT_SECS),
+        );
+        crate::socket_tuning::set_socket_buffers_std(&stream, RNODE_TCP_BUFFER_BYTES);
         Ok(Self::Tcp(stream))
     }
 

@@ -29,6 +29,25 @@ pub fn set_keepalive(stream: &TcpStream) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Enable portable `SO_KEEPALIVE` on a blocking std TCP stream.
+#[cfg(unix)]
+pub fn set_keepalive_std(stream: &std::net::TcpStream) -> std::io::Result<()> {
+    use std::os::fd::{AsRawFd, FromRawFd};
+    let raw_fd = stream.as_raw_fd();
+    let sock = std::mem::ManuallyDrop::new(unsafe { socket2::Socket::from_raw_fd(raw_fd) });
+    sock.set_keepalive(true)?;
+    Ok(())
+}
+
+#[cfg(windows)]
+pub fn set_keepalive_std(stream: &std::net::TcpStream) -> std::io::Result<()> {
+    use std::os::windows::io::{AsRawSocket, FromRawSocket};
+    let raw = stream.as_raw_socket();
+    let sock = std::mem::ManuallyDrop::new(unsafe { socket2::Socket::from_raw_socket(raw) });
+    sock.set_keepalive(true)?;
+    Ok(())
+}
+
 /// Tuned keepalive: idle/interval/retries + Linux TCP_USER_TIMEOUT. Best-effort.
 #[cfg(unix)]
 pub fn set_keepalive_tuned(
@@ -54,6 +73,35 @@ pub fn set_keepalive_tuned(
 ) {
     use std::os::windows::io::{AsRawSocket, FromRawSocket};
     let raw = stream.as_ref().as_raw_socket();
+    let sock = std::mem::ManuallyDrop::new(unsafe { socket2::Socket::from_raw_socket(raw) });
+    apply_tuned_keepalive(&sock, idle, intvl, retries, user_timeout);
+}
+
+/// Tuned keepalive for blocking std TCP streams. Best-effort.
+#[cfg(unix)]
+pub fn set_keepalive_tuned_std(
+    stream: &std::net::TcpStream,
+    idle: Duration,
+    intvl: Duration,
+    retries: u32,
+    user_timeout: Duration,
+) {
+    use std::os::fd::{AsRawFd, FromRawFd};
+    let raw_fd = stream.as_raw_fd();
+    let sock = std::mem::ManuallyDrop::new(unsafe { socket2::Socket::from_raw_fd(raw_fd) });
+    apply_tuned_keepalive(&sock, idle, intvl, retries, user_timeout);
+}
+
+#[cfg(windows)]
+pub fn set_keepalive_tuned_std(
+    stream: &std::net::TcpStream,
+    idle: Duration,
+    intvl: Duration,
+    retries: u32,
+    user_timeout: Duration,
+) {
+    use std::os::windows::io::{AsRawSocket, FromRawSocket};
+    let raw = stream.as_raw_socket();
     let sock = std::mem::ManuallyDrop::new(unsafe { socket2::Socket::from_raw_socket(raw) });
     apply_tuned_keepalive(&sock, idle, intvl, retries, user_timeout);
 }
@@ -102,6 +150,25 @@ pub fn set_socket_buffers(stream: &TcpStream, size: usize) {
 pub fn set_socket_buffers(stream: &TcpStream, size: usize) {
     use std::os::windows::io::{AsRawSocket, FromRawSocket};
     let raw = stream.as_ref().as_raw_socket();
+    let sock = std::mem::ManuallyDrop::new(unsafe { socket2::Socket::from_raw_socket(raw) });
+    let _ = sock.set_recv_buffer_size(size);
+    let _ = sock.set_send_buffer_size(size);
+}
+
+/// Raise TCP send/recv buffers on a blocking std TCP stream; best-effort.
+#[cfg(unix)]
+pub fn set_socket_buffers_std(stream: &std::net::TcpStream, size: usize) {
+    use std::os::fd::{AsRawFd, FromRawFd};
+    let raw_fd = stream.as_raw_fd();
+    let sock = std::mem::ManuallyDrop::new(unsafe { socket2::Socket::from_raw_fd(raw_fd) });
+    let _ = sock.set_recv_buffer_size(size);
+    let _ = sock.set_send_buffer_size(size);
+}
+
+#[cfg(windows)]
+pub fn set_socket_buffers_std(stream: &std::net::TcpStream, size: usize) {
+    use std::os::windows::io::{AsRawSocket, FromRawSocket};
+    let raw = stream.as_raw_socket();
     let sock = std::mem::ManuallyDrop::new(unsafe { socket2::Socket::from_raw_socket(raw) });
     let _ = sock.set_recv_buffer_size(size);
     let _ = sock.set_send_buffer_size(size);
@@ -175,6 +242,36 @@ mod tests {
 
         set_socket_buffers(&server, 131_072);
         set_socket_buffers(&client, 131_072);
+    }
+
+    #[test]
+    fn std_keepalive_and_buffers_apply_without_panic() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let accept = std::thread::spawn(move || listener.accept().unwrap().0);
+        let client = std::net::TcpStream::connect(addr).unwrap();
+        let server = accept.join().unwrap();
+
+        set_keepalive_std(&server).expect("server set_keepalive_std");
+        set_keepalive_std(&client).expect("client set_keepalive_std");
+
+        set_keepalive_tuned_std(
+            &server,
+            Duration::from_secs(5),
+            Duration::from_secs(2),
+            12,
+            Duration::from_secs(24),
+        );
+        set_keepalive_tuned_std(
+            &client,
+            Duration::from_secs(5),
+            Duration::from_secs(2),
+            12,
+            Duration::from_secs(24),
+        );
+
+        set_socket_buffers_std(&server, 131_072);
+        set_socket_buffers_std(&client, 131_072);
     }
 
     #[test]
