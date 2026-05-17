@@ -133,13 +133,8 @@ pub enum PortConfig {
 #[cfg(feature = "serial")]
 impl PortConfig {
     pub fn parse(port: &str, baud: u32) -> Result<Self, String> {
-        if let Some(rest) = port.strip_prefix("tcp://") {
-            // Already has a port number?
-            let addr = if rest.contains(':') {
-                rest.to_string()
-            } else {
-                format!("{}:{}", rest, DEFAULT_TCP_PORT)
-            };
+        if let Some(rest) = strip_tcp_scheme(port) {
+            let addr = parse_tcp_endpoint(rest)?;
             Ok(Self::Tcp { addr })
         } else {
             Ok(Self::Serial {
@@ -148,6 +143,66 @@ impl PortConfig {
             })
         }
     }
+}
+
+#[cfg(feature = "serial")]
+fn strip_tcp_scheme(port: &str) -> Option<&str> {
+    const TCP_SCHEME: &str = "tcp://";
+    port.get(..TCP_SCHEME.len())
+        .filter(|prefix| prefix.eq_ignore_ascii_case(TCP_SCHEME))
+        .and_then(|_| port.get(TCP_SCHEME.len()..))
+}
+
+#[cfg(feature = "serial")]
+fn parse_tcp_endpoint(endpoint: &str) -> Result<String, String> {
+    if endpoint.is_empty() {
+        return Err("missing TCP host".to_string());
+    }
+
+    if let Some(rest) = endpoint.strip_prefix('[') {
+        let Some(closing) = rest.find(']') else {
+            return Err("missing closing ']' in IPv6 TCP host".to_string());
+        };
+        let host = &rest[..closing];
+        if host.is_empty() {
+            return Err("missing TCP host".to_string());
+        }
+
+        let tail = &rest[closing + 1..];
+        let port = if tail.is_empty() {
+            DEFAULT_TCP_PORT
+        } else if let Some(port) = tail.strip_prefix(':') {
+            parse_tcp_port(port)?
+        } else {
+            return Err("unexpected text after bracketed TCP host".to_string());
+        };
+
+        return Ok(format!("[{host}]:{port}"));
+    }
+
+    let colon_count = endpoint.matches(':').count();
+    match colon_count {
+        0 => Ok(format!("{endpoint}:{DEFAULT_TCP_PORT}")),
+        1 => {
+            let (host, port) = endpoint
+                .rsplit_once(':')
+                .expect("colon_count guarantees a separator");
+            if host.is_empty() {
+                return Err("missing TCP host".to_string());
+            }
+            Ok(format!("{host}:{}", parse_tcp_port(port)?))
+        }
+        _ => Ok(format!("[{endpoint}]:{DEFAULT_TCP_PORT}")),
+    }
+}
+
+#[cfg(feature = "serial")]
+fn parse_tcp_port(port: &str) -> Result<u16, String> {
+    if port.is_empty() {
+        return Err("missing TCP port".to_string());
+    }
+    port.parse::<u16>()
+        .map_err(|_| format!("invalid TCP port: {port}"))
 }
 
 /// A unified sync I/O stream for either a serial port or a TCP socket.
@@ -883,6 +938,74 @@ mod tests {
             PortConfig::Tcp { addr } => assert_eq!(addr, "rnode.local:7633"),
             _ => panic!("expected Tcp variant"),
         }
+    }
+
+    #[cfg(feature = "serial")]
+    #[test]
+    fn test_port_config_tcp_case_insensitive_scheme() {
+        let cfg = PortConfig::parse("TCP://rnode.local", 115200).unwrap();
+        match cfg {
+            PortConfig::Tcp { addr } => assert_eq!(addr, "rnode.local:7633"),
+            _ => panic!("expected Tcp variant"),
+        }
+    }
+
+    #[cfg(feature = "serial")]
+    #[test]
+    fn test_port_config_tcp_empty_host_rejected() {
+        let err = PortConfig::parse("tcp://", 115200).unwrap_err();
+        assert!(err.contains("missing TCP host"));
+    }
+
+    #[cfg(feature = "serial")]
+    #[test]
+    fn test_port_config_tcp_invalid_port_rejected() {
+        let err = PortConfig::parse("tcp://rnode.local:notaport", 115200).unwrap_err();
+        assert!(err.contains("invalid TCP port"));
+    }
+
+    #[cfg(feature = "serial")]
+    #[test]
+    fn test_port_config_tcp_missing_port_rejected() {
+        let err = PortConfig::parse("tcp://rnode.local:", 115200).unwrap_err();
+        assert!(err.contains("missing TCP port"));
+    }
+
+    #[cfg(feature = "serial")]
+    #[test]
+    fn test_port_config_tcp_bracketed_ipv6_default_port() {
+        let cfg = PortConfig::parse("tcp://[2001:db8::1]", 115200).unwrap();
+        match cfg {
+            PortConfig::Tcp { addr } => assert_eq!(addr, "[2001:db8::1]:7633"),
+            _ => panic!("expected Tcp variant"),
+        }
+    }
+
+    #[cfg(feature = "serial")]
+    #[test]
+    fn test_port_config_tcp_bracketed_ipv6_explicit_port() {
+        let cfg = PortConfig::parse("tcp://[2001:db8::1]:9000", 115200).unwrap();
+        match cfg {
+            PortConfig::Tcp { addr } => assert_eq!(addr, "[2001:db8::1]:9000"),
+            _ => panic!("expected Tcp variant"),
+        }
+    }
+
+    #[cfg(feature = "serial")]
+    #[test]
+    fn test_port_config_tcp_unbracketed_ipv6_default_port() {
+        let cfg = PortConfig::parse("tcp://2001:db8::1", 115200).unwrap();
+        match cfg {
+            PortConfig::Tcp { addr } => assert_eq!(addr, "[2001:db8::1]:7633"),
+            _ => panic!("expected Tcp variant"),
+        }
+    }
+
+    #[cfg(feature = "serial")]
+    #[test]
+    fn test_port_config_tcp_malformed_bracketed_ipv6_rejected() {
+        let err = PortConfig::parse("tcp://[2001:db8::1", 115200).unwrap_err();
+        assert!(err.contains("missing closing"));
     }
 
     #[cfg(feature = "serial")]
