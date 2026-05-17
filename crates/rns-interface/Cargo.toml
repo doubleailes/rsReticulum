@@ -8,7 +8,7 @@ license.workspace = true
 [features]
 default = []
 serial = ["dep:serialport"]
-ble = ["dep:btleplug", "dep:futures", "dep:uuid"]
+ble = ["dep:btleplug", "dep:futures", "dep:uuid", "dep:bluer"]
 ble_peer = ["ble"]
 # See rns-transport's mobile-throttle. When enabled, auto-interface beacons
 # and reverse-peering probes slow down in the background; BLE peer scan
@@ -26,7 +26,7 @@ tracing = { workspace = true }
 socket2 = { workspace = true }
 if-addrs = { workspace = true }
 serialport = { workspace = true, optional = true }
-btleplug = { workspace = true, optional = true }
+btleplug = { version = "0.11", optional = true }
 futures = { version = "0.3", optional = true }
 uuid = { version = "1", optional = true }
 rand = { workspace = true }
@@ -56,7 +56,7 @@ jni = "0.19"
 # Linux-only target dep so non-Linux builds don't pull in BlueZ. The
 # linux_peripheral module is gated by both `ble` feature and target_os.
 [target.'cfg(target_os = "linux")'.dependencies]
-bluer = { version = "0.17", features = ["bluetoothd"] }
+bluer = { version = "0.17", features = ["bluetoothd"], optional = true }
 
 # Windows BLE Peripheral via WinRT GattServiceProvider (MSIX-packaged apps).
 # Windows-only target dep so cross-platform builds don't pull in WinRT
