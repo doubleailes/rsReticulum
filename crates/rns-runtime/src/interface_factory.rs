@@ -274,6 +274,9 @@ pub fn synthesize_interface(
                     "RNodeInterface '{name}' is an Android USB-OTG entry — skipped at startup; re-add from the UI after plugging the device in"
                 )));
             }
+            // TODO: Once rns-interface exposes TCP-backed RNode without the
+            // `serial` feature, route `tcp://` ports through that path instead
+            // of rejecting them in non-serial builds.
             #[cfg(feature = "serial")]
             {
                 synthesize_rnode(name, section, mode)

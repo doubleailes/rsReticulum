@@ -116,6 +116,10 @@ const RNODE_TCP_CONNECT_TIMEOUT_SECS: u64 = 5;
 
 // Transport abstraction
 
+// TODO: Split TCP-backed RNode support out of the `serial` feature. The current
+// shared stream keeps the initial TCP implementation small, but non-serial
+// builds cannot use `port = tcp://...` until this module has transport-specific
+// feature gates.
 /// Parsed representation of the `port` config field.
 #[cfg(feature = "serial")]
 #[derive(Debug, Clone)]
