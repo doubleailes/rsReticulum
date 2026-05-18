@@ -346,7 +346,11 @@ impl TransportActor {
             .get(&header.destination_hash)
             .map(|entry| entry.random_blobs.clone())
             .unwrap_or_default();
-        let should_add = if let Some(existing) = self.path_table.get(&header.destination_hash) {
+        let suppressed =
+            self.is_path_interface_suppressed(header.destination_hash, interface_id, now_f64());
+        let should_add = if suppressed {
+            false
+        } else if let Some(existing) = self.path_table.get(&header.destination_hash) {
             let random_seen = existing.has_random_blob(&announce_random_hash);
             let path_timebase = path_timebase_from_random_blobs(existing.random_blobs.iter());
             if header.hops <= existing.hops {
@@ -466,6 +470,8 @@ impl TransportActor {
                 dest = hex::encode(header.destination_hash),
                 hops = header.hops,
                 announce_emitted,
+                interface_id,
+                suppressed,
                 "ignoring replayed or stale announce"
             );
             return;

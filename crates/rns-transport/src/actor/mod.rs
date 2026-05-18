@@ -70,6 +70,10 @@ pub struct TransportActor {
     /// Python `pending_discovery_prs`: failed-link rediscovery requests queued
     /// for throttled emission.
     pub pending_discovery_prs: VecDeque<PendingDiscoveryPathRequest>,
+    /// Destination/interface pairs temporarily barred from installing paths.
+    /// Used when a Direct LinkRequest timed out on one route, so the next
+    /// path request can discover alternates instead of instantly reusing it.
+    pub path_interface_suppressions: HashMap<([u8; 16], InterfaceId), f64>,
     last_discovery_pr_tx: f64,
     /// External interface waiting for a path response from a local shared client.
     /// Python calls this `pending_local_path_requests`.
@@ -213,6 +217,7 @@ impl TransportActor {
             discovery_path_requests: HashMap::new(),
             discovery_pr_tags: HashMap::new(),
             pending_discovery_prs: VecDeque::new(),
+            path_interface_suppressions: HashMap::new(),
             last_discovery_pr_tx: 0.0,
             pending_local_path_requests: HashMap::new(),
             path_states: HashMap::new(),
@@ -880,6 +885,8 @@ impl TransportActor {
         if dropped > 0 {
             debug!(id, dropped, "dropped paths via deregistered interface");
         }
+        self.path_interface_suppressions
+            .retain(|(_, interface_id), _| *interface_id != id);
         self.pending_local_path_requests
             .retain(|_, waiting_interface| *waiting_interface != id);
         self.discovery_path_requests
@@ -893,6 +900,49 @@ impl TransportActor {
             self.is_shared_instance = false;
             self.clear_shared_connection_state();
         }
+    }
+
+    fn suppress_path_interface(
+        &mut self,
+        dest: [u8; 16],
+        interface_id: InterfaceId,
+        duration: f64,
+    ) -> bool {
+        if duration <= 0.0 || !duration.is_finite() {
+            return false;
+        }
+        let until = now_f64() + duration;
+        self.path_interface_suppressions
+            .insert((dest, interface_id), until);
+        debug!(
+            dest = %hex::encode(dest),
+            interface_id,
+            duration,
+            "temporarily suppressing path interface"
+        );
+        true
+    }
+
+    fn is_path_interface_suppressed(
+        &mut self,
+        dest: [u8; 16],
+        interface_id: InterfaceId,
+        now: f64,
+    ) -> bool {
+        let key = (dest, interface_id);
+        match self.path_interface_suppressions.get(&key).copied() {
+            Some(until) if now < until => true,
+            Some(_) => {
+                self.path_interface_suppressions.remove(&key);
+                false
+            }
+            None => false,
+        }
+    }
+
+    fn cull_path_interface_suppressions(&mut self, now: f64) {
+        self.path_interface_suppressions
+            .retain(|_, until| now < *until);
     }
 
     /// Send raw bytes on `id`, IFAC-wrapping first if configured.
@@ -1355,6 +1405,26 @@ mod tests {
         };
         let mut raw = header.pack();
         raw.extend_from_slice(&[0xDD; 32]);
+        Bytes::from(raw)
+    }
+
+    fn make_link_request_packet(dest_hash: [u8; 16], hops: u8) -> Bytes {
+        let flags = rns_wire::flags::PacketFlags {
+            header_type: rns_wire::flags::HeaderType::Header1,
+            context_flag: false,
+            transport_type: rns_wire::flags::TransportType::Broadcast,
+            destination_type: rns_wire::flags::DestinationType::Single,
+            packet_type: rns_wire::flags::PacketType::LinkRequest,
+        };
+        let header = rns_wire::header::PacketHeader {
+            flags,
+            hops,
+            transport_id: None,
+            destination_hash: dest_hash,
+            context: rns_wire::context::PacketContext::None,
+        };
+        let mut raw = header.pack();
+        raw.extend_from_slice(&[0xCC; 64]);
         Bytes::from(raw)
     }
 
@@ -2625,6 +2695,189 @@ mod tests {
         // Only interface 2 should receive (directed via path)
         assert!(rx1.try_recv().is_err());
         assert!(rx2.try_recv().is_ok());
+    }
+
+    fn assert_link_request_pins_to_path_owner(
+        owner_name: &str,
+        owner_mode: InterfaceMode,
+        owner_role: InterfaceRole,
+        alternate_name: &str,
+        alternate_mode: InterfaceMode,
+        alternate_role: InterfaceRole,
+    ) {
+        let (mut actor, _tx) = TransportActor::new();
+        let (mut owner_entry, mut owner_rx) = make_test_interface(owner_name);
+        let (mut alternate_entry, mut alternate_rx) = make_test_interface(alternate_name);
+        owner_entry.mode = owner_mode;
+        owner_entry.role = owner_role;
+        alternate_entry.mode = alternate_mode;
+        alternate_entry.role = alternate_role;
+        actor.interfaces.insert(1, owner_entry);
+        actor.interfaces.insert(2, alternate_entry);
+
+        let dest_hash = [0xA7; 16];
+        let owner_path = crate::path_table::PathEntry::new(None, 1, 1, owner_mode);
+        actor.path_table.insert(dest_hash, owner_path);
+
+        actor.on_outbound(OutboundRequest {
+            raw: make_link_request_packet(dest_hash, 0),
+            destination_hash: dest_hash,
+        });
+
+        let sent = owner_rx
+            .try_recv()
+            .expect("Direct LinkRequest should follow the owned path");
+        let (header, _) = rns_wire::header::PacketHeader::unpack(&sent).unwrap();
+        assert_eq!(
+            header.flags.packet_type,
+            rns_wire::flags::PacketType::LinkRequest
+        );
+        assert!(
+            alternate_rx.try_recv().is_err(),
+            "alternate interface {alternate_name} stays unused while {owner_name} owns the path"
+        );
+    }
+
+    #[test]
+    fn direct_link_request_without_path_broadcasts_to_all_interfaces() {
+        let (mut actor, _tx) = TransportActor::new();
+        let (mut auto_entry, mut auto_rx) = make_test_interface("Local Network");
+        let (mut tcp_entry, mut tcp_rx) = make_test_interface("TCP peer");
+        let (mut rnode_entry, mut rnode_rx) = make_test_interface("RNode");
+        auto_entry.mode = InterfaceMode::Full;
+        tcp_entry.mode = InterfaceMode::Full;
+        rnode_entry.mode = InterfaceMode::Full;
+        actor.interfaces.insert(1, auto_entry);
+        actor.interfaces.insert(2, tcp_entry);
+        actor.interfaces.insert(3, rnode_entry);
+
+        let dest_hash = [0xA8; 16];
+        actor.on_outbound(OutboundRequest {
+            raw: make_link_request_packet(dest_hash, 0),
+            destination_hash: dest_hash,
+        });
+
+        auto_rx
+            .try_recv()
+            .expect("no-path Direct LinkRequest should broadcast to Local Network");
+        tcp_rx
+            .try_recv()
+            .expect("no-path Direct LinkRequest should broadcast to TCP");
+        rnode_rx
+            .try_recv()
+            .expect("no-path Direct LinkRequest should broadcast to RNode");
+    }
+
+    #[test]
+    fn direct_link_request_pins_to_path_owner_across_interface_types() {
+        let cases = [
+            (
+                "Local Network",
+                InterfaceMode::Full,
+                InterfaceRole::Normal,
+                "TCP peer",
+                InterfaceMode::Full,
+                InterfaceRole::Normal,
+            ),
+            (
+                "BLE peer",
+                InterfaceMode::Full,
+                InterfaceRole::Normal,
+                "TCP peer",
+                InterfaceMode::Full,
+                InterfaceRole::Normal,
+            ),
+            (
+                "RNode",
+                InterfaceMode::Full,
+                InterfaceRole::Normal,
+                "TCP peer",
+                InterfaceMode::Full,
+                InterfaceRole::Normal,
+            ),
+            (
+                "TCP peer",
+                InterfaceMode::Full,
+                InterfaceRole::Normal,
+                "Local Network",
+                InterfaceMode::Full,
+                InterfaceRole::Normal,
+            ),
+            (
+                "SharedInstanceServer/client",
+                InterfaceMode::Full,
+                InterfaceRole::LocalClient,
+                "TCP peer",
+                InterfaceMode::Full,
+                InterfaceRole::Normal,
+            ),
+        ];
+
+        for (owner_name, owner_mode, owner_role, alternate_name, alternate_mode, alternate_role) in
+            cases
+        {
+            assert_link_request_pins_to_path_owner(
+                owner_name,
+                owner_mode,
+                owner_role,
+                alternate_name,
+                alternate_mode,
+                alternate_role,
+            );
+        }
+    }
+
+    #[test]
+    fn suppressed_path_owner_does_not_reclaim_route_during_rediscovery() {
+        let (mut actor, _tx) = TransportActor::new();
+        let (auto_entry, _auto_rx) = make_test_interface("Local Network");
+        let (tcp_entry, _tcp_rx) = make_test_interface("TCP peer");
+        actor.interfaces.insert(1, auto_entry);
+        actor.interfaces.insert(2, tcp_entry);
+
+        let identity = rns_identity::identity::Identity::new();
+        let (auto_announce, dest_hash) =
+            make_announce_for_with_random_blob(&identity, "lxmf.delivery", 1, [0x11; 10]);
+        let (tcp_announce, _) =
+            make_announce_for_with_random_blob(&identity, "lxmf.delivery", 1, [0x22; 10]);
+
+        actor.path_table.insert(
+            dest_hash,
+            crate::path_table::PathEntry::new(None, 1, 1, InterfaceMode::Full),
+        );
+        match actor.handle_query(TransportQuery::SuppressCurrentPathInterface {
+            dest: dest_hash,
+            duration: 30.0,
+        }) {
+            TransportQueryResponse::BoolResult(true) => {}
+            other => panic!("expected current path-interface suppression, got {other:?}"),
+        }
+        actor.path_table.remove(&dest_hash);
+
+        actor.on_inbound(InboundPacket {
+            raw: auto_announce,
+            interface_id: 1,
+            rssi: None,
+            snr: None,
+            q: None,
+        });
+        assert!(
+            !actor.path_table.has_path(&dest_hash),
+            "suppressed Local Network announce must not reinstall the failed path"
+        );
+
+        actor.on_inbound(InboundPacket {
+            raw: tcp_announce,
+            interface_id: 2,
+            rssi: None,
+            snr: None,
+            q: None,
+        });
+        let path = actor
+            .path_table
+            .get(&dest_hash)
+            .expect("alternate TCP announce should install a path");
+        assert_eq!(path.interface_id, 2);
     }
 
     #[test]

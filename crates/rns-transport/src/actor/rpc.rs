@@ -24,6 +24,17 @@ impl TransportActor {
                             hops: entry.hops,
                             expires: entry.expires,
                             interface: iface_name,
+                            interface_id: entry.interface_id,
+                            interface_mode: self
+                                .interfaces
+                                .get(&entry.interface_id)
+                                .map(|e| e.mode)
+                                .unwrap_or(crate::constants::InterfaceMode::Full),
+                            interface_role: self
+                                .interfaces
+                                .get(&entry.interface_id)
+                                .map(|e| e.role)
+                                .unwrap_or_default(),
                         }
                     })
                     .collect();
@@ -174,6 +185,21 @@ impl TransportActor {
                 self.path_table.expire(&dest);
                 self.state_dirty = true;
                 TransportQueryResponse::Ok
+            }
+            TransportQuery::SuppressPathInterface {
+                dest,
+                interface_id,
+                duration,
+            } => TransportQueryResponse::BoolResult(self.suppress_path_interface(
+                dest,
+                interface_id,
+                duration,
+            )),
+            TransportQuery::SuppressCurrentPathInterface { dest, duration } => {
+                let interface_id = self.path_table.get(&dest).map(|entry| entry.interface_id);
+                TransportQueryResponse::BoolResult(interface_id.is_some_and(|interface_id| {
+                    self.suppress_path_interface(dest, interface_id, duration)
+                }))
             }
             TransportQuery::DropAnnounceQueues => {
                 for entry in self.interfaces.values_mut() {

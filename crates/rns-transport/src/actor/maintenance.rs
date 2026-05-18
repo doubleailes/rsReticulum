@@ -31,6 +31,7 @@ impl TransportActor {
             self.reverse_table.cull_expired_batch(100);
             self.tunnel_table.cull_expired_batch(50);
             self.cull_stale_tunnel_paths(now);
+            self.cull_path_interface_suppressions(now);
 
             // Drop entries pointing to interfaces that have gone away —
             // those routes could never be used anyway.

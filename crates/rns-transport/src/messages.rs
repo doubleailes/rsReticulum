@@ -397,6 +397,21 @@ pub enum TransportQuery {
     DropPath {
         dest: [u8; 16],
     },
+    /// Temporarily reject path-table installs for `dest` learned through
+    /// `interface_id`. Used after link establishment failure so rediscovery can
+    /// consider alternate interfaces instead of immediately reselecting the
+    /// path that just failed.
+    SuppressPathInterface {
+        dest: [u8; 16],
+        interface_id: InterfaceId,
+        duration: f64,
+    },
+    /// Temporarily reject path-table installs for `dest` learned through the
+    /// interface that currently owns the path.
+    SuppressCurrentPathInterface {
+        dest: [u8; 16],
+        duration: f64,
+    },
     DropAnnounceQueues,
     GetBlackholedIdentities,
     BlackholeIdentity {
@@ -526,6 +541,9 @@ pub struct PathTableRpcEntry {
     pub hops: u8,
     pub expires: f64,
     pub interface: String,
+    pub interface_id: InterfaceId,
+    pub interface_mode: InterfaceMode,
+    pub interface_role: InterfaceRole,
 }
 
 #[derive(Debug, Clone)]

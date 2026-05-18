@@ -502,6 +502,9 @@ mod tests {
                                 hops: 2,
                                 expires: 1_700_100_000.0,
                                 interface: "MockIf".to_string(),
+                                interface_id: 1,
+                                interface_mode: rns_transport::constants::InterfaceMode::Full,
+                                interface_role: rns_transport::messages::InterfaceRole::Normal,
                             }];
                             TransportQueryResponse::PathTable(entries)
                         }

@@ -337,6 +337,9 @@ fn rpc_response_to_transport_response(
                         hops: entry.hops,
                         expires: entry.expires,
                         interface: entry.interface,
+                        interface_id: 0,
+                        interface_mode: rns_transport::constants::InterfaceMode::Full,
+                        interface_role: rns_transport::messages::InterfaceRole::Normal,
                     })
                 })
                 .collect();
