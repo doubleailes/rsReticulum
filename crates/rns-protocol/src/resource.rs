@@ -1253,6 +1253,7 @@ pub struct OutboundTransfer {
     /// Scopes the search range when servicing RESOURCE_REQ lookups.
     pub receiver_min_consecutive_height: usize,
     pub sent_parts: usize,
+    sent_part_indices: HashSet<usize>,
     req_hashlist: HashSet<[u8; 32]>,
 }
 
@@ -1301,6 +1302,7 @@ impl OutboundTransfer {
             window_max_sent: 0,
             receiver_min_consecutive_height: 0,
             sent_parts: 0,
+            sent_part_indices: HashSet::new(),
             req_hashlist: HashSet::new(),
         }
     }
@@ -1351,6 +1353,9 @@ impl OutboundTransfer {
                     if let Some(part_data) = part_data {
                         self.last_part_sent = Some(Instant::now());
                         self.resource.state = ResourceState::Transferring;
+                        if self.sent_part_indices.insert(part_idx) {
+                            self.sent_parts += 1;
+                        }
 
                         if self.window_cursor >= window_end {
                             // Last part in the window is now in flight; stop
@@ -1548,6 +1553,9 @@ impl OutboundTransfer {
             {
                 if let Some(part_data) = self.resource.get_part(i) {
                     actions.push(TransferAction::SendPart(i, part_data.to_vec()));
+                    if self.sent_part_indices.insert(i) {
+                        self.sent_parts += 1;
+                    }
                     sent_count += 1;
                 }
             }
@@ -1736,13 +1744,16 @@ impl OutboundTransfer {
         buf
     }
 
-    /// Fraction of parts confirmed, in `0.0..=1.0`.
+    /// Fraction of unique parts transmitted, in `0.0..=1.0`.
+    ///
+    /// Upstream Reticulum reports initiator-side progress from `sent_parts`,
+    /// while receiver HMUs/proofs still decide completion. This keeps UI
+    /// progress useful on large resources before a full segment proof arrives.
     pub fn progress(&self) -> f64 {
-        let confirmed = self.confirmed_parts.iter().filter(|&&c| c).count();
         if self.resource.num_parts() == 0 {
             return 1.0;
         }
-        confirmed as f64 / self.resource.num_parts() as f64
+        self.sent_parts.min(self.resource.num_parts()) as f64 / self.resource.num_parts() as f64
     }
 }
 
@@ -2819,6 +2830,55 @@ mod tests {
         let transfer =
             OutboundTransfer::new(b"data".to_vec(), false, Duration::from_millis(100)).unwrap();
         assert_eq!(transfer.progress(), 0.0);
+    }
+
+    #[test]
+    fn test_transfer_progress_tracks_unique_sent_parts() {
+        let data = vec![0x55; SDU * 2 + 100];
+        let mut sender =
+            OutboundTransfer::new(data.clone(), false, Duration::from_millis(50)).unwrap();
+        assert!(sender.resource.num_parts() > 1);
+
+        assert!(matches!(
+            sender.tick(),
+            TransferAction::SendAdvertisement(_)
+        ));
+
+        let first_progress = match sender.tick() {
+            TransferAction::SendPart(_, _) => sender.progress(),
+            other => panic!("expected first part, got {other:?}"),
+        };
+        assert!(first_progress > 0.0);
+        assert!(first_progress < 1.0);
+
+        let mut receiver = InboundTransfer::from_advertisement(
+            sender.resource.num_parts(),
+            sender.resource.total_size,
+            data.len(),
+            sender.resource.random_hash,
+            sender.resource.resource_hash,
+            ResourceFlags {
+                compressed: false,
+                ..Default::default()
+            },
+            sender.resource.map_hashes.clone(),
+            Duration::from_millis(50),
+        )
+        .unwrap();
+        let TransferAction::SendRequest(request) = receiver.request_next() else {
+            panic!("expected receiver request");
+        };
+
+        let first_count = sender.sent_parts;
+        let _ = sender.handle_request(&request);
+        let after_request = sender.sent_parts;
+        let _ = sender.handle_request(&request);
+
+        assert!(after_request >= first_count);
+        assert_eq!(
+            sender.sent_parts, after_request,
+            "duplicate requests must not inflate visible send progress"
+        );
     }
 
     #[test]
