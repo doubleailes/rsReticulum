@@ -450,6 +450,12 @@ pub enum TransportQuery {
     DropAllVia {
         next_hop: [u8; 16],
     },
+    /// Drop every cached route from the path table and persist the empty table.
+    /// Response: `IntResult(count_cleared)`.
+    DropPathTable,
+    /// Drop every cached announce snapshot and persist the empty cache.
+    /// Response: `IntResult(count_cleared)`.
+    DropRecentAnnounces,
     /// Remote-status RPC — interface stats + optional link count, wire-format
     /// compatible with `Transport.remote_status_handler`.
     RemoteStatus {

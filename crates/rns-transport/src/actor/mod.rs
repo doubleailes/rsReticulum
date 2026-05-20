@@ -1272,10 +1272,11 @@ fn mode_discovers_unknown_paths(mode: InterfaceMode) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::constants::InterfaceDirection;
+    use crate::constants::{InterfaceDirection, InterfaceMode};
     use crate::messages::{
         InboundPacket, InterfaceEntry, OutboundRequest, TransportQuery, TransportQueryResponse,
     };
+    use crate::path_table::PathEntry;
 
     fn make_valid_announce(app_name: &str, hops: u8) -> (Bytes, [u8; 16]) {
         let identity = rns_identity::identity::Identity::new();
@@ -7626,6 +7627,72 @@ mod tests {
             }
             other => panic!("expected Announces response, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn drop_recent_announces_clears_cached_snapshots() {
+        let (mut actor, _tx) = TransportActor::new();
+        let (entry, _rx) = make_test_interface("test_iface");
+        actor.interfaces.insert(1, entry);
+
+        let identity = rns_identity::identity::Identity::new();
+        let (raw, dh) = make_announce_for(&identity, "lxmf.delivery", 2);
+        actor.on_inbound(crate::messages::InboundPacket {
+            raw,
+            interface_id: 1,
+            rssi: None,
+            snr: None,
+            q: None,
+        });
+        assert!(actor.recent_announces.contains_key(&dh));
+
+        match actor.handle_query(crate::messages::TransportQuery::DropRecentAnnounces) {
+            crate::messages::TransportQueryResponse::IntResult(n) => assert_eq!(n, 1),
+            other => panic!("expected IntResult response, got {other:?}"),
+        }
+        assert!(actor.recent_announces.is_empty());
+        assert!(!actor.state_dirty);
+    }
+
+    #[test]
+    fn drop_path_table_clears_routes_and_pending_path_state() {
+        let (mut actor, _tx) = TransportActor::new();
+        let dest = [0xAB; 16];
+        actor.path_table.insert(
+            dest,
+            PathEntry::new(Some([0xCD; 16]), 3, 7, InterfaceMode::Full),
+        );
+        actor
+            .pending_path_entries
+            .push(crate::persistence::PersistedPathEntry {
+                destination_hash: vec![0x11; 16],
+                timestamp: 1.0,
+                next_hop: None,
+                hops: 1,
+                expires: 2.0,
+                random_blobs: Vec::new(),
+                interface_id: 7,
+                interface_name: Some("missing".into()),
+                interface_hash: None,
+                packet_hash: None,
+            });
+        actor.pending_local_path_requests.insert(dest, 7);
+        actor
+            .pending_discovery_prs
+            .push_back(PendingDiscoveryPathRequest {
+                destination_hash: dest,
+                blocked_interface: Some(7),
+            });
+
+        match actor.handle_query(crate::messages::TransportQuery::DropPathTable) {
+            crate::messages::TransportQueryResponse::IntResult(n) => assert_eq!(n, 1),
+            other => panic!("expected IntResult response, got {other:?}"),
+        }
+        assert!(actor.path_table.is_empty());
+        assert!(actor.pending_path_entries.is_empty());
+        assert!(actor.pending_local_path_requests.is_empty());
+        assert!(actor.pending_discovery_prs.is_empty());
+        assert!(!actor.state_dirty);
     }
 
     /// Helper: insert a synthetic recent_announce for `(dest_hash, identity)`.

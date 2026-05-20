@@ -373,6 +373,22 @@ async fn process_rpc_request(
             }
             RpcResponse::Ok
         }
+        RpcRequest::DropPathTable => {
+            if let Some(TransportQueryResponse::IntResult(n)) =
+                query_transport(transport_tx, TransportQuery::DropPathTable).await
+            {
+                return RpcResponse::IntResult(n);
+            }
+            RpcResponse::IntResult(0)
+        }
+        RpcRequest::DropRecentAnnounces => {
+            if let Some(TransportQueryResponse::IntResult(n)) =
+                query_transport(transport_tx, TransportQuery::DropRecentAnnounces).await
+            {
+                return RpcResponse::IntResult(n);
+            }
+            RpcResponse::IntResult(0)
+        }
         RpcRequest::DropAnnounceQueues => {
             let _ = query_transport(transport_tx, TransportQuery::DropAnnounceQueues).await;
             RpcResponse::Ok
@@ -853,6 +869,8 @@ listener.close()
             RpcRequest::DropAllVia {
                 transport_hash: vec![0; 16],
             },
+            RpcRequest::DropPathTable,
+            RpcRequest::DropRecentAnnounces,
             RpcRequest::DropAnnounceQueues,
             RpcRequest::BlackholeIdentity {
                 identity_hash: vec![0; 16],

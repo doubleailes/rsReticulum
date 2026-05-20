@@ -283,6 +283,8 @@ fn transport_query_to_rpc_request(query: &TransportQuery) -> Option<crate::rpc::
         TransportQuery::DropAllVia { next_hop } => RpcRequest::DropAllVia {
             transport_hash: next_hop.to_vec(),
         },
+        TransportQuery::DropPathTable => RpcRequest::DropPathTable,
+        TransportQuery::DropRecentAnnounces => RpcRequest::DropRecentAnnounces,
         TransportQuery::DropAnnounceQueues => RpcRequest::DropAnnounceQueues,
         TransportQuery::BlackholeIdentity {
             hash,

@@ -65,6 +65,8 @@ pub enum RpcRequest {
     DropAllVia {
         transport_hash: Vec<u8>,
     },
+    DropPathTable,
+    DropRecentAnnounces,
     DropAnnounceQueues,
     BlackholeIdentity {
         identity_hash: Vec<u8>,
@@ -267,6 +269,13 @@ fn request_to_py_value(req: &RpcRequest) -> PyValue {
             ("drop", PyValue::String("all_via".to_string())),
             ("destination_hash", PyValue::Bytes(transport_hash.clone())),
         ]),
+        RpcRequest::DropPathTable => {
+            py_dict(vec![("drop", PyValue::String("path_table".to_string()))])
+        }
+        RpcRequest::DropRecentAnnounces => py_dict(vec![(
+            "drop",
+            PyValue::String("recent_announces".to_string()),
+        )]),
         RpcRequest::DropAnnounceQueues => py_dict(vec![(
             "drop",
             PyValue::String("announce_queues".to_string()),
@@ -362,6 +371,8 @@ fn py_value_to_request(value: &PyValue) -> Result<RpcRequest, RpcError> {
             "all_via" => Ok(RpcRequest::DropAllVia {
                 transport_hash: dict_bytes(entries, "destination_hash")?,
             }),
+            "path_table" => Ok(RpcRequest::DropPathTable),
+            "recent_announces" => Ok(RpcRequest::DropRecentAnnounces),
             "announce_queues" => Ok(RpcRequest::DropAnnounceQueues),
             other => Err(RpcError::Deserialize(format!(
                 "unknown Python RPC drop path: {other}"
@@ -605,9 +616,10 @@ fn py_value_to_response_for_request(
         | RpcRequest::GetPacketRssi { .. }
         | RpcRequest::GetPacketSnr { .. }
         | RpcRequest::GetPacketQ { .. } => Ok(RpcResponse::FloatResult(py_optional_float(value)?)),
-        RpcRequest::GetLinkCount | RpcRequest::DropAllVia { .. } => {
-            Ok(RpcResponse::IntResult(py_required_int(value)?))
-        }
+        RpcRequest::GetLinkCount
+        | RpcRequest::DropAllVia { .. }
+        | RpcRequest::DropPathTable
+        | RpcRequest::DropRecentAnnounces => Ok(RpcResponse::IntResult(py_required_int(value)?)),
         RpcRequest::GetBlackholedIdentities => {
             Ok(RpcResponse::BlackholeList(parse_blackhole_list(value)?))
         }
@@ -1828,6 +1840,8 @@ mod tests {
             RpcRequest::DropPath {
                 destination_hash: vec![0; 16],
             },
+            RpcRequest::DropPathTable,
+            RpcRequest::DropRecentAnnounces,
             RpcRequest::DropAnnounceQueues,
             RpcRequest::BlackholeIdentity {
                 identity_hash: vec![0; 16],

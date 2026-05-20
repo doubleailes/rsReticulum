@@ -219,6 +219,24 @@ impl TransportActor {
                 }
                 TransportQueryResponse::Ok
             }
+            TransportQuery::DropPathTable => {
+                let cleared = self.path_table.len();
+                self.path_table = crate::path_table::PathTable::new();
+                self.pending_path_entries.clear();
+                self.discovery_path_requests.clear();
+                self.pending_local_path_requests.clear();
+                self.pending_discovery_prs.clear();
+                self.state_dirty = true;
+                self.save_routing_state();
+                TransportQueryResponse::IntResult(cleared as i64)
+            }
+            TransportQuery::DropRecentAnnounces => {
+                let cleared = self.recent_announces.len();
+                self.recent_announces.clear();
+                self.state_dirty = true;
+                self.save_routing_state();
+                TransportQueryResponse::IntResult(cleared as i64)
+            }
             TransportQuery::GetBlackholedIdentities => {
                 // Snapshot of identity hashes we have a current announce for —
                 // used to decorate each entry with `verified`.
