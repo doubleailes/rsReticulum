@@ -8,6 +8,7 @@ license.workspace = true
 [features]
 default = []
 serial = ["rns-interface/serial"]
+rnode-tcp = ["rns-interface/rnode-tcp"]
 ble = ["rns-interface/ble"]
 
 [dependencies]

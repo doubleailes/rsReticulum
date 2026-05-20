@@ -1823,7 +1823,7 @@ fn interface_config_name(iface_config: &interface_factory::InterfaceConfig) -> &
         #[cfg(feature = "serial")]
         interface_factory::InterfaceConfig::KissSerial(c) => &c.name,
         interface_factory::InterfaceConfig::Auto(c) => &c.name,
-        #[cfg(feature = "serial")]
+        #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
         interface_factory::InterfaceConfig::RNode(c) => &c.name,
         interface_factory::InterfaceConfig::Local(c) => &c.name,
         interface_factory::InterfaceConfig::I2P(c) => &c.name,
@@ -1920,7 +1920,7 @@ fn discovery_config_for_interface(
                 None,
                 None,
             ),
-            #[cfg(feature = "serial")]
+            #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
             interface_factory::InterfaceConfig::RNode(c) => (
                 "RNodeInterface",
                 configured_reachable_on(section),
@@ -2737,13 +2737,12 @@ pub async fn spawn_ble_rnode_runtime(
     Ok((id, online))
 }
 
-/// Desktop USB-serial RNode counterpart to [`spawn_ble_rnode_runtime`].
-#[cfg(feature = "serial")]
-/// Settings for a runtime-spawned USB-serial RNode interface.
+/// Runtime-spawned RNode over USB serial or TCP (`tcp://host[:port]`).
+#[cfg(any(feature = "serial", feature = "rnode-tcp"))]
 pub struct RnodeRuntimeArgs<'a> {
     /// Interface name registered with the transport actor.
     pub name: &'a str,
-    /// Serial device path.
+    /// Serial device path or TCP URL.
     pub port: &'a str,
     /// Radio frequency in Hz.
     pub frequency: u32,
@@ -2757,7 +2756,7 @@ pub struct RnodeRuntimeArgs<'a> {
     pub tx_power: i8,
 }
 
-#[cfg(feature = "serial")]
+#[cfg(any(feature = "serial", feature = "rnode-tcp"))]
 pub async fn spawn_rnode_runtime(
     handle: &ReticulumHandle,
     args: RnodeRuntimeArgs<'_>,
@@ -3087,7 +3086,7 @@ async fn spawn_interface(
                 .map(|h| vec![h])
                 .map_err(|e| format!("Auto: {e}"))
         }
-        #[cfg(feature = "serial")]
+        #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
         interface_factory::InterfaceConfig::RNode(c) => {
             let mut rnode_config = rns_interface::rnode::RNodeConfig::new(&c.name, &c.port);
             rnode_config.frequency = c.frequency;

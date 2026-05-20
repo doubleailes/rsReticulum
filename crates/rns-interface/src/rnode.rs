@@ -13,15 +13,15 @@ use crate::kiss;
 use crate::traits::{InterfaceId, InterfaceMode};
 use rns_transport::messages::{InboundPacket, TransportMessage};
 
-#[cfg(feature = "serial")]
+#[cfg(any(feature = "serial", feature = "rnode-tcp"))]
 use crate::traits::{InterfaceDirection, InterfaceHandle};
-#[cfg(feature = "serial")]
+#[cfg(any(feature = "serial", feature = "rnode-tcp"))]
 use std::sync::Arc;
-#[cfg(feature = "serial")]
+#[cfg(any(feature = "serial", feature = "rnode-tcp"))]
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-#[cfg(feature = "serial")]
+#[cfg(any(feature = "serial", feature = "rnode-tcp"))]
 use std::time::Duration;
-#[cfg(feature = "serial")]
+#[cfg(any(feature = "serial", feature = "rnode-tcp"))]
 use tokio::sync::mpsc;
 
 pub const CMD_FREQUENCY: u8 = 0x01;
@@ -109,53 +109,58 @@ pub const RADIO_STATE_OFF: u8 = 0x00;
 /// Default TCP port for RNode-over-IP.
 pub const DEFAULT_TCP_PORT: u16 = 7633;
 
-#[cfg(feature = "serial")]
+#[cfg(any(feature = "serial", feature = "rnode-tcp"))]
 const RNODE_READ_TIMEOUT_MS: u64 = 100;
-#[cfg(feature = "serial")]
+#[cfg(any(feature = "serial", feature = "rnode-tcp"))]
 const RNODE_TCP_CONNECT_TIMEOUT_SECS: u64 = 5;
-#[cfg(feature = "serial")]
+#[cfg(any(feature = "serial", feature = "rnode-tcp"))]
 const RNODE_TCP_KEEPIDLE_SECS: u64 = 5;
-#[cfg(feature = "serial")]
+#[cfg(any(feature = "serial", feature = "rnode-tcp"))]
 const RNODE_TCP_KEEPINTVL_SECS: u64 = 2;
-#[cfg(feature = "serial")]
+#[cfg(any(feature = "serial", feature = "rnode-tcp"))]
 const RNODE_TCP_KEEPCNT: u32 = 12;
-#[cfg(feature = "serial")]
+#[cfg(any(feature = "serial", feature = "rnode-tcp"))]
 const RNODE_TCP_USER_TIMEOUT_SECS: u64 = 24;
-#[cfg(feature = "serial")]
+#[cfg(any(feature = "serial", feature = "rnode-tcp"))]
 const RNODE_TCP_BUFFER_BYTES: usize = 131_072;
 
 // Transport abstraction
 
-// TODO: Split TCP-backed RNode support out of the `serial` feature. The current
-// shared stream keeps the initial TCP implementation small, but non-serial
-// builds cannot use `port = tcp://...` until this module has transport-specific
-// feature gates.
 /// Parsed representation of the `port` config field.
-#[cfg(feature = "serial")]
+#[cfg(any(feature = "serial", feature = "rnode-tcp"))]
 #[derive(Debug, Clone)]
 pub enum PortConfig {
     /// A local serial device path, e.g. `/dev/ttyUSB0` or `COM3`.
+    #[cfg(feature = "serial")]
     Serial { path: String, baud: u32 },
     /// A TCP endpoint, e.g. `tcp://192.168.1.1` or `tcp://192.168.1.1:9000`.
     Tcp { addr: String },
 }
 
-#[cfg(feature = "serial")]
+#[cfg(any(feature = "serial", feature = "rnode-tcp"))]
 impl PortConfig {
     pub fn parse(port: &str, baud: u32) -> Result<Self, String> {
+        #[cfg(not(feature = "serial"))]
+        let _ = baud;
+
         if let Some(rest) = strip_tcp_scheme(port) {
             let addr = parse_tcp_endpoint(rest)?;
             Ok(Self::Tcp { addr })
         } else {
-            Ok(Self::Serial {
-                path: port.to_string(),
-                baud,
-            })
+            #[cfg(feature = "serial")]
+            {
+                return Ok(Self::Serial {
+                    path: port.to_string(),
+                    baud,
+                });
+            }
+            #[cfg(not(feature = "serial"))]
+            Err("RNode serial ports require the 'serial' feature; use tcp://host[:port] for TCP RNodes".to_string())
         }
     }
 }
 
-#[cfg(feature = "serial")]
+#[cfg(any(feature = "serial", feature = "rnode-tcp"))]
 fn strip_tcp_scheme(port: &str) -> Option<&str> {
     const TCP_SCHEME: &str = "tcp://";
     port.get(..TCP_SCHEME.len())
@@ -163,7 +168,7 @@ fn strip_tcp_scheme(port: &str) -> Option<&str> {
         .and_then(|_| port.get(TCP_SCHEME.len()..))
 }
 
-#[cfg(feature = "serial")]
+#[cfg(any(feature = "serial", feature = "rnode-tcp"))]
 fn parse_tcp_endpoint(endpoint: &str) -> Result<String, String> {
     if endpoint.is_empty() {
         return Err("missing TCP host".to_string());
@@ -206,7 +211,7 @@ fn parse_tcp_endpoint(endpoint: &str) -> Result<String, String> {
     }
 }
 
-#[cfg(feature = "serial")]
+#[cfg(any(feature = "serial", feature = "rnode-tcp"))]
 fn parse_tcp_port(port: &str) -> Result<u16, String> {
     if port.is_empty() {
         return Err("missing TCP port".to_string());
@@ -219,15 +224,17 @@ fn parse_tcp_port(port: &str) -> Result<u16, String> {
 ///
 /// Both variants support `Read + Write + Send + 'static` so the existing
 /// `spawn_blocking` read/write loops require minimal changes.
-#[cfg(feature = "serial")]
+#[cfg(any(feature = "serial", feature = "rnode-tcp"))]
 pub enum RNodeStream {
+    #[cfg(feature = "serial")]
     Serial(Box<dyn serialport::SerialPort>),
     Tcp(std::net::TcpStream),
 }
 
-#[cfg(feature = "serial")]
+#[cfg(any(feature = "serial", feature = "rnode-tcp"))]
 impl RNodeStream {
     /// Open a serial port.
+    #[cfg(feature = "serial")]
     pub fn open_serial(path: &str, baud: u32) -> std::io::Result<Self> {
         let port = serialport::new(path, baud)
             .timeout(Duration::from_millis(RNODE_READ_TIMEOUT_MS))
@@ -281,6 +288,7 @@ impl RNodeStream {
     /// - TCP: uses `TcpStream::try_clone` (both halves share the same fd).
     pub fn try_clone(&self) -> std::io::Result<Self> {
         match self {
+            #[cfg(feature = "serial")]
             Self::Serial(p) => Ok(Self::Serial(p.try_clone().map_err(std::io::Error::other)?)),
             Self::Tcp(s) => Ok(Self::Tcp(s.try_clone()?)),
         }
@@ -289,6 +297,7 @@ impl RNodeStream {
     /// Human-readable description for log messages.
     pub fn description(&self) -> String {
         match self {
+            #[cfg(feature = "serial")]
             Self::Serial(p) => p.name().unwrap_or_else(|| "<unknown serial>".to_string()),
             Self::Tcp(s) => s
                 .peer_addr()
@@ -302,20 +311,22 @@ impl RNodeStream {
     }
 }
 
-#[cfg(feature = "serial")]
+#[cfg(any(feature = "serial", feature = "rnode-tcp"))]
 impl std::io::Read for RNodeStream {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         match self {
+            #[cfg(feature = "serial")]
             Self::Serial(p) => p.read(buf),
             Self::Tcp(s) => s.read(buf),
         }
     }
 }
 
-#[cfg(feature = "serial")]
+#[cfg(any(feature = "serial", feature = "rnode-tcp"))]
 impl std::io::Write for RNodeStream {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         match self {
+            #[cfg(feature = "serial")]
             Self::Serial(p) => p.write(buf),
             Self::Tcp(s) => s.write(buf),
         }
@@ -323,13 +334,14 @@ impl std::io::Write for RNodeStream {
 
     fn flush(&mut self) -> std::io::Result<()> {
         match self {
+            #[cfg(feature = "serial")]
             Self::Serial(p) => p.flush(),
             Self::Tcp(s) => s.flush(),
         }
     }
 }
 
-#[cfg(feature = "serial")]
+#[cfg(any(feature = "serial", feature = "rnode-tcp"))]
 fn read_rnode_stream(
     mut stream: RNodeStream,
     mut buf: [u8; 1024],
@@ -354,12 +366,13 @@ fn read_rnode_stream(
     }
 }
 
-#[cfg(feature = "serial")]
+#[cfg(any(feature = "serial", feature = "rnode-tcp"))]
 async fn open_configured_rnode_stream(
     config: &RNodeConfig,
     port_cfg: &PortConfig,
 ) -> Result<RNodeStream, crate::traits::InterfaceError> {
     let port = match port_cfg {
+        #[cfg(feature = "serial")]
         PortConfig::Serial { path, baud } => {
             tracing::info!(
                 name = %config.name,
@@ -430,7 +443,7 @@ async fn open_configured_rnode_stream(
     Ok(port)
 }
 
-#[cfg(feature = "serial")]
+#[cfg(any(feature = "serial", feature = "rnode-tcp"))]
 fn reconnect_delay() -> Duration {
     #[cfg(test)]
     {
@@ -687,7 +700,7 @@ pub fn process_rnode_response(
     }
 }
 
-#[cfg(feature = "serial")]
+#[cfg(any(feature = "serial", feature = "rnode-tcp"))]
 pub async fn spawn_rnode_interface(
     config: RNodeConfig,
     id: InterfaceId,
@@ -999,105 +1012,112 @@ mod tests {
         assert!(matches!(cfg, PortConfig::Serial { path, .. } if path == "/dev/ttyUSB0"));
     }
 
-    #[cfg(feature = "serial")]
+    #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
     #[test]
     fn test_port_config_tcp_default_port() {
         let cfg = PortConfig::parse("tcp://192.168.1.1", 115200).unwrap();
         match cfg {
             PortConfig::Tcp { addr } => assert_eq!(addr, "192.168.1.1:7633"),
+            #[cfg(feature = "serial")]
             _ => panic!("expected Tcp variant"),
         }
     }
 
-    #[cfg(feature = "serial")]
+    #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
     #[test]
     fn test_port_config_tcp_explicit_port() {
         let cfg = PortConfig::parse("tcp://192.168.1.1:9000", 115200).unwrap();
         match cfg {
             PortConfig::Tcp { addr } => assert_eq!(addr, "192.168.1.1:9000"),
+            #[cfg(feature = "serial")]
             _ => panic!("expected Tcp variant"),
         }
     }
 
-    #[cfg(feature = "serial")]
+    #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
     #[test]
     fn test_port_config_tcp_hostname() {
         let cfg = PortConfig::parse("tcp://rnode.local", 115200).unwrap();
         match cfg {
             PortConfig::Tcp { addr } => assert_eq!(addr, "rnode.local:7633"),
+            #[cfg(feature = "serial")]
             _ => panic!("expected Tcp variant"),
         }
     }
 
-    #[cfg(feature = "serial")]
+    #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
     #[test]
     fn test_port_config_tcp_case_insensitive_scheme() {
         let cfg = PortConfig::parse("TCP://rnode.local", 115200).unwrap();
         match cfg {
             PortConfig::Tcp { addr } => assert_eq!(addr, "rnode.local:7633"),
+            #[cfg(feature = "serial")]
             _ => panic!("expected Tcp variant"),
         }
     }
 
-    #[cfg(feature = "serial")]
+    #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
     #[test]
     fn test_port_config_tcp_empty_host_rejected() {
         let err = PortConfig::parse("tcp://", 115200).unwrap_err();
         assert!(err.contains("missing TCP host"));
     }
 
-    #[cfg(feature = "serial")]
+    #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
     #[test]
     fn test_port_config_tcp_invalid_port_rejected() {
         let err = PortConfig::parse("tcp://rnode.local:notaport", 115200).unwrap_err();
         assert!(err.contains("invalid TCP port"));
     }
 
-    #[cfg(feature = "serial")]
+    #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
     #[test]
     fn test_port_config_tcp_missing_port_rejected() {
         let err = PortConfig::parse("tcp://rnode.local:", 115200).unwrap_err();
         assert!(err.contains("missing TCP port"));
     }
 
-    #[cfg(feature = "serial")]
+    #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
     #[test]
     fn test_port_config_tcp_bracketed_ipv6_default_port() {
         let cfg = PortConfig::parse("tcp://[2001:db8::1]", 115200).unwrap();
         match cfg {
             PortConfig::Tcp { addr } => assert_eq!(addr, "[2001:db8::1]:7633"),
+            #[cfg(feature = "serial")]
             _ => panic!("expected Tcp variant"),
         }
     }
 
-    #[cfg(feature = "serial")]
+    #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
     #[test]
     fn test_port_config_tcp_bracketed_ipv6_explicit_port() {
         let cfg = PortConfig::parse("tcp://[2001:db8::1]:9000", 115200).unwrap();
         match cfg {
             PortConfig::Tcp { addr } => assert_eq!(addr, "[2001:db8::1]:9000"),
+            #[cfg(feature = "serial")]
             _ => panic!("expected Tcp variant"),
         }
     }
 
-    #[cfg(feature = "serial")]
+    #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
     #[test]
     fn test_port_config_tcp_unbracketed_ipv6_default_port() {
         let cfg = PortConfig::parse("tcp://2001:db8::1", 115200).unwrap();
         match cfg {
             PortConfig::Tcp { addr } => assert_eq!(addr, "[2001:db8::1]:7633"),
+            #[cfg(feature = "serial")]
             _ => panic!("expected Tcp variant"),
         }
     }
 
-    #[cfg(feature = "serial")]
+    #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
     #[test]
     fn test_port_config_tcp_malformed_bracketed_ipv6_rejected() {
         let err = PortConfig::parse("tcp://[2001:db8::1", 115200).unwrap_err();
         assert!(err.contains("missing closing"));
     }
 
-    #[cfg(feature = "serial")]
+    #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
     #[test]
     fn test_tcp_eof_is_read_error() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -1116,7 +1136,7 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "serial")]
+    #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
     #[test]
     fn test_tcp_connect_accepts_timeout() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -1134,7 +1154,7 @@ mod tests {
         accept.join().unwrap();
     }
 
-    #[cfg(feature = "serial")]
+    #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
     #[tokio::test]
     async fn test_rnode_tcp_reconnects_after_eof() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();

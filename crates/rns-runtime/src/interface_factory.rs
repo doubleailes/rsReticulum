@@ -30,7 +30,7 @@ pub enum InterfaceConfig {
     #[cfg(feature = "serial")]
     KissSerial(KissSerialConfig),
     Auto(AutoInterfaceConfig),
-    #[cfg(feature = "serial")]
+    #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
     RNode(RNodeInterfaceConfig),
     Local(LocalInterfaceConfig),
     I2P(I2PInterfaceConfig),
@@ -79,7 +79,7 @@ pub struct AutoInterfaceConfig {
     pub mode: InterfaceMode,
 }
 
-#[cfg(feature = "serial")]
+#[cfg(any(feature = "serial", feature = "rnode-tcp"))]
 #[derive(Debug, Clone)]
 pub struct RNodeInterfaceConfig {
     pub name: String,
@@ -254,7 +254,12 @@ pub fn synthesize_interface(
         "KISSInterface" => synthesize_kiss_serial(name, section, mode),
         "AutoInterface" => synthesize_auto(name, section, mode),
         "RNodeInterface" => {
-            let port = section.get("port").unwrap_or("");
+            let port = section
+                .get("port")
+                .ok_or_else(|| InterfaceFactoryError::MissingField {
+                    name: name.to_string(),
+                    field: "port".to_string(),
+                })?;
             if port.starts_with("ble://") {
                 #[cfg(feature = "ble")]
                 {
@@ -274,17 +279,23 @@ pub fn synthesize_interface(
                     "RNodeInterface '{name}' is an Android USB-OTG entry — skipped at startup; re-add from the UI after plugging the device in"
                 )));
             }
-            // TODO: Once rns-interface exposes TCP-backed RNode without the
-            // `serial` feature, route `tcp://` ports through that path instead
-            // of rejecting them in non-serial builds.
-            #[cfg(feature = "serial")]
+            #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
             {
-                synthesize_rnode(name, section, mode)
+                let is_tcp = port
+                    .get(.."tcp://".len())
+                    .is_some_and(|prefix| prefix.eq_ignore_ascii_case("tcp://"));
+                if is_tcp || cfg!(feature = "serial") {
+                    synthesize_rnode(name, section, mode)
+                } else {
+                    Err(InterfaceFactoryError::Disabled(format!(
+                        "RNodeInterface '{name}' requires 'serial' feature for non-TCP ports"
+                    )))
+                }
             }
-            #[cfg(not(feature = "serial"))]
+            #[cfg(not(any(feature = "serial", feature = "rnode-tcp")))]
             {
                 Err(InterfaceFactoryError::Disabled(format!(
-                    "RNodeInterface '{name}' requires 'serial' feature for serial ports"
+                    "RNodeInterface '{name}' requires 'serial' or 'rnode-tcp' feature"
                 )))
             }
         }
@@ -527,7 +538,7 @@ fn synthesize_auto(
     }))
 }
 
-#[cfg(feature = "serial")]
+#[cfg(any(feature = "serial", feature = "rnode-tcp"))]
 fn synthesize_rnode(
     name: &str,
     section: &ConfigSection,
@@ -1063,9 +1074,10 @@ pub fn default_ifac_size_for(config: &InterfaceConfig) -> usize {
         #[cfg(feature = "serial")]
         InterfaceConfig::Serial(_)
         | InterfaceConfig::KissSerial(_)
-        | InterfaceConfig::RNode(_)
         | InterfaceConfig::RNodeMulti(_)
         | InterfaceConfig::AX25KISS(_) => 8,
+        #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+        InterfaceConfig::RNode(_) => 8,
         InterfaceConfig::Local(_) | InterfaceConfig::Pipe(_) => 8,
         #[cfg(feature = "ble")]
         InterfaceConfig::BleRNode(_) => 8,
@@ -1458,7 +1470,26 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "serial")]
+    #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+    #[test]
+    fn test_synthesize_rnode_tcp() {
+        let mut section = ConfigSection::new();
+        section.set("type", "RNodeInterface");
+        section.set("port", "tcp://rnode.local");
+        section.set("frequency", "915000000");
+
+        let config = synthesize_interface("rnode_tcp", &section).unwrap();
+        match config {
+            InterfaceConfig::RNode(c) => {
+                assert_eq!(c.name, "rnode_tcp");
+                assert_eq!(c.port, "tcp://rnode.local");
+                assert_eq!(c.frequency, 915000000);
+            }
+            _ => panic!("expected RNode"),
+        }
+    }
+
+    #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
     #[test]
     fn test_synthesize_rnode_missing_port() {
         let mut section = ConfigSection::new();
@@ -1473,12 +1504,12 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "serial")]
+    #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
     #[test]
     fn test_synthesize_rnode_missing_frequency() {
         let mut section = ConfigSection::new();
         section.set("type", "RNodeInterface");
-        section.set("port", "/dev/ttyACM0");
+        section.set("port", "tcp://rnode.local");
 
         match synthesize_interface("rnode_no_freq", &section) {
             Err(InterfaceFactoryError::MissingField { field, .. }) => {
