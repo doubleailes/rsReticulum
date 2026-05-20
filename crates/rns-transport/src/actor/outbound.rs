@@ -57,7 +57,7 @@ impl TransportActor {
                 self.broadcast_on_interfaces(&request.raw, None);
             }
             rns_wire::flags::DestinationType::Single | rns_wire::flags::DestinationType::Link => {
-                if let Some(path) = self.path_table.get(&request.destination_hash) {
+                if let Some(path) = self.path_table.get_live(&request.destination_hash) {
                     let target_interface = path.interface_id;
                     let path_hops = path.hops;
                     let path_next_hop = path.next_hop;
@@ -112,8 +112,8 @@ impl TransportActor {
 
                     // Touch the path so an actively-used route isn't culled
                     // for staleness while traffic is still flowing on it.
-                    if let Some(path) = self.path_table.get_mut(&request.destination_hash) {
-                        path.timestamp = now_f64();
+                    if let Some(path) = self.path_table.get_live_mut(&request.destination_hash) {
+                        path.touch();
                     }
                 } else {
                     let iface_names: Vec<&str> = self
@@ -325,7 +325,7 @@ impl TransportActor {
         }
 
         if !is_from_local_client {
-            if let Some(path) = self.path_table.get(&requested_dest) {
+            if let Some(path) = self.path_table.get_live(&requested_dest) {
                 if self.is_local_client_interface(path.interface_id) {
                     self.pending_local_path_requests
                         .insert(requested_dest, interface_id);
@@ -337,7 +337,7 @@ impl TransportActor {
         // shared instance's path cache even when the instance is not a transport
         // node. Ordinary peers still require transport mode.
         if let Some(path) = (self.is_transport_enabled || is_from_local_client)
-            .then(|| self.path_table.get(&requested_dest))
+            .then(|| self.path_table.get_live(&requested_dest))
             .flatten()
         {
             let requestor_is_next_hop =

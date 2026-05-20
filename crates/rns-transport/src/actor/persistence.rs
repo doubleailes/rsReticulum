@@ -517,10 +517,18 @@ impl TransportActor {
             match crate::persistence::load_announce_cache(&announce_path) {
                 Ok(entries) => {
                     let count = entries.len();
+                    let mut expired = 0usize;
                     for ae in entries {
                         if ae.destination_hash.len() == 16 {
                             let mut hash = [0u8; 16];
                             hash.copy_from_slice(&ae.destination_hash);
+                            let stale_pathless = !ae.retained
+                                && !self.recent_announces.contains_key(&hash)
+                                && now_ts - ae.timestamp > DESTINATION_TIMEOUT as f64;
+                            if stale_pathless {
+                                expired += 1;
+                                continue;
+                            }
                             let public_key = ae.public_key.and_then(|k| {
                                 if k.len() == 64 {
                                     let mut arr = [0u8; 64];
@@ -561,7 +569,7 @@ impl TransportActor {
                                 });
                         }
                     }
-                    debug!("loaded {} announce cache entries from disk", count);
+                    debug!(count, expired, "loaded announce cache entries from disk");
                 }
                 Err(e) => {
                     trace!("failed to load announce cache: {}", e);

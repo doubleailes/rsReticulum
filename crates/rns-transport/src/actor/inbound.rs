@@ -600,7 +600,7 @@ impl TransportActor {
         let from_local_client = self.is_local_client_interface(interface_id);
         let for_local_client = self
             .path_table
-            .get(&header.destination_hash)
+            .get_live(&header.destination_hash)
             .is_some_and(|path| self.is_local_client_interface(path.interface_id));
 
         let path_request_dest = Self::path_request_dest_hash();
@@ -733,8 +733,8 @@ impl TransportActor {
                 Some(target_interface),
             );
             self.send_to_interface(target_interface, &forwarded);
-            if let Some(path) = self.path_table.get_mut(&header.destination_hash) {
-                path.timestamp = now_f64();
+            if let Some(path) = self.path_table.get_live_mut(&header.destination_hash) {
+                path.touch();
             }
             trace!(
                 dest = hex::encode(header.destination_hash),
@@ -753,7 +753,7 @@ impl TransportActor {
         let from_local_client = self.is_local_client_interface(interface_id);
         let for_local_client = self
             .path_table
-            .get(&header.destination_hash)
+            .get_live(&header.destination_hash)
             .is_some_and(|path| self.is_local_client_interface(path.interface_id));
 
         let link_request_for_this_instance = header.transport_id.is_none()
@@ -787,14 +787,14 @@ impl TransportActor {
             from_local_client,
             for_local_client,
         ) {
-            let Some(path) = self.path_table.get(&header.destination_hash) else {
+            let Some(path) = self.path_table.get_live(&header.destination_hash) else {
                 return;
             };
             let remaining_hops = path.hops;
             let next_hop = path.next_hop;
             self.send_to_interface(target_interface, &forwarded);
-            if let Some(path) = self.path_table.get_mut(&header.destination_hash) {
-                path.timestamp = now_f64();
+            if let Some(path) = self.path_table.get_live_mut(&header.destination_hash) {
+                path.touch();
             }
 
             // Cache the relay so the matching LRPROOF can be routed back to
@@ -850,7 +850,7 @@ impl TransportActor {
         from_local_client: bool,
         for_local_client: bool,
     ) -> Option<(InterfaceId, Vec<u8>)> {
-        let path = self.path_table.get(&header.destination_hash)?;
+        let path = self.path_table.get_live(&header.destination_hash)?;
         if path.interface_id == interface_id && !for_local_client {
             return None;
         }

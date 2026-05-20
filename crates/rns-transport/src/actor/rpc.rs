@@ -10,7 +10,7 @@ impl TransportActor {
             TransportQuery::GetPathTable => {
                 let entries: Vec<PathTableRpcEntry> = self
                     .path_table
-                    .iter()
+                    .iter_live()
                     .map(|(hash, entry)| {
                         let iface_name = self
                             .interfaces
@@ -151,13 +151,13 @@ impl TransportActor {
                 TransportQueryResponse::Announces(entries)
             }
             TransportQuery::GetNextHop { dest } => {
-                let next_hop = self.path_table.get(&dest).and_then(|e| e.next_hop);
+                let next_hop = self.path_table.get_live(&dest).and_then(|e| e.next_hop);
                 TransportQueryResponse::HashResult(next_hop)
             }
             TransportQuery::GetNextHopIfName { dest } => {
                 let name = self
                     .path_table
-                    .get(&dest)
+                    .get_live(&dest)
                     .and_then(|e| self.interfaces.get(&e.interface_id).map(|i| i.name.clone()));
                 TransportQueryResponse::StringResult(name)
             }
@@ -196,7 +196,10 @@ impl TransportActor {
                 duration,
             )),
             TransportQuery::SuppressCurrentPathInterface { dest, duration } => {
-                let interface_id = self.path_table.get(&dest).map(|entry| entry.interface_id);
+                let interface_id = self
+                    .path_table
+                    .get_live(&dest)
+                    .map(|entry| entry.interface_id);
                 TransportQueryResponse::BoolResult(interface_id.is_some_and(|interface_id| {
                     self.suppress_path_interface(dest, interface_id, duration)
                 }))
@@ -430,19 +433,22 @@ impl TransportActor {
             TransportQuery::GetNextHopBitrate { dest } => {
                 let bitrate = self
                     .path_table
-                    .get(&dest)
+                    .get_live(&dest)
                     .and_then(|e| self.interfaces.get(&e.interface_id))
                     .map(|iface| iface.bitrate as f64);
                 TransportQueryResponse::FloatResult(bitrate)
             }
             TransportQuery::GetNextHopInterfaceId { dest } => {
-                let id = self.path_table.get(&dest).map(|e| e.interface_id as i64);
+                let id = self
+                    .path_table
+                    .get_live(&dest)
+                    .map(|e| e.interface_id as i64);
                 TransportQueryResponse::IntResult(id.unwrap_or(-1))
             }
             TransportQuery::FirstHopTimeout { dest } => {
                 let timeout = self
                     .path_table
-                    .get(&dest)
+                    .get_live(&dest)
                     .and_then(|e| self.interfaces.get(&e.interface_id))
                     .map(|iface| {
                         let per_byte_latency = 8.0 / iface.bitrate as f64;

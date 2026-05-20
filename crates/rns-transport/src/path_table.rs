@@ -63,6 +63,20 @@ impl PathEntry {
         now_f64() > self.expires
     }
 
+    /// Mark an actively used route as live. Reticulum's Python path cull is
+    /// timestamp based; Rust stores an explicit expiry, so both clocks must
+    /// move together when traffic proves the route is still useful.
+    pub fn touch(&mut self) {
+        let now = now_f64();
+        let lifetime = if self.expires > self.timestamp {
+            self.expires - self.timestamp
+        } else {
+            path_expiry(InterfaceMode::Full) as f64
+        };
+        self.timestamp = now;
+        self.expires = now + lifetime;
+    }
+
     /// Most recent blobs to persist — older entries can be regenerated from
     /// the wire on replay, so we cap the snapshot at `PERSIST_RANDOM_BLOBS`
     /// to keep the on-disk table small.
@@ -112,14 +126,22 @@ impl PathTable {
         self.entries.get_mut(dest_hash)
     }
 
+    pub fn get_live(&self, dest_hash: &[u8; 16]) -> Option<&PathEntry> {
+        self.entries.get(dest_hash).filter(|e| !e.is_expired())
+    }
+
+    pub fn get_live_mut(&mut self, dest_hash: &[u8; 16]) -> Option<&mut PathEntry> {
+        self.entries.get_mut(dest_hash).filter(|e| !e.is_expired())
+    }
+
     /// A path exists and has not yet expired. Callers should prefer this
     /// over `get().is_some()` so stale entries are not treated as routable.
     pub fn has_path(&self, dest_hash: &[u8; 16]) -> bool {
-        self.entries.get(dest_hash).is_some_and(|e| !e.is_expired())
+        self.get_live(dest_hash).is_some()
     }
 
     pub fn hops_to(&self, dest_hash: &[u8; 16]) -> Option<u8> {
-        self.entries.get(dest_hash).map(|e| e.hops)
+        self.get_live(dest_hash).map(|e| e.hops)
     }
 
     pub fn remove(&mut self, dest_hash: &[u8; 16]) -> Option<PathEntry> {
@@ -217,6 +239,10 @@ impl PathTable {
     pub fn iter(&self) -> impl Iterator<Item = (&DestHash, &PathEntry)> {
         self.entries.iter()
     }
+
+    pub fn iter_live(&self) -> impl Iterator<Item = (&DestHash, &PathEntry)> {
+        self.entries.iter().filter(|(_, entry)| !entry.is_expired())
+    }
 }
 
 impl Default for PathTable {
@@ -257,6 +283,37 @@ mod tests {
         assert!(table.has_path(&hash));
         assert_eq!(table.hops_to(&hash), Some(3));
         assert_eq!(table.len(), 1);
+    }
+
+    #[test]
+    fn expired_entries_are_not_live_paths() {
+        let mut table = PathTable::new();
+        let hash = [0xA1; 16];
+        let mut entry = PathEntry::new(None, 1, 1, InterfaceMode::Gateway);
+        entry.expires = now_f64() - 1.0;
+        table.insert(hash, entry);
+
+        assert!(table.get(&hash).is_some());
+        assert!(table.get_live(&hash).is_none());
+        assert!(table.get_live_mut(&hash).is_none());
+        assert!(!table.has_path(&hash));
+        assert_eq!(table.hops_to(&hash), None);
+        assert_eq!(table.iter().count(), 1);
+        assert_eq!(table.iter_live().count(), 0);
+    }
+
+    #[test]
+    fn touch_extends_explicit_expiry_with_original_lifetime() {
+        let mut entry = PathEntry::new(None, 1, 1, InterfaceMode::Roaming);
+        let lifetime = entry.expires - entry.timestamp;
+        entry.timestamp -= 10.0;
+        entry.expires -= 10.0;
+
+        entry.touch();
+
+        let new_lifetime = entry.expires - entry.timestamp;
+        assert!((new_lifetime - lifetime).abs() < 0.001);
+        assert!(entry.expires > now_f64());
     }
 
     #[test]

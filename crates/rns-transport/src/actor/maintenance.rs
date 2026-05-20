@@ -442,7 +442,7 @@ impl TransportActor {
                         return Some(*dest_hash);
                     }
 
-                    let active = self.path_table.get(dest_hash)?;
+                    let active = self.path_table.get_live(dest_hash)?;
                     let current_timebase =
                         path_timebase_from_random_blobs(active.random_blobs.iter());
                     let tunnel_timebase =

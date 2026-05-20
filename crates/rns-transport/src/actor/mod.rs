@@ -1037,7 +1037,7 @@ impl TransportActor {
                 if self.local_destinations.contains(destination_hash) {
                     return true;
                 }
-                let Some(path) = self.path_table.get(destination_hash) else {
+                let Some(path) = self.path_table.get_live(destination_hash) else {
                     return false;
                 };
                 !matches!(
@@ -1051,7 +1051,7 @@ impl TransportActor {
                 if self.local_destinations.contains(destination_hash) {
                     return true;
                 }
-                let Some(path) = self.path_table.get(destination_hash) else {
+                let Some(path) = self.path_table.get_live(destination_hash) else {
                     return false;
                 };
                 !matches!(
