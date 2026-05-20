@@ -149,10 +149,10 @@ impl PortConfig {
         } else {
             #[cfg(feature = "serial")]
             {
-                return Ok(Self::Serial {
+                Ok(Self::Serial {
                     path: port.to_string(),
                     baud,
-                });
+                })
             }
             #[cfg(not(feature = "serial"))]
             Err("RNode serial ports require the 'serial' feature; use tcp://host[:port] for TCP RNodes".to_string())
