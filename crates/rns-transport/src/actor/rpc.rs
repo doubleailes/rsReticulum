@@ -129,15 +129,24 @@ impl TransportActor {
                 let mut entries: Vec<AnnounceRpcEntry> = self
                     .recent_announces
                     .values()
-                    .map(|a| AnnounceRpcEntry {
-                        dest_hash: a.dest_hash,
-                        hops: a.hops,
-                        app_data: a.app_data.clone(),
-                        timestamp: a.timestamp,
-                        public_key: a.public_key,
-                        ratchet: a.ratchet,
-                        name_hash: a.name_hash,
-                        retained: a.retained,
+                    .map(|a| {
+                        let is_path_response =
+                            rns_wire::header::PacketHeader::unpack(&a.raw_packet)
+                                .ok()
+                                .is_some_and(|(header, _)| {
+                                    header.context == rns_wire::context::PacketContext::PathResponse
+                                });
+                        AnnounceRpcEntry {
+                            dest_hash: a.dest_hash,
+                            hops: a.hops,
+                            app_data: a.app_data.clone(),
+                            timestamp: a.timestamp,
+                            public_key: a.public_key,
+                            ratchet: a.ratchet,
+                            name_hash: a.name_hash,
+                            is_path_response,
+                            retained: a.retained,
+                        }
                     })
                     .collect();
                 // HashMap iteration order is unspecified; sort newest-first

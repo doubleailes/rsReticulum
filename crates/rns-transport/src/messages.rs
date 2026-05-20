@@ -598,6 +598,9 @@ pub struct AnnounceRpcEntry {
     pub ratchet: Option<[u8; 32]>,
     /// `SHA-256(app_name)[:10]` for the announced aspect.
     pub name_hash: [u8; 10],
+    /// True when the cached announce arrived as a path response instead of a
+    /// fresh network announce.
+    pub is_path_response: bool,
     /// Pinned via `RetainDestination`; the maintenance sweep skips the
     /// entry regardless of age while this is `true`.
     pub retained: bool,

@@ -456,6 +456,7 @@ mod tests {
                 public_key: Some([0x11; 64]),
                 ratchet: None,
                 name_hash: [0; 10],
+                is_path_response: false,
                 retained: false,
             },
             AnnounceRpcEntry {
@@ -466,6 +467,7 @@ mod tests {
                 public_key: Some([0x22; 64]),
                 ratchet: None,
                 name_hash: [0; 10],
+                is_path_response: false,
                 retained: false,
             },
         ];
