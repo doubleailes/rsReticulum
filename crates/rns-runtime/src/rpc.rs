@@ -1721,7 +1721,7 @@ mod tests {
             announce_rate_target: Some(3600.0),
             announce_rate_grace: Some(5),
             announce_rate_penalty: Some(30.0),
-            announce_cap: 2.0,
+            announce_cap: 0.02,
             ifac_size: 0,
             tx_drops: 1,
         }

@@ -487,7 +487,7 @@ mod tests {
                                 announce_rate_target: None,
                                 announce_rate_grace: None,
                                 announce_rate_penalty: None,
-                                announce_cap: 2.0,
+                                announce_cap: 0.02,
                                 ifac_size: 0,
                                 tx_drops: 0,
                             }];

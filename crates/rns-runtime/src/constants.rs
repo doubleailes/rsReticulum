@@ -12,9 +12,12 @@ pub const RESOURCE_CACHE: u64 = 86400;
 pub const MAX_QUEUED_ANNOUNCES: usize = 16384;
 pub const QUEUED_ANNOUNCE_LIFE: u64 = 86400;
 
-/// Percentage matching Python `Reticulum.ANNOUNCE_CAP = 2`; transport actor
-/// divides by 100 before applying to bitrate math.
-pub const ANNOUNCE_CAP: f64 = 2.0;
+/// Announce bandwidth cap as a fraction of interface bitrate (2%).
+///
+/// Python exposes/configures this as `2` percent, then stores `0.02` on live
+/// interfaces. Runtime registration must hand the transport actor the stored
+/// fraction, because queue spacing is calculated as `tx_time / announce_cap`.
+pub const ANNOUNCE_CAP: f64 = 0.02;
 
 pub const MINIMUM_BITRATE: u64 = 5;
 pub const IFAC_MIN_SIZE: usize = 1;

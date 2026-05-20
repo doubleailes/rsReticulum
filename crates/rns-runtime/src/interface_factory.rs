@@ -1032,7 +1032,9 @@ impl InterfacePostInit {
         Self {
             outgoing: section.get_bool("outgoing").unwrap_or(true),
             bitrate: section.get_uint("bitrate"),
-            announce_cap: section.get_float("announce_cap"),
+            announce_cap: section
+                .get_float("announce_cap")
+                .and_then(normalize_announce_cap_percent),
             announce_rate_target,
             announce_rate_grace: section
                 .get_uint("announce_rate_grace")
@@ -1059,6 +1061,14 @@ impl InterfacePostInit {
     pub fn with_default_ifac_size(mut self, size: usize) -> Self {
         self.default_ifac_size = size;
         self
+    }
+}
+
+fn normalize_announce_cap_percent(value: f64) -> Option<f64> {
+    if value > 0.0 && value <= 100.0 {
+        Some(value / 100.0)
+    } else {
+        None
     }
 }
 
@@ -1622,12 +1632,32 @@ mod tests {
         assert_eq!(pi.ifac_passphrase.as_deref(), Some("secret"));
         assert_eq!(pi.ifac_size, Some(16));
         assert!(!pi.ingress_control);
-        assert!((pi.announce_cap.unwrap() - 5.0).abs() < f64::EPSILON);
+        assert!((pi.announce_cap.unwrap() - 0.05).abs() < f64::EPSILON);
         assert_eq!(pi.ingress_overrides.enabled, Some(false));
         assert_eq!(pi.ingress_overrides.pr_burst_freq_new, Some(4.5));
         assert_eq!(pi.ingress_overrides.pr_burst_freq, Some(9.5));
         assert_eq!(pi.ingress_overrides.ec_pr_freq, Some(6.5));
         assert_eq!(pi.ingress_overrides.egress_control, Some(true));
+    }
+
+    #[test]
+    fn announce_cap_config_uses_python_percent_shape() {
+        let mut section = ConfigSection::new();
+        section.set("announce_cap", "2");
+        let pi = InterfacePostInit::from_section(&section);
+        assert_eq!(pi.announce_cap, Some(0.02));
+
+        section.set("announce_cap", "100");
+        let pi = InterfacePostInit::from_section(&section);
+        assert_eq!(pi.announce_cap, Some(1.0));
+
+        section.set("announce_cap", "0");
+        let pi = InterfacePostInit::from_section(&section);
+        assert_eq!(pi.announce_cap, None);
+
+        section.set("announce_cap", "101");
+        let pi = InterfacePostInit::from_section(&section);
+        assert_eq!(pi.announce_cap, None);
     }
 
     #[test]

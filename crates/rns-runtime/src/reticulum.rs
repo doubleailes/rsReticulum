@@ -3808,6 +3808,56 @@ egress_control = Yes
     }
 
     #[tokio::test]
+    async fn runtime_registration_uses_fractional_announce_cap() {
+        let (transport_tx, mut transport_rx) = mpsc::channel::<TransportMessage>(4);
+        let interface_controls: InterfaceControlMap =
+            Arc::new(std::sync::Mutex::new(HashMap::new()));
+
+        let post_init = interface_factory::InterfacePostInit::from_section(&ConfigSection::new());
+        register_interface_with_post_init(
+            &transport_tx,
+            test_interface_handle(920_001, None, "default-cap"),
+            &post_init,
+            None,
+            &interface_controls,
+        )
+        .await;
+        let TransportMessage::RegisterInterface { entry, .. } =
+            transport_rx.recv().await.expect("default cap registration")
+        else {
+            panic!("expected RegisterInterface");
+        };
+        assert!((entry.announce_cap - ANNOUNCE_CAP).abs() < f64::EPSILON);
+
+        let mut section = ConfigSection::new();
+        section.set("announce_cap", "5.0");
+        let post_init = interface_factory::InterfacePostInit::from_section(&section);
+        register_interface_with_post_init(
+            &transport_tx,
+            test_interface_handle(920_002, None, "custom-cap"),
+            &post_init,
+            None,
+            &interface_controls,
+        )
+        .await;
+        let TransportMessage::RegisterInterface { entry, .. } =
+            transport_rx.recv().await.expect("custom cap registration")
+        else {
+            panic!("expected RegisterInterface");
+        };
+        assert!((entry.announce_cap - 0.05).abs() < f64::EPSILON);
+
+        interface_tasks()
+            .lock()
+            .expect("interface_tasks mutex poisoned")
+            .remove(&920_001);
+        interface_tasks()
+            .lock()
+            .expect("interface_tasks mutex poisoned")
+            .remove(&920_002);
+    }
+
+    #[tokio::test]
     async fn dynamic_child_inherits_parent_control_settings() {
         let parent_id = 910_001;
         let child_id = 910_002;
