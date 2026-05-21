@@ -7,7 +7,7 @@
 
 [![License: AGPL-3.0-or-later](https://img.shields.io/badge/license-AGPL--3.0--or--later-blue.svg)](LICENSE)
 [![Rust 1.85+](https://img.shields.io/badge/rust-1.85%2B-orange.svg)](https://www.rust-lang.org)
-[![Reticulum 1.2.5](https://img.shields.io/badge/target-Reticulum%201.2.4-success.svg)](https://reticulum.network/)
+[![Reticulum 1.2.5](https://img.shields.io/badge/target-Reticulum%201.2.5-success.svg)](https://reticulum.network/)
 [![Status](https://img.shields.io/badge/status-experimental-yellow.svg)](#feature-status)
 
 [Reticulum Manual](https://reticulum.network/manual/) |
