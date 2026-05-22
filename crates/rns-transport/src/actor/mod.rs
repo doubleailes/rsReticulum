@@ -102,6 +102,10 @@ pub struct TransportActor {
     /// defers to the shared instance for routing decisions rather than
     /// originating them locally.
     pub is_shared_instance: bool,
+    /// Sticky process-mode marker for shared-instance clients. It remains true
+    /// after a shared connection drops so shutdown cannot persist an empty
+    /// local routing table over the real shared instance's cache.
+    pub shared_instance_client_mode: bool,
 
     pub storage_dir: Option<PathBuf>,
 
@@ -234,6 +238,7 @@ impl TransportActor {
             transport_identity_hash: None,
             blackhole_sources: Vec::new(),
             is_shared_instance: false,
+            shared_instance_client_mode: false,
             storage_dir: None,
             last_state_save: 0.0,
             state_dirty: false,
@@ -452,10 +457,13 @@ impl TransportActor {
             TransportMessage::SharedConnectionLost => {
                 tracing::warn!("shared instance connection lost — suspending transport");
                 self.is_shared_instance = false;
+                self.shared_instance_client_mode = true;
                 self.clear_shared_connection_state();
             }
             TransportMessage::SharedConnectionRestored { interface_id } => {
                 tracing::info!(interface_id, "shared instance connection restored");
+                self.shared_instance_client_mode = true;
+                self.clear_shared_connection_state();
                 self.is_shared_instance = true;
                 self.request_announces_from_local_destinations();
             }
@@ -656,6 +664,10 @@ impl TransportActor {
         self.held_announces.clear();
         self.reverse_table = ReverseTable::new();
         self.tunnel_table = TunnelTable::new();
+        self.pending_path_entries.clear();
+        self.pending_tunnel_entries.clear();
+        self.path_requests.clear();
+        self.path_states.clear();
         self.packet_metrics.clear();
         self.packet_metrics_order.clear();
         self.discovery_path_requests.clear();
@@ -898,6 +910,7 @@ impl TransportActor {
                 "shared instance peer interface deregistered — clearing shared routing state"
             );
             self.is_shared_instance = false;
+            self.shared_instance_client_mode = true;
             self.clear_shared_connection_state();
         }
     }
@@ -970,17 +983,20 @@ impl TransportActor {
         match entry.tx.try_send(data) {
             Ok(()) => {}
             Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                entry
+                let tx_drops = entry
                     .tx_drops
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                tracing::error!(
-                    interface_id = id,
-                    interface_name = %entry.name,
-                    queue_remaining = entry.tx.capacity(),
-                    queue_max = entry.tx.max_capacity(),
-                    tx_drops = entry.tx_drops.load(std::sync::atomic::Ordering::Relaxed),
-                    "PACKET DROPPED: interface TX channel full"
-                );
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                    + 1;
+                if tx_drops <= 8 || tx_drops.is_power_of_two() {
+                    tracing::error!(
+                        interface_id = id,
+                        interface_name = %entry.name,
+                        queue_remaining = entry.tx.capacity(),
+                        queue_max = entry.tx.max_capacity(),
+                        tx_drops,
+                        "PACKET DROPPED: interface TX channel full"
+                    );
+                }
             }
             Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
                 tracing::info!(
@@ -1605,6 +1621,31 @@ mod tests {
 
         actor.send_to_interface(1, &[0x01, 0x02]);
         assert!(rx.try_recv().is_err()); // Should not have sent
+    }
+
+    #[test]
+    fn test_send_to_interface_full_channel_counts_drops_without_deregistering() {
+        let (mut actor, _tx) = TransportActor::new();
+        let (tx, mut rx) = mpsc::channel(1);
+        let tx_drops = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let mut entry = InterfaceEntry::new(
+            "full".to_string(),
+            InterfaceMode::Full,
+            InterfaceDirection::bidirectional(),
+            1_000_000,
+            500,
+            tx,
+        );
+        entry.tx_drops = tx_drops.clone();
+        actor.interfaces.insert(1, entry);
+
+        actor.send_to_interface(1, &[0x01]);
+        actor.send_to_interface(1, &[0x02]);
+        actor.send_to_interface(1, &[0x03]);
+
+        assert_eq!(rx.try_recv().unwrap(), Bytes::from_static(&[0x01]));
+        assert_eq!(tx_drops.load(std::sync::atomic::Ordering::Relaxed), 2);
+        assert!(actor.interfaces.contains_key(&1));
     }
 
     #[test]
@@ -5629,6 +5670,60 @@ mod tests {
     }
 
     #[test]
+    fn shared_connection_restored_discards_local_routing_state() {
+        let (mut actor, _tx) = TransportActor::new();
+        actor.path_table.insert(
+            [0xAA; 16],
+            crate::path_table::PathEntry::new(None, 1, 7, InterfaceMode::Gateway),
+        );
+        actor
+            .pending_path_entries
+            .push(crate::persistence::PersistedPathEntry {
+                destination_hash: vec![0xBB; 16],
+                timestamp: 1.0,
+                next_hop: None,
+                hops: 1,
+                expires: 9999999999.0,
+                random_blobs: Vec::new(),
+                interface_id: 0,
+                interface_name: Some("SharedInstanceClient".to_string()),
+                interface_hash: None,
+                packet_hash: None,
+            });
+        actor.path_requests.insert([0xCC; 16], 1.0);
+        actor
+            .path_states
+            .insert([0xDD; 16], crate::constants::PathState::Unresponsive);
+        actor.recent_announces.insert(
+            [0xEE; 16],
+            RecentAnnounce {
+                dest_hash: [0xEE; 16],
+                hops: 1,
+                app_data: None,
+                timestamp: 1.0,
+                public_key: Some([0x11; 64]),
+                ratchet: None,
+                raw_packet: Vec::new(),
+                retained: false,
+                name_hash: [0; 10],
+            },
+        );
+
+        actor.handle_message(TransportMessage::SharedConnectionRestored { interface_id: 42 });
+
+        assert!(actor.is_shared_instance);
+        assert!(actor.shared_instance_client_mode);
+        assert!(!actor.path_table.has_path(&[0xAA; 16]));
+        assert!(actor.pending_path_entries.is_empty());
+        assert!(actor.path_requests.is_empty());
+        assert!(actor.path_states.is_empty());
+        assert!(
+            actor.recent_announces.contains_key(&[0xEE; 16]),
+            "known destination metadata is retained separately from routing state"
+        );
+    }
+
+    #[test]
     fn legacy_v2_path_snapshot_is_dropped_on_load() {
         // v2 had no `interface_name`; entries can't be rebound, so they
         // must not leak into pending or the live table.
@@ -5827,6 +5922,48 @@ mod tests {
             actor.last_state_save > 0.0,
             "save should bump last_state_save"
         );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn shared_instance_save_state_skips_transport_snapshots() {
+        let dir = std::env::temp_dir().join("rns_shared_client_skip_save");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let (mut actor, _tx) = TransportActor::new();
+        actor.storage_dir = Some(dir.clone());
+        actor.is_shared_instance = true;
+        actor.shared_instance_client_mode = true;
+        actor.state_dirty = true;
+        actor.path_table.insert(
+            [0xAA; 16],
+            crate::path_table::PathEntry::new(None, 1, 1, InterfaceMode::Gateway),
+        );
+        actor.recent_announces.insert(
+            [0xBB; 16],
+            RecentAnnounce {
+                dest_hash: [0xBB; 16],
+                hops: 1,
+                app_data: None,
+                timestamp: 1.0,
+                public_key: Some([0x22; 64]),
+                ratchet: None,
+                raw_packet: Vec::new(),
+                retained: false,
+                name_hash: [0; 10],
+            },
+        );
+
+        actor.save_state();
+
+        assert!(!dir.join("path_table.msgpack").exists());
+        assert!(!dir.join("destination_table").exists());
+        assert!(!dir.join("announce_cache.msgpack").exists());
+        assert!(!dir.join("packet_hashlist").exists());
+        assert!(!actor.state_dirty);
+        assert!(actor.last_state_save > 0.0);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

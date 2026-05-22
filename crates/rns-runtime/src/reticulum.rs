@@ -1555,6 +1555,20 @@ fn next_id(id_gen: &Arc<AtomicU64>) -> u64 {
     id_gen.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
+fn ingress_for_role(
+    role: rns_transport::messages::InterfaceRole,
+    ingress_overrides: &rns_transport::ingress::IngressOverrides,
+) -> rns_transport::ingress::IngressController {
+    match role {
+        rns_transport::messages::InterfaceRole::LocalClient
+        | rns_transport::messages::InterfaceRole::SharedInstancePeer => {
+            rns_transport::ingress::IngressController::disabled()
+        }
+        _ if ingress_overrides.is_empty() => rns_transport::ingress::IngressController::new(),
+        _ => rns_transport::ingress::IngressController::with_overrides(ingress_overrides),
+    }
+}
+
 /// Preserve Python Reticulum's six interface modes in the transport actor.
 /// Full and point-to-point currently share gateway's forwarding policy, but
 /// retaining the variants keeps stats/RPC and future policy changes honest.
@@ -1624,11 +1638,7 @@ async fn register_interface_handle_with_role_and_overrides(
 ) {
     let name = handle.name.clone();
     let id = handle.id;
-    let ingress = if ingress_overrides.is_empty() {
-        rns_transport::ingress::IngressController::new()
-    } else {
-        rns_transport::ingress::IngressController::with_overrides(&ingress_overrides)
-    };
+    let ingress = ingress_for_role(role, &ingress_overrides);
     // Stash the driver task so `teardown_interface` can abort it; drop alone only detaches.
     interface_tasks()
         .lock()
@@ -3911,6 +3921,46 @@ egress_control = Yes
             .lock()
             .expect("interface_tasks mutex poisoned")
             .remove(&child_id);
+    }
+
+    #[tokio::test]
+    async fn shared_instance_interface_roles_disable_ingress_control() {
+        let (transport_tx, mut transport_rx) = mpsc::channel::<TransportMessage>(4);
+        let interface_controls: InterfaceControlMap =
+            Arc::new(std::sync::Mutex::new(HashMap::new()));
+
+        let mut overrides = rns_transport::ingress::IngressOverrides::default();
+        overrides.enabled = Some(true);
+        overrides.burst_freq_new = Some(1.0);
+
+        for (id, role) in [
+            (910_201, rns_transport::messages::InterfaceRole::LocalClient),
+            (
+                910_202,
+                rns_transport::messages::InterfaceRole::SharedInstancePeer,
+            ),
+        ] {
+            register_interface_handle_with_role_and_overrides(
+                &transport_tx,
+                test_interface_handle(id, None, role.as_str()),
+                role,
+                overrides.clone(),
+                &interface_controls,
+            )
+            .await;
+
+            let msg = transport_rx.recv().await.expect("registration");
+            let TransportMessage::RegisterInterface { entry, .. } = msg else {
+                panic!("expected RegisterInterface");
+            };
+            assert_eq!(entry.role, role);
+            assert!(!entry.ingress.is_enabled());
+
+            interface_tasks()
+                .lock()
+                .expect("interface_tasks mutex poisoned")
+                .remove(&id);
+        }
     }
 
     #[test]

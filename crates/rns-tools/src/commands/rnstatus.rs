@@ -208,6 +208,10 @@ async fn run_local_once(args: &Args) -> ExitCode {
         match local_rpc_request(&endpoint, &rpc_key, &RpcRequest::GetInterfaceStats, timeout).await
         {
             Ok(RpcResponse::InterfaceStats(v)) => v,
+            Ok(RpcResponse::Error(e)) => {
+                eprintln!("rnstatus-rs: {e}");
+                return ExitCode::from(1);
+            }
             Ok(other) => {
                 eprintln!("rnstatus-rs: unexpected response: {other:?}");
                 return ExitCode::from(1);

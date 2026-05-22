@@ -222,17 +222,23 @@ async fn query_transport(
     query: rns_transport::messages::TransportQuery,
 ) -> Option<rns_transport::messages::TransportQueryResponse> {
     let (tx, rx) = tokio::sync::oneshot::channel();
-    if transport_tx
-        .send(TransportMessage::Rpc {
+    let budget = std::time::Duration::from_secs(5);
+    let started = std::time::Instant::now();
+    match tokio::time::timeout(
+        budget,
+        transport_tx.send(TransportMessage::Rpc {
             query,
             response_tx: tx,
-        })
-        .await
-        .is_err()
+        }),
+    )
+    .await
     {
-        return None;
+        Ok(Ok(())) => {}
+        Ok(Err(_)) => return None,
+        Err(_) => return None,
     }
-    tokio::time::timeout(std::time::Duration::from_secs(5), rx)
+    let remaining = budget.checked_sub(started.elapsed())?;
+    tokio::time::timeout(remaining, rx)
         .await
         .ok()
         .and_then(|r| r.ok())
@@ -303,7 +309,9 @@ async fn process_rpc_request(
                         .collect();
                     RpcResponse::InterfaceStats(rpc_entries)
                 }
-                _ => RpcResponse::InterfaceStats(Vec::new()),
+                _ => RpcResponse::Error(
+                    "transport actor did not answer interface stats query".to_string(),
+                ),
             }
         }
         RpcRequest::GetRateTable => {

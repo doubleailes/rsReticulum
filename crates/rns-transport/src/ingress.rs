@@ -376,11 +376,12 @@ impl IngressController {
     }
 
     /// Release at most one held announce per call — the one with the lowest
-    /// hop count, so short-path announces win priority. `None` means either
-    /// the burst is still active, the release cooldown has not elapsed, or
-    /// the buffer is empty.
+    /// hop count, so short-path announces win priority. This intentionally
+    /// does not consult `should_ingress_limit()`: upstream releases held
+    /// announces based on release time and current announce frequency, even if
+    /// the displayed burst state has not cleared yet.
     pub fn try_release_held(&mut self) -> Option<HeldAnnounce> {
-        if self.should_ingress_limit() || self.held_announces.is_empty() {
+        if self.held_announces.is_empty() {
             return None;
         }
 
@@ -395,7 +396,12 @@ impl IngressController {
             self.burst_freq
         };
 
-        if self.incoming_announce_frequency() >= freq_threshold {
+        let ia_freq = frequency_from_deque_mut(
+            &mut self.ia_freq_deque,
+            IC_DEQUE_MIN_SAMPLE,
+            Duration::from_secs_f64(AR_FREQ_DECAY),
+        );
+        if ia_freq >= freq_threshold {
             return None;
         }
 
@@ -630,6 +636,47 @@ mod tests {
         );
         assert!(ctrl.should_ingress_limit());
         assert!(!ctrl.is_burst_active());
+    }
+
+    #[test]
+    fn held_release_poll_does_not_activate_burst_when_nothing_is_held() {
+        let mut ctrl = IngressController::new();
+        push_samples(&mut ctrl.ia_freq_deque, IA_FREQ_SAMPLES, 4, 1.0, 0.1);
+
+        assert!(ctrl.try_release_held().is_none());
+        assert!(!ctrl.is_burst_active());
+    }
+
+    #[test]
+    fn held_announces_release_even_if_burst_state_is_waiting_for_clear_samples() {
+        let mut ctrl = IngressController::new();
+        push_samples(&mut ctrl.ia_freq_deque, IA_FREQ_SAMPLES, 4, 1.0, 0.1);
+        assert!(ctrl.should_ingress_limit());
+        assert!(ctrl.is_burst_active());
+
+        ctrl.burst_activated = Instant::now() - Duration::from_secs_f64(IC_BURST_HOLD + 1.0);
+        ctrl.ia_freq_deque.clear();
+        push_samples(
+            &mut ctrl.ia_freq_deque,
+            IA_FREQ_SAMPLES,
+            IC_BURST_MIN_SAMPLES,
+            AR_FREQ_DECAY + 1.0,
+            0.1,
+        );
+        assert!(ctrl.should_ingress_limit());
+        assert!(ctrl.is_burst_active());
+
+        ctrl.held_release = Instant::now() - Duration::from_secs(1);
+        ctrl.hold_announce(HeldAnnounce {
+            raw: Bytes::from_static(&[1, 2, 3]),
+            destination_hash: [0xA5; 16],
+            hops: 1,
+            receiving_interface_id: 1,
+        });
+
+        let released = ctrl.try_release_held();
+        assert!(released.is_some());
+        assert!(ctrl.is_burst_active());
     }
 
     #[test]

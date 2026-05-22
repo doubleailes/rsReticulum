@@ -56,6 +56,13 @@ impl TransportActor {
     /// `state_dirty` and bumps `last_state_save` so the periodic trigger
     /// doesn't double-fire.
     pub(super) fn save_routing_state(&mut self) {
+        if self.shared_instance_client_mode {
+            trace!("skipping routing-state save in shared-instance client mode");
+            self.state_dirty = false;
+            self.last_state_save = now();
+            return;
+        }
+
         if let Some(ref dir) = self.storage_dir {
             let interface_names: std::collections::HashMap<u64, String> = self
                 .interfaces
@@ -170,6 +177,9 @@ impl TransportActor {
     pub(super) fn save_state(&mut self) {
         // Routing state first so the order matches the periodic-save shape.
         self.save_routing_state();
+        if self.shared_instance_client_mode {
+            return;
+        }
 
         if let Some(ref dir) = self.storage_dir {
             let hashlist_path = dir.join("packet_hashlist");
