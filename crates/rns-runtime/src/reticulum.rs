@@ -3929,9 +3929,11 @@ egress_control = Yes
         let interface_controls: InterfaceControlMap =
             Arc::new(std::sync::Mutex::new(HashMap::new()));
 
-        let mut overrides = rns_transport::ingress::IngressOverrides::default();
-        overrides.enabled = Some(true);
-        overrides.burst_freq_new = Some(1.0);
+        let overrides = rns_transport::ingress::IngressOverrides {
+            enabled: Some(true),
+            burst_freq_new: Some(1.0),
+            ..Default::default()
+        };
 
         for (id, role) in [
             (910_201, rns_transport::messages::InterfaceRole::LocalClient),
