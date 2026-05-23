@@ -46,6 +46,45 @@ fn recent_announce_from_cached_packet(
     recent
 }
 
+fn python_announce_cache_index(
+    announce_cache_dir: &std::path::Path,
+) -> Option<std::collections::HashSet<String>> {
+    match std::fs::read_dir(announce_cache_dir) {
+        Ok(entries) => {
+            let mut names = std::collections::HashSet::new();
+            for entry in entries.flatten() {
+                if let Some(name) = entry.file_name().to_str()
+                    && name.len() == 64
+                    && name.as_bytes().iter().all(u8::is_ascii_hexdigit)
+                {
+                    names.insert(name.to_ascii_lowercase());
+                }
+            }
+            Some(names)
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            Some(std::collections::HashSet::new())
+        }
+        Err(_) => None,
+    }
+}
+
+fn load_indexed_python_cached_announce(
+    announce_cache_dir: &std::path::Path,
+    cache_index: Option<&std::collections::HashSet<String>>,
+    packet_hash: &[u8; 32],
+) -> Result<Option<crate::persistence::PythonCachedAnnounce>, crate::persistence::PersistenceError>
+{
+    if let Some(index) = cache_index {
+        let name = hex::encode(packet_hash);
+        if !index.contains(&name) {
+            return Ok(None);
+        }
+    }
+
+    crate::persistence::load_python_cached_announce(announce_cache_dir, packet_hash)
+}
+
 impl TransportActor {
     /// Flush the small/critical routing-state files: path_table,
     /// announce_cache, blackhole_table, tunnel_table. Hashlist is excluded —
@@ -242,13 +281,15 @@ impl TransportActor {
                     let mut missing_cache = 0usize;
                     let mut pending = 0usize;
                     let announce_cache_dir = dir.join("cache").join("announces");
+                    let announce_cache_index = python_announce_cache_index(&announce_cache_dir);
                     for pe in entries {
                         if pe.expires <= now_ts {
                             expired += 1;
                             continue;
                         }
-                        let cached = match crate::persistence::load_python_cached_announce(
+                        let cached = match load_indexed_python_cached_announce(
                             &announce_cache_dir,
+                            announce_cache_index.as_ref(),
                             &pe.packet_hash,
                         ) {
                             Ok(Some(cached)) => cached,
@@ -389,6 +430,7 @@ impl TransportActor {
                     let mut legacy = 0usize;
                     let mut pending = 0usize;
                     let announce_cache_dir = dir.join("cache").join("announces");
+                    let announce_cache_index = python_announce_cache_index(&announce_cache_dir);
                     for te in entries {
                         if te.expires <= now_ts {
                             expired += 1;
@@ -409,8 +451,9 @@ impl TransportActor {
                                 interface_hash =
                                     tp.interface_hash.as_ref().map(|hash| hash.to_vec());
                             }
-                            let cached = match crate::persistence::load_python_cached_announce(
+                            let cached = match load_indexed_python_cached_announce(
                                 &announce_cache_dir,
+                                announce_cache_index.as_ref(),
                                 &tp.packet_hash,
                             ) {
                                 Ok(Some(cached)) => cached,

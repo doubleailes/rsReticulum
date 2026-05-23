@@ -110,7 +110,7 @@ pub struct TransportActor {
     pub storage_dir: Option<PathBuf>,
 
     /// Last save (Unix seconds) — gates the periodic save tick. 0 forces an
-    /// initial baseline write after `SetStoragePaths`.
+    /// initial baseline write after storage initialisation.
     pub last_state_save: f64,
 
     /// Set when persisted-state mutates; cleared after each `save_state`.
@@ -253,6 +253,17 @@ impl TransportActor {
         };
 
         (actor, tx)
+    }
+
+    /// Load persisted state before the actor starts draining live traffic.
+    ///
+    /// Startup restore can touch thousands of Python cache files on slow
+    /// storage. Doing that work after `run()` starts blocks interface
+    /// registration, RPC queries and inbound packet processing behind a
+    /// synchronous `SetStoragePaths` message.
+    pub fn initialize_storage(&mut self, storage_dir: PathBuf) {
+        self.storage_dir = Some(storage_dir);
+        self.load_state();
     }
 
     /// Run the actor event loop. Messages are processed sequentially so no
@@ -5629,6 +5640,75 @@ mod tests {
         );
         // Live path table is still empty until RegisterInterface arrives.
         assert!(!actor.path_table.has_path(&[0xAA; 16]));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn initialize_storage_uses_python_cache_index_for_destination_table() {
+        let dir = std::env::temp_dir().join("rns_load_python_destination_cache_index");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs_f64();
+        let cached_dest = [0xCA; 16];
+        let missing_dest = [0xDB; 16];
+        let mut cached_entry =
+            crate::path_table::PathEntry::new(None, 1, 7, InterfaceMode::Gateway);
+        cached_entry.timestamp = now;
+        cached_entry.expires = now + 3600.0;
+        cached_entry.packet_hash = Some([0x11; 32]);
+        let mut missing_entry =
+            crate::path_table::PathEntry::new(None, 1, 7, InterfaceMode::Gateway);
+        missing_entry.timestamp = now;
+        missing_entry.expires = now + 3600.0;
+        missing_entry.packet_hash = Some([0x22; 32]);
+
+        let mut table = crate::path_table::PathTable::new();
+        table.insert(cached_dest, cached_entry);
+        table.insert(missing_dest, missing_entry);
+
+        let mut names = std::collections::HashMap::new();
+        names.insert(7u64, "Border_TCP".to_string());
+        crate::persistence::save_python_destination_table(
+            &table,
+            &names,
+            &dir.join("destination_table"),
+        )
+        .unwrap();
+
+        let announces = [RecentAnnounce {
+            dest_hash: cached_dest,
+            hops: 1,
+            app_data: None,
+            timestamp: now,
+            public_key: None,
+            ratchet: None,
+            raw_packet: vec![0xFE; 42],
+            retained: false,
+            name_hash: [0u8; 10],
+        }];
+        crate::persistence::save_python_announce_cache_for_paths(
+            &table,
+            announces.iter(),
+            &names,
+            &dir.join("cache").join("announces"),
+        )
+        .unwrap();
+
+        let (mut actor, _tx) = TransportActor::new();
+        actor.initialize_storage(dir.clone());
+
+        assert_eq!(actor.pending_path_entries.len(), 1);
+        assert_eq!(
+            actor.pending_path_entries[0].destination_hash,
+            cached_dest.to_vec()
+        );
+        assert!(actor.recent_announces.contains_key(&cached_dest));
+        assert!(!actor.recent_announces.contains_key(&missing_dest));
 
         let _ = std::fs::remove_dir_all(&dir);
     }

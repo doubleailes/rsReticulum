@@ -949,15 +949,12 @@ pub async fn init(
 
     let (mut actor, transport_tx) = rns_transport::actor::TransportActor::new();
     actor.is_foreground = is_foreground.clone();
+    actor.initialize_storage(paths.storage_dir.clone());
 
     let shutdown_tx = transport_tx.clone();
     let shutdown_clone = shutdown.clone();
     tokio::spawn(async move {
         actor.run().await;
-    });
-
-    let _ = transport_tx.try_send(TransportMessage::SetStoragePaths {
-        storage_dir: paths.storage_dir.clone(),
     });
 
     // Python Reticulum has a persistent transport identity. The actor needs
