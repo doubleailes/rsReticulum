@@ -566,6 +566,15 @@ pub fn build_radio_off_sequence() -> Vec<u8> {
     out
 }
 
+/// KISS sequence matching upstream RNodeInterface.detach(): radio off, then
+/// leave host-controlled mode so device UI state is reset before disconnect.
+pub fn build_detach_sequence() -> Vec<u8> {
+    let mut out = Vec::with_capacity(8);
+    kiss::frame_with_command_into(CMD_RADIO_STATE, &[RADIO_STATE_OFF], &mut out);
+    kiss::frame_with_command_into(CMD_LEAVE, &[0xFF], &mut out);
+    out
+}
+
 // Hot-path interface adapters pass this enum around directly; boxing the
 // packet variant would add allocation to every received frame.
 #[allow(clippy::large_enum_variant)]
@@ -991,6 +1000,20 @@ mod tests {
         let mut deframer = kiss::RawKissDeframer::new();
         let frames = deframer.feed(&seq);
         assert_eq!(frames, vec![(CMD_RADIO_STATE, vec![RADIO_STATE_OFF])]);
+    }
+
+    #[test]
+    fn test_detach_sequence() {
+        let seq = build_detach_sequence();
+        let mut deframer = kiss::RawKissDeframer::new();
+        let frames = deframer.feed(&seq);
+        assert_eq!(
+            frames,
+            vec![
+                (CMD_RADIO_STATE, vec![RADIO_STATE_OFF]),
+                (CMD_LEAVE, vec![0xFF]),
+            ]
+        );
     }
 
     #[test]

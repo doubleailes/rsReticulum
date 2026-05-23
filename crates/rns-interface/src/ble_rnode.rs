@@ -1074,10 +1074,10 @@ pub(crate) async fn ble_write(
 }
 
 async fn ble_send_radio_off(conn: &BleRNodeConnection) {
-    let seq = rnode::build_radio_off_sequence();
+    let seq = rnode::build_detach_sequence();
     match ble_write(&conn.peripheral, &conn.rx_char, &seq, conn.write_mtu).await {
-        Ok(()) => ble_diag("[ble] radio-off sent before disconnect"),
-        Err(e) => ble_diag(format!("[ble] radio-off before disconnect failed: {e}")),
+        Ok(()) => ble_diag("[ble] detach sent before disconnect"),
+        Err(e) => ble_diag(format!("[ble] detach before disconnect failed: {e}")),
     }
 }
 
@@ -1602,7 +1602,7 @@ pub async fn spawn_ble_rnode_interface_native(
                 }
                 if !running_task.load(Ordering::SeqCst) {
                     let _ = conn_tx_for_stop
-                        .send(NativeBridgeWrite::Raw(rnode::build_radio_off_sequence()))
+                        .send(NativeBridgeWrite::Raw(rnode::build_detach_sequence()))
                         .await;
                     tokio::time::sleep(Duration::from_millis(100)).await;
                     break 'read;
@@ -1627,7 +1627,7 @@ pub async fn spawn_ble_rnode_interface_native(
                         // shutdown flag cleared.
                         if !running_task.load(Ordering::SeqCst) {
                             let _ = conn_tx_for_stop
-                                .send(NativeBridgeWrite::Raw(rnode::build_radio_off_sequence()))
+                                .send(NativeBridgeWrite::Raw(rnode::build_detach_sequence()))
                                 .await;
                             tokio::time::sleep(Duration::from_millis(100)).await;
                             break 'read;
