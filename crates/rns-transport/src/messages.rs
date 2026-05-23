@@ -368,6 +368,11 @@ pub enum TransportQuery {
     GetNextHop {
         dest: [u8; 16],
     },
+    /// Hop count for `dest`. Returns `IntResult(PATHFINDER_M)` when unknown,
+    /// matching Python `Transport.hops_to()`.
+    HopsTo {
+        dest: [u8; 16],
+    },
     GetNextHopIfName {
         dest: [u8; 16],
     },
