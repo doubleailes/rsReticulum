@@ -2912,13 +2912,11 @@ pub async fn spawn_ble_peer_runtime(
     event_tx: Option<tokio::sync::mpsc::Sender<rns_interface::ble_peer::BlePeerEvent>>,
     foreground_wake: std::sync::Arc<tokio::sync::Notify>,
     seed_identities: Vec<String>,
-    low_power_advertising: bool,
 ) -> Result<u64, String> {
     let id = handle
         .id_gen
         .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-    let mut config = rns_interface::ble_peer::BlePeerConfig::new(name, identity_hash);
-    config.low_power_advertising = low_power_advertising;
+    let config = rns_interface::ble_peer::BlePeerConfig::new(name, identity_hash);
 
     // Install before start so initial scan/connect events aren't dropped.
     if let Some(tx) = event_tx {
