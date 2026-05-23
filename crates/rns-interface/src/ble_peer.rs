@@ -433,8 +433,8 @@ pub struct BlePeerConfig {
     /// 16-byte Reticulum identity hash for this node.
     pub identity_hash: Vec<u8>,
     pub mode: InterfaceMode,
-    /// Prefer lower-duty BLE advertising when the platform exposes that knob.
-    pub low_power_advertising: bool,
+    /// Prefer faster/higher-duty BLE advertising when the platform exposes that knob.
+    pub high_duty_advertising: bool,
 }
 
 impl BlePeerConfig {
@@ -443,7 +443,7 @@ impl BlePeerConfig {
             name: name.to_string(),
             identity_hash,
             mode: InterfaceMode::Full,
-            low_power_advertising: false,
+            high_duty_advertising: false,
         }
     }
 }
@@ -454,11 +454,11 @@ const ANDROID_ADVERTISE_MODE_BALANCED: i32 = 1;
 const ANDROID_ADVERTISE_MODE_LOW_LATENCY: i32 = 2;
 
 #[cfg(any(target_os = "android", test))]
-fn android_advertise_mode(low_power_advertising: bool) -> i32 {
-    if low_power_advertising {
-        ANDROID_ADVERTISE_MODE_BALANCED
-    } else {
+fn android_advertise_mode(high_duty_advertising: bool) -> i32 {
+    if high_duty_advertising {
         ANDROID_ADVERTISE_MODE_LOW_LATENCY
+    } else {
+        ANDROID_ADVERTISE_MODE_BALANCED
     }
 }
 
@@ -1120,7 +1120,7 @@ pub fn init_android_jvm(vm: jni::JavaVM) {
 
 pub async fn start_peripheral(
     _identity_hash: &[u8],
-    _low_power_advertising: bool,
+    _high_duty_advertising: bool,
 ) -> Result<(), String> {
     #[cfg(any(target_os = "ios", target_os = "macos"))]
     {
@@ -1129,7 +1129,7 @@ pub async fn start_peripheral(
 
     #[cfg(target_os = "android")]
     {
-        return android_peripheral::start_advertising(_identity_hash, _low_power_advertising).await;
+        return android_peripheral::start_advertising(_identity_hash, _high_duty_advertising).await;
     }
 
     #[cfg(target_os = "linux")]
@@ -2797,7 +2797,7 @@ mod android_peripheral {
 
     pub async fn start_advertising(
         identity_hash: &[u8],
-        low_power_advertising: bool,
+        high_duty_advertising: bool,
     ) -> Result<(), String> {
         // Set up inbound channel for GATT server write callbacks (see INBOUND_TX docs)
         let (tx, rx) = tokio::sync::mpsc::channel::<(String, Vec<u8>)>(INBOUND_CAPACITY);
@@ -2843,12 +2843,13 @@ mod android_peripheral {
                     return Err("BluetoothLeAdvertiser unavailable (multi-adv not supported?)".into());
                 }
 
-                // Build AdvertiseSettings. Keep TX power high for range; the
-                // optional low-power mode only changes the advertising interval.
+                // Build AdvertiseSettings. Keep TX power high for range, but
+                // default the advertising cadence to Android's balanced mode,
+                // which has been the most stable peer-discovery baseline.
                 let settings_cls = env.find_class("android/bluetooth/le/AdvertiseSettings$Builder")
                     .map_err(|e| format!("{e}"))?;
                 let builder = env.new_object(settings_cls, "()V", &[]).map_err(|e| format!("{e}"))?;
-                let advertise_mode = super::android_advertise_mode(low_power_advertising);
+                let advertise_mode = super::android_advertise_mode(high_duty_advertising);
                 env.call_method(builder, "setAdvertiseMode",
                     "(I)Landroid/bluetooth/le/AdvertiseSettings$Builder;",
                     &[JValue::Int(advertise_mode)]).ok(); // 1=BALANCED, 2=LOW_LATENCY
@@ -2911,7 +2912,7 @@ mod android_peripheral {
                 let _ = ADVERTISER_REF.set(env.new_global_ref(advertiser).map_err(|e| format!("{e}"))?);
                 let _ = CALLBACK_REF.set(callback_ref);
                 tracing::info!(
-                    low_power_advertising,
+                    high_duty_advertising,
                     advertise_mode,
                     "Android BLE Peripheral: advertising started"
                 );
@@ -4739,7 +4740,7 @@ pub async fn spawn_ble_peer_interface(
     mark_running();
 
     // Start peripheral (GATT server + advertising)
-    if let Err(e) = start_peripheral(&config.identity_hash, config.low_power_advertising).await {
+    if let Err(e) = start_peripheral(&config.identity_hash, config.high_duty_advertising).await {
         tracing::warn!(name = %name, error = %e, "BLE Peripheral start failed, running Central-only");
     }
 
@@ -6172,18 +6173,18 @@ mod tests {
         assert_eq!(cfg.name, "mesh0");
         assert_eq!(cfg.identity_hash.len(), 16);
         assert_eq!(cfg.mode, InterfaceMode::Full);
-        assert!(!cfg.low_power_advertising);
+        assert!(!cfg.high_duty_advertising);
     }
 
     #[test]
-    fn test_android_advertising_mode_defaults_to_low_latency() {
+    fn test_android_advertising_mode_defaults_to_balanced() {
         assert_eq!(
             android_advertise_mode(false),
-            ANDROID_ADVERTISE_MODE_LOW_LATENCY
+            ANDROID_ADVERTISE_MODE_BALANCED
         );
         assert_eq!(
             android_advertise_mode(true),
-            ANDROID_ADVERTISE_MODE_BALANCED
+            ANDROID_ADVERTISE_MODE_LOW_LATENCY
         );
     }
 
