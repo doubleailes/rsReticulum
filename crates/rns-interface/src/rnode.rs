@@ -16,13 +16,15 @@ use rns_transport::messages::{InboundPacket, TransportMessage};
 #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
 use crate::traits::{InterfaceDirection, InterfaceHandle};
 #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
-use std::sync::Arc;
+use std::collections::HashMap;
 #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+use std::sync::{Arc, Mutex, OnceLock};
+#[cfg(any(feature = "serial", feature = "rnode-tcp"))]
 use std::time::Duration;
 #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 
 pub const CMD_FREQUENCY: u8 = 0x01;
 pub const CMD_BANDWIDTH: u8 = 0x02;
@@ -123,6 +125,88 @@ const RNODE_TCP_KEEPCNT: u32 = 12;
 const RNODE_TCP_USER_TIMEOUT_SECS: u64 = 24;
 #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
 const RNODE_TCP_BUFFER_BYTES: usize = 131_072;
+
+#[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+type RNodeStopRegistry = Mutex<HashMap<InterfaceId, mpsc::Sender<()>>>;
+
+#[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+fn rnode_stop_registry() -> &'static RNodeStopRegistry {
+    static REGISTRY: OnceLock<RNodeStopRegistry> = OnceLock::new();
+    REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+#[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+struct RNodeStopRegistryGuard {
+    id: InterfaceId,
+}
+
+#[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+impl Drop for RNodeStopRegistryGuard {
+    fn drop(&mut self) {
+        rnode_stop_registry()
+            .lock()
+            .expect("rnode_stop_registry mutex poisoned")
+            .remove(&self.id);
+    }
+}
+
+#[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+fn register_rnode_stop(id: InterfaceId, stop_tx: mpsc::Sender<()>) -> RNodeStopRegistryGuard {
+    rnode_stop_registry()
+        .lock()
+        .expect("rnode_stop_registry mutex poisoned")
+        .insert(id, stop_tx);
+    RNodeStopRegistryGuard { id }
+}
+
+/// Ask a serial/TCP RNode interface to send upstream's detach sequence before
+/// runtime teardown aborts the task. Idempotent; unknown ids are ignored.
+#[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+pub fn stop_rnode_interface(id: InterfaceId) {
+    let stop_tx = rnode_stop_registry()
+        .lock()
+        .expect("rnode_stop_registry mutex poisoned")
+        .get(&id)
+        .cloned();
+    let Some(stop_tx) = stop_tx else {
+        tracing::debug!(id, "RNode stop requested for unknown interface");
+        return;
+    };
+    match stop_tx.try_send(()) {
+        Ok(()) => tracing::info!(id, "RNode stop signal sent"),
+        Err(mpsc::error::TrySendError::Full(_)) => {
+            tracing::debug!(id, "RNode stop signal already pending")
+        }
+        Err(mpsc::error::TrySendError::Closed(_)) => {
+            tracing::debug!(id, "RNode stop signal receiver already closed")
+        }
+    }
+}
+
+#[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+enum RNodeWriteRequest {
+    Packet(Bytes),
+    Raw(Vec<u8>, oneshot::Sender<()>),
+}
+
+#[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+async fn send_detach_request(conn_tx: &mpsc::Sender<RNodeWriteRequest>, id: InterfaceId) {
+    let (done_tx, done_rx) = oneshot::channel();
+    if conn_tx
+        .send(RNodeWriteRequest::Raw(build_detach_sequence(), done_tx))
+        .await
+        .is_err()
+    {
+        tracing::warn!(id, "RNode detach sequence could not be queued");
+        return;
+    }
+
+    match tokio::time::timeout(Duration::from_millis(500), done_rx).await {
+        Ok(Ok(())) => tracing::info!(id, "RNode detach sequence sent"),
+        Ok(Err(_)) => tracing::warn!(id, "RNode detach writer dropped acknowledgement"),
+        Err(_) => tracing::warn!(id, "RNode detach sequence timed out"),
+    }
+}
 
 // Transport abstraction
 
@@ -744,6 +828,8 @@ pub async fn spawn_rnode_interface(
     let shared_txb = Arc::new(AtomicU64::new(0));
     let (tx, rx) = mpsc::channel::<Bytes>(256);
     let rx = Arc::new(tokio::sync::Mutex::new(rx));
+    let (stop_tx, mut stop_rx) = mpsc::channel::<()>(1);
+    let stop_guard = register_rnode_stop(id, stop_tx);
     let name = config.name.clone();
     let mode = config.mode;
     let flow_control = config.flow_control;
@@ -755,9 +841,14 @@ pub async fn spawn_rnode_interface(
     let task_port_cfg = port_cfg.clone();
     let task_name = config.name.clone();
     let read_task = tokio::spawn(async move {
+        let _stop_guard = stop_guard;
         let mut next_port = Some(port);
 
         loop {
+            if stop_rx.try_recv().is_ok() {
+                tracing::info!(name = %task_name, "RNode stop requested before reconnect");
+                return;
+            }
             let mut port_r = match next_port.take() {
                 Some(port) => port,
                 None => match open_configured_rnode_stream(&task_config, &task_port_cfg).await {
@@ -769,7 +860,13 @@ pub async fn spawn_rnode_interface(
                             error = %e,
                             "RNode reconnect failed"
                         );
-                        tokio::time::sleep(reconnect_delay()).await;
+                        tokio::select! {
+                            _ = stop_rx.recv() => {
+                                tracing::info!(name = %task_name, "RNode stop requested during reconnect backoff");
+                                return;
+                            }
+                            _ = tokio::time::sleep(reconnect_delay()) => {}
+                        }
                         continue;
                     }
                 },
@@ -781,22 +878,36 @@ pub async fn spawn_rnode_interface(
                 Err(e) => {
                     tracing::warn!(error = %e, "RNode clone failed before reconnect");
                     online_r.store(false, Ordering::SeqCst);
-                    tokio::time::sleep(reconnect_delay()).await;
+                    tokio::select! {
+                        _ = stop_rx.recv() => {
+                            tracing::info!(name = %task_name, "RNode stop requested during reconnect backoff");
+                            return;
+                        }
+                        _ = tokio::time::sleep(reconnect_delay()) => {}
+                    }
                     continue;
                 }
             };
 
             let ready = Arc::new(AtomicBool::new(true));
-            let (conn_tx, mut conn_rx) = mpsc::channel::<Bytes>(256);
+            let (conn_tx, mut conn_rx) = mpsc::channel::<RNodeWriteRequest>(256);
+            let conn_tx_for_stop = conn_tx.clone();
 
             let online_w = online_r.clone();
             let ready_w = ready.clone();
             let txb_w = txb_r.clone();
             let write_handle = tokio::spawn(async move {
                 let mut port_w = port_write;
-                while let Some(data) = conn_rx.recv().await {
-                    txb_w.fetch_add(data.len() as u64, std::sync::atomic::Ordering::Relaxed);
-                    if flow_control {
+                while let Some(request) = conn_rx.recv().await {
+                    let (framed, is_packet, done_tx) = match request {
+                        RNodeWriteRequest::Packet(data) => {
+                            txb_w
+                                .fetch_add(data.len() as u64, std::sync::atomic::Ordering::Relaxed);
+                            (kiss::frame(&data), true, None)
+                        }
+                        RNodeWriteRequest::Raw(frame, done_tx) => (frame, false, Some(done_tx)),
+                    };
+                    if is_packet && flow_control {
                         while !ready_w.load(Ordering::SeqCst) {
                             tokio::time::sleep(Duration::from_millis(10)).await;
                             if !online_w.load(Ordering::SeqCst) {
@@ -804,7 +915,6 @@ pub async fn spawn_rnode_interface(
                             }
                         }
                     }
-                    let framed = kiss::frame(&data);
                     let online_ref = online_w.clone();
                     let result = tokio::task::spawn_blocking(move || {
                         use std::io::Write;
@@ -813,6 +923,9 @@ pub async fn spawn_rnode_interface(
                         Ok::<_, std::io::Error>(port_w)
                     })
                     .await;
+                    if let Some(done_tx) = done_tx {
+                        let _ = done_tx.send(());
+                    }
                     match result {
                         Ok(Ok(p)) => {
                             port_w = p;
@@ -835,7 +948,7 @@ pub async fn spawn_rnode_interface(
             let fwd_handle = tokio::spawn(async move {
                 let mut guard = rx_ref.lock().await;
                 while let Some(data) = guard.recv().await {
-                    if conn_tx.send(data).await.is_err() {
+                    if conn_tx.send(RNodeWriteRequest::Packet(data)).await.is_err() {
                         break;
                     }
                 }
@@ -846,8 +959,15 @@ pub async fn spawn_rnode_interface(
             let mut last_rssi: Option<f32> = None;
             let mut last_snr: Option<f32> = None;
             let mut transport_closed = false;
+            let mut stop_requested = false;
 
             loop {
+                if stop_rx.try_recv().is_ok() {
+                    tracing::info!(name = %task_name, "RNode stop requested");
+                    send_detach_request(&conn_tx_for_stop, id).await;
+                    stop_requested = true;
+                    break;
+                }
                 if !online_r.load(Ordering::SeqCst) {
                     break;
                 }
@@ -906,12 +1026,18 @@ pub async fn spawn_rnode_interface(
             write_handle.abort();
             let _ = write_handle.await;
 
-            if transport_closed {
+            if stop_requested || transport_closed {
                 return;
             }
 
             tracing::info!(name = %task_name, "RNode reconnecting");
-            tokio::time::sleep(reconnect_delay()).await;
+            tokio::select! {
+                _ = stop_rx.recv() => {
+                    tracing::info!(name = %task_name, "RNode stop requested during reconnect backoff");
+                    return;
+                }
+                _ = tokio::time::sleep(reconnect_delay()) => {}
+            }
         }
     });
 
@@ -1014,6 +1140,20 @@ mod tests {
                 (CMD_LEAVE, vec![0xFF]),
             ]
         );
+    }
+
+    #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+    #[test]
+    fn test_stop_rnode_interface_signals_registered_driver() {
+        let id = 0xBAD5_700;
+        let (stop_tx, mut stop_rx) = mpsc::channel::<()>(1);
+        let guard = register_rnode_stop(id, stop_tx);
+
+        stop_rnode_interface(id);
+
+        assert!(stop_rx.try_recv().is_ok());
+        drop(guard);
+        stop_rnode_interface(id);
     }
 
     #[test]

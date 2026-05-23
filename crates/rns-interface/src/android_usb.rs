@@ -1,7 +1,8 @@
 //! USB serial RNode over Android USB-C OTG via JNI to `UsbManager`. 115200 8N1.
 
-use std::sync::Arc;
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use bytes::Bytes;
 use tokio::sync::mpsc;
@@ -26,6 +27,60 @@ pub const KNOWN_VIDS: &[(u16, &str)] = &[
     (0x239A, "Adafruit"),
     (0x1915, "Nordic Semiconductor NRF52840"),
 ];
+
+type AndroidUsbRNodeStopRegistry = Mutex<HashMap<InterfaceId, mpsc::Sender<()>>>;
+
+fn android_usb_rnode_stop_registry() -> &'static AndroidUsbRNodeStopRegistry {
+    static REGISTRY: OnceLock<AndroidUsbRNodeStopRegistry> = OnceLock::new();
+    REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+struct AndroidUsbRNodeStopRegistryGuard {
+    id: InterfaceId,
+}
+
+impl Drop for AndroidUsbRNodeStopRegistryGuard {
+    fn drop(&mut self) {
+        android_usb_rnode_stop_registry()
+            .lock()
+            .expect("android_usb_rnode_stop_registry mutex poisoned")
+            .remove(&self.id);
+    }
+}
+
+fn register_android_usb_rnode_stop(
+    id: InterfaceId,
+    stop_tx: mpsc::Sender<()>,
+) -> AndroidUsbRNodeStopRegistryGuard {
+    android_usb_rnode_stop_registry()
+        .lock()
+        .expect("android_usb_rnode_stop_registry mutex poisoned")
+        .insert(id, stop_tx);
+    AndroidUsbRNodeStopRegistryGuard { id }
+}
+
+/// Ask an Android USB RNode interface to send upstream's detach sequence before
+/// runtime teardown aborts the task. Idempotent; unknown ids are ignored.
+pub fn stop_android_usb_rnode_interface(id: InterfaceId) {
+    let stop_tx = android_usb_rnode_stop_registry()
+        .lock()
+        .expect("android_usb_rnode_stop_registry mutex poisoned")
+        .get(&id)
+        .cloned();
+    let Some(stop_tx) = stop_tx else {
+        tracing::debug!(id, "Android USB RNode stop requested for unknown interface");
+        return;
+    };
+    match stop_tx.try_send(()) {
+        Ok(()) => tracing::info!(id, "Android USB RNode stop signal sent"),
+        Err(mpsc::error::TrySendError::Full(_)) => {
+            tracing::debug!(id, "Android USB RNode stop signal already pending")
+        }
+        Err(mpsc::error::TrySendError::Closed(_)) => {
+            tracing::debug!(id, "Android USB RNode stop signal receiver already closed")
+        }
+    }
+}
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct UsbSerialDevice {
@@ -68,7 +123,6 @@ impl AndroidUsbConfig {
 
 use jni::JavaVM;
 use jni::objects::{GlobalRef, JObject, JValue};
-use std::sync::OnceLock;
 
 static JAVA_VM: OnceLock<JavaVM> = OnceLock::new();
 static APP_CONTEXT: OnceLock<GlobalRef> = OnceLock::new();
@@ -572,17 +626,32 @@ pub async fn spawn_android_usb_rnode_interface(
     let shared_rxb = Arc::new(AtomicU64::new(0));
 
     let (tx, mut app_rx) = mpsc::channel::<Bytes>(64);
+    let (stop_tx, mut stop_rx) = mpsc::channel::<()>(1);
+    let stop_guard = register_android_usb_rnode_stop(id, stop_tx);
 
     let txb = shared_txb.clone();
     let wtx = raw_write_tx.clone();
     let write_name = name.clone();
     tokio::spawn(async move {
-        while let Some(payload) = app_rx.recv().await {
-            let frame = kiss::frame(&payload);
-            txb.fetch_add(frame.len() as u64, Ordering::Relaxed);
-            if wtx.send(frame).await.is_err() {
-                tracing::warn!(name = %write_name, "USB write channel closed");
-                break;
+        loop {
+            tokio::select! {
+                Some(payload) = app_rx.recv() => {
+                    let frame = kiss::frame(&payload);
+                    txb.fetch_add(frame.len() as u64, Ordering::Relaxed);
+                    if wtx.send(frame).await.is_err() {
+                        tracing::warn!(name = %write_name, "USB write channel closed");
+                        break;
+                    }
+                }
+                Some(_) = stop_rx.recv() => {
+                    if wtx.send(rnode::build_detach_sequence()).await.is_err() {
+                        tracing::warn!(name = %write_name, "USB detach sequence could not be queued");
+                    } else {
+                        tracing::info!(name = %write_name, "USB detach sequence queued");
+                    }
+                    break;
+                }
+                else => break,
             }
         }
     });
@@ -593,6 +662,7 @@ pub async fn spawn_android_usb_rnode_interface(
     let rxb = shared_rxb.clone();
     let online = connected.clone();
     let read_task = tokio::spawn(async move {
+        let _stop_guard = stop_guard;
         let mut deframer = kiss::KissDeframer::new();
         let mut last_rssi: Option<f32> = None;
         let mut last_snr: Option<f32> = None;

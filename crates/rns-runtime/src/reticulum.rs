@@ -2966,6 +2966,15 @@ pub async fn teardown_ble_rnode_interface(handle: &ReticulumHandle, id: u64) {
     teardown_interface(handle, id).await;
 }
 
+/// Stop serial/TCP RNode radio and leave host-controlled mode before generic
+/// interface deregistration aborts the driver task.
+#[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+pub async fn teardown_rnode_interface(handle: &ReticulumHandle, id: u64) {
+    rns_interface::rnode::stop_rnode_interface(id);
+    tokio::time::sleep(std::time::Duration::from_millis(700)).await;
+    teardown_interface(handle, id).await;
+}
+
 #[cfg(target_os = "android")]
 pub async fn spawn_android_usb_rnode_runtime(
     handle: &ReticulumHandle,
@@ -3003,6 +3012,13 @@ pub async fn spawn_android_usb_rnode_runtime(
     .await;
     tracing::info!(name = %name, id, "runtime Android USB RNode interface spawned");
     Ok(id)
+}
+
+#[cfg(target_os = "android")]
+pub async fn teardown_android_usb_rnode_interface(handle: &ReticulumHandle, id: u64) {
+    rns_interface::android_usb::stop_android_usb_rnode_interface(id);
+    tokio::time::sleep(std::time::Duration::from_millis(700)).await;
+    teardown_interface(handle, id).await;
 }
 
 pub async fn teardown_interface(handle: &ReticulumHandle, id: u64) {
