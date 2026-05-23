@@ -206,8 +206,11 @@ impl TransportActor {
             || self
                 .discovery_path_requests
                 .contains_key(&header.destination_hash);
+        // Record on this interface *and* every parent in the spawn chain so
+        // aggregate frequency on a Backbone / TCP-accept parent reflects
+        // child traffic (Python `from_spawned=True` recursion).
+        self.record_received_announce(interface_id);
         if let Some(entry) = self.interfaces.get_mut(&interface_id) {
-            entry.ingress.received_announce();
             if !is_from_local_client
                 && !announced_destination_known
                 && !answers_path_request

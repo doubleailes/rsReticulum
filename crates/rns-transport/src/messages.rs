@@ -68,6 +68,11 @@ pub struct TimerTick {
 /// sender; driver code holds only the matching receiver.
 pub struct InterfaceEntry {
     pub name: String,
+    /// Parent interface for dynamically spawned children (TCP accept loop,
+    /// BackboneInterface peers, I2P, LocalInterface). Used to propagate
+    /// ingress frequency samples up the chain so the parent's deque reflects
+    /// aggregate traffic — matches Python `from_spawned=True` recursion.
+    pub parent_id: Option<InterfaceId>,
     pub mode: InterfaceMode,
     pub role: InterfaceRole,
     pub direction: InterfaceDirection,
@@ -112,6 +117,7 @@ impl InterfaceEntry {
     ) -> Self {
         Self {
             name,
+            parent_id: None,
             mode,
             role: InterfaceRole::Normal,
             direction,
@@ -137,6 +143,11 @@ impl InterfaceEntry {
     pub fn with_ifac(mut self, key: [u8; 64], size: usize) -> Self {
         self.ifac_key = Some(key);
         self.ifac_size = size;
+        self
+    }
+
+    pub fn with_parent(mut self, parent_id: InterfaceId) -> Self {
+        self.parent_id = Some(parent_id);
         self
     }
 

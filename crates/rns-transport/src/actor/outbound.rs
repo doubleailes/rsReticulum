@@ -146,9 +146,7 @@ impl TransportActor {
             self.packet_hashlist.insert(pkt_hash);
             self.send_to_interface(interface_id, &request.raw);
             if parsed.flags.packet_type == rns_wire::flags::PacketType::Announce {
-                if let Some(entry) = self.interfaces.get_mut(&interface_id) {
-                    entry.ingress.sent_announce();
-                }
+                self.record_sent_announce(interface_id);
             }
         }
     }
@@ -283,9 +281,7 @@ impl TransportActor {
             return;
         };
 
-        if let Some(entry) = self.interfaces.get_mut(&interface_id) {
-            entry.ingress.received_path_request();
-        }
+        self.record_received_path_request(interface_id);
 
         let now = now_f64();
         let mut unique_tag = Vec::with_capacity(32);
@@ -566,9 +562,7 @@ impl TransportActor {
         }
 
         self.send_to_interface(interface_id, &raw);
-        if let Some(entry) = self.interfaces.get_mut(&interface_id) {
-            entry.ingress.sent_path_request();
-        }
+        self.record_sent_path_request(interface_id);
         self.path_requests.insert(destination_hash, now);
     }
 
