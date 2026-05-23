@@ -3451,6 +3451,55 @@ mod tests {
         bytes::Bytes::from(raw)
     }
 
+    fn write_stale_python_destination_table(storage_dir: &Path, entries: usize) {
+        std::fs::create_dir_all(storage_dir).unwrap();
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs_f64();
+        let mut table = rns_transport::path_table::PathTable::new();
+        for i in 0..entries {
+            let mut dest = [0u8; 16];
+            dest[..8].copy_from_slice(&(i as u64).to_be_bytes());
+            dest[8..].copy_from_slice(&(!i as u64).to_be_bytes());
+
+            let mut packet_hash = [0u8; 32];
+            packet_hash[..8].copy_from_slice(&(i as u64).to_be_bytes());
+            packet_hash[8..16].copy_from_slice(&(entries as u64).to_be_bytes());
+            packet_hash[16..24].copy_from_slice(&(0xA5A5_A5A5_A5A5_A5A5u64).to_be_bytes());
+            packet_hash[24..].copy_from_slice(&(!i as u64).to_be_bytes());
+
+            let mut entry = rns_transport::path_table::PathEntry::new(
+                None,
+                1,
+                7,
+                rns_transport::constants::InterfaceMode::Gateway,
+            );
+            entry.timestamp = now;
+            entry.expires = now + 3600.0;
+            entry.packet_hash = Some(packet_hash);
+            table.insert(dest, entry);
+        }
+
+        let mut names = std::collections::HashMap::new();
+        names.insert(7u64, "Border_TCP".to_string());
+        rns_transport::persistence::save_python_destination_table(
+            &table,
+            &names,
+            &storage_dir.join("destination_table"),
+        )
+        .unwrap();
+    }
+
+    async fn free_tcp_port_pair() -> (u16, u16) {
+        let first = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let second = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let first_port = first.local_addr().unwrap().port();
+        let second_port = second.local_addr().unwrap().port();
+        (first_port, second_port)
+    }
+
     fn test_interface_handle(
         id: u64,
         parent_id: Option<u64>,
@@ -4191,12 +4240,7 @@ enabled = yes
 
     #[tokio::test]
     async fn test_init_shared_instance_tcp_server_then_client() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-        drop(listener);
-        let control_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let control_port = control_listener.local_addr().unwrap().port();
-        drop(control_listener);
+        let (port, control_port) = free_tcp_port_pair().await;
 
         let nonce = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -4373,6 +4417,136 @@ enabled = yes
         let _ = std::fs::remove_dir_all(&dir_a);
         let _ = std::fs::remove_dir_all(&dir_b);
         let _ = std::fs::remove_dir_all(&dir_c);
+    }
+
+    #[tokio::test]
+    async fn init_with_stale_python_destination_table_serves_interface_stats_rpc() {
+        let (port, control_port) = free_tcp_port_pair().await;
+
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("reticulum_rs_stale_python_table_{nonce}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let storage_dir = dir.join("storage");
+        write_stale_python_destination_table(&storage_dir, 512);
+
+        let rpc_key_hex = "5353535353535353535353535353535353535353535353535353535353535353";
+        let cfg = format!(
+            "[reticulum]\nshare_instance = Yes\nshared_instance_type = tcp\nshared_instance_port = {port}\ninstance_control_port = {control_port}\nrpc_key = {rpc_key_hex}\nenable_transport = Yes\n\n[interfaces]\n"
+        );
+        std::fs::write(dir.join("config"), &cfg).unwrap();
+
+        let shutdown = ShutdownSignal::new();
+        let foreground = Arc::new(AtomicBool::new(true));
+        let handle = init(
+            Some(dir.to_str().unwrap()),
+            None,
+            shutdown.clone(),
+            foreground,
+        )
+        .await
+        .unwrap();
+        assert_eq!(handle.instance_mode, InstanceMode::Shared);
+
+        let rpc_key = hex::decode(rpc_key_hex).unwrap();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        let response = loop {
+            match crate::rpc::connect_and_request(
+                control_port,
+                &rpc_key,
+                &crate::rpc::RpcRequest::GetInterfaceStats,
+                std::time::Duration::from_secs(2),
+            )
+            .await
+            {
+                Ok(response) => break response,
+                Err(crate::rpc::RpcError::Io(e))
+                    if e.kind() == std::io::ErrorKind::ConnectionRefused
+                        && tokio::time::Instant::now() < deadline =>
+                {
+                    tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                }
+                Err(e) => panic!("interface stats RPC should succeed: {e:?}"),
+            }
+        };
+
+        let crate::rpc::RpcResponse::InterfaceStats(stats) = response else {
+            panic!("unexpected interface stats response: {response:?}");
+        };
+        assert!(
+            stats.iter().any(|entry| entry.role == "shared_server"),
+            "rnstatus-style local RPC should see the shared server interface"
+        );
+
+        shutdown.trigger();
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires network access to a public Reticulum TCP peer"]
+    async fn live_tcp_public_testnet_interface_status_smoke() {
+        let host = std::env::var("RSRETICULUM_LIVE_TCP_HOST")
+            .unwrap_or_else(|_| "rns.ratspeak.org".to_string());
+        let port = std::env::var("RSRETICULUM_LIVE_TCP_PORT")
+            .ok()
+            .and_then(|value| value.parse::<u16>().ok())
+            .unwrap_or(4242);
+
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("reticulum_rs_live_tcp_testnet_{nonce}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg = format!(
+            "[reticulum]\nshare_instance = No\nenable_transport = No\n\n[interfaces]\n\n[[Public TCP]]\ntype = TCPClientInterface\nenabled = Yes\ntarget_host = {host}\ntarget_port = {port}\n"
+        );
+        std::fs::write(dir.join("config"), &cfg).unwrap();
+
+        let shutdown = ShutdownSignal::new();
+        let foreground = Arc::new(AtomicBool::new(true));
+        let handle = init(
+            Some(dir.to_str().unwrap()),
+            None,
+            shutdown.clone(),
+            foreground,
+        )
+        .await
+        .unwrap();
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut saw_online = false;
+        while tokio::time::Instant::now() < deadline {
+            let Some(rns_transport::messages::TransportQueryResponse::InterfaceStats(stats)) =
+                handle
+                    .query_transport(rns_transport::messages::TransportQuery::GetInterfaceStats)
+                    .await
+            else {
+                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                continue;
+            };
+
+            if stats
+                .iter()
+                .any(|entry| entry.name == "Public TCP" && entry.online)
+            {
+                saw_online = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        }
+
+        shutdown.trigger();
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert!(
+            saw_online,
+            "Public TCP interface did not come online for {host}:{port}"
+        );
     }
 
     #[cfg(feature = "serial")]
