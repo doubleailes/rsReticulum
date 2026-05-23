@@ -559,6 +559,13 @@ pub fn build_init_sequence(config: &RNodeConfig) -> Vec<u8> {
     out
 }
 
+/// KISS sequence for returning an RNode radio to idle before disconnecting.
+pub fn build_radio_off_sequence() -> Vec<u8> {
+    let mut out = Vec::with_capacity(4);
+    kiss::frame_with_command_into(CMD_RADIO_STATE, &[RADIO_STATE_OFF], &mut out);
+    out
+}
+
 // Hot-path interface adapters pass this enum around directly; boxing the
 // packet variant would add allocation to every received frame.
 #[allow(clippy::large_enum_variant)]
@@ -976,6 +983,14 @@ mod tests {
         let frames = deframer.feed(&seq);
         assert_eq!(frames.len(), 4);
         assert_eq!(frames[0].0, CMD_DETECT);
+    }
+
+    #[test]
+    fn test_radio_off_sequence() {
+        let seq = build_radio_off_sequence();
+        let mut deframer = kiss::RawKissDeframer::new();
+        let frames = deframer.feed(&seq);
+        assert_eq!(frames, vec![(CMD_RADIO_STATE, vec![RADIO_STATE_OFF])]);
     }
 
     #[test]

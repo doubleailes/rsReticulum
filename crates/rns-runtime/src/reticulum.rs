@@ -2962,6 +2962,7 @@ pub async fn teardown_ble_peer_interface(handle: &ReticulumHandle, id: u64) {
 #[cfg(feature = "ble")]
 pub async fn teardown_ble_rnode_interface(handle: &ReticulumHandle, id: u64) {
     rns_interface::ble_rnode::stop_ble_rnode_interface(id);
+    tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
     teardown_interface(handle, id).await;
 }
 

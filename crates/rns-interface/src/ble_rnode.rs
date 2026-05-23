@@ -46,7 +46,6 @@ const RECONNECT_WAIT_MAX: u64 = 120;
 /// `None` retries forever; teardown goes via `stop_ble_rnode_interface`.
 const MAX_RECONNECT_TRIES: Option<usize> = None;
 const SCAN_TIMEOUT: u64 = 3;
-const CONNECT_TIMEOUT: u64 = 5;
 /// Bounds disable-while-offline teardown latency to ~1s.
 const RUNNING_POLL: Duration = Duration::from_secs(1);
 
@@ -584,6 +583,11 @@ struct BleRNodeConnection {
     write_mtu: usize,
 }
 
+enum NativeBridgeWrite {
+    Packet(Bytes),
+    Raw(Vec<u8>),
+}
+
 async fn connect_rnode(
     adapter: &Adapter,
     ble_uri: &str,
@@ -1069,6 +1073,14 @@ pub(crate) async fn ble_write(
     Ok(())
 }
 
+async fn ble_send_radio_off(conn: &BleRNodeConnection) {
+    let seq = rnode::build_radio_off_sequence();
+    match ble_write(&conn.peripheral, &conn.rx_char, &seq, conn.write_mtu).await {
+        Ok(()) => ble_diag("[ble] radio-off sent before disconnect"),
+        Err(e) => ble_diag(format!("[ble] radio-off before disconnect failed: {e}")),
+    }
+}
+
 /// Auto-reconnect across drops; resolve_ble_target re-runs every retry so
 /// iOS RPA rotation heals automatically.
 pub async fn spawn_ble_rnode_interface(
@@ -1286,16 +1298,21 @@ pub async fn spawn_ble_rnode_interface(
             let mut transport_closed = false;
 
             'read: loop {
-                if !online_handle.load(Ordering::SeqCst) || !running_task.load(Ordering::SeqCst) {
+                if !online_handle.load(Ordering::SeqCst) {
+                    break 'read;
+                }
+                if !running_task.load(Ordering::SeqCst) {
+                    ble_send_radio_off(&conn).await;
                     break 'read;
                 }
 
                 let notification = tokio::select! {
                     n = notification_stream.next() => n,
-                    _ = tokio::time::sleep(Duration::from_secs(CONNECT_TIMEOUT)) => {
+                    _ = tokio::time::sleep(RUNNING_POLL) => {
                         // Polling slice — bounds disable-while-connected
                         // teardown latency.
                         if !running_task.load(Ordering::SeqCst) {
+                            ble_send_radio_off(&conn).await;
                             break 'read;
                         }
                         if conn.peripheral.is_connected().await.unwrap_or(false) {
@@ -1525,26 +1542,38 @@ pub async fn spawn_ble_rnode_interface_native(
 
             let ready = Arc::new(AtomicBool::new(true));
 
-            let (conn_tx, mut conn_rx) = mpsc::channel::<Bytes>(256);
+            let (conn_tx, mut conn_rx) = mpsc::channel::<NativeBridgeWrite>(256);
+            let conn_tx_for_stop = conn_tx.clone();
             let online_w = online_handle.clone();
             let ready_w = ready.clone();
             let txb_w = task_txb.clone();
             let write_handle = tokio::spawn(async move {
-                while let Some(data) = conn_rx.recv().await {
-                    txb_w.fetch_add(data.len() as u64, Ordering::Relaxed);
-                    if flow_control {
-                        while !ready_w.load(Ordering::SeqCst) {
-                            tokio::time::sleep(Duration::from_millis(10)).await;
-                            if !online_w.load(Ordering::SeqCst) {
+                while let Some(msg) = conn_rx.recv().await {
+                    match msg {
+                        NativeBridgeWrite::Packet(data) => {
+                            txb_w.fetch_add(data.len() as u64, Ordering::Relaxed);
+                            if flow_control {
+                                while !ready_w.load(Ordering::SeqCst) {
+                                    tokio::time::sleep(Duration::from_millis(10)).await;
+                                    if !online_w.load(Ordering::SeqCst) {
+                                        return;
+                                    }
+                                }
+                            }
+                            let framed = kiss::frame(&data);
+                            if let Err(e) = tcp_write.write_all(&framed).await {
+                                tracing::warn!(error = %e, "BLE RNode native write error");
+                                online_w.store(false, Ordering::SeqCst);
                                 return;
                             }
                         }
-                    }
-                    let framed = kiss::frame(&data);
-                    if let Err(e) = tcp_write.write_all(&framed).await {
-                        tracing::warn!(error = %e, "BLE RNode native write error");
-                        online_w.store(false, Ordering::SeqCst);
-                        return;
+                        NativeBridgeWrite::Raw(data) => {
+                            if let Err(e) = tcp_write.write_all(&data).await {
+                                tracing::warn!(error = %e, "BLE RNode native raw write error");
+                            }
+                            let _ = tcp_write.flush().await;
+                            return;
+                        }
                     }
                 }
             });
@@ -1555,7 +1584,7 @@ pub async fn spawn_ble_rnode_interface_native(
             let fwd_handle = tokio::spawn(async move {
                 let mut guard = rx_ref.lock().await;
                 while let Some(data) = guard.recv().await {
-                    if conn_tx.send(data).await.is_err() {
+                    if conn_tx.send(NativeBridgeWrite::Packet(data)).await.is_err() {
                         break;
                     }
                 }
@@ -1568,7 +1597,14 @@ pub async fn spawn_ble_rnode_interface_native(
             let mut transport_closed = false;
 
             'read: loop {
-                if !online_handle.load(Ordering::SeqCst) || !running_task.load(Ordering::SeqCst) {
+                if !online_handle.load(Ordering::SeqCst) {
+                    break 'read;
+                }
+                if !running_task.load(Ordering::SeqCst) {
+                    let _ = conn_tx_for_stop
+                        .send(NativeBridgeWrite::Raw(rnode::build_radio_off_sequence()))
+                        .await;
+                    tokio::time::sleep(Duration::from_millis(100)).await;
                     break 'read;
                 }
 
@@ -1590,6 +1626,10 @@ pub async fn spawn_ble_rnode_interface_native(
                         // Idle LoRa silence is normal — only break if
                         // shutdown flag cleared.
                         if !running_task.load(Ordering::SeqCst) {
+                            let _ = conn_tx_for_stop
+                                .send(NativeBridgeWrite::Raw(rnode::build_radio_off_sequence()))
+                                .await;
+                            tokio::time::sleep(Duration::from_millis(100)).await;
                             break 'read;
                         }
                         continue;
