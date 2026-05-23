@@ -18,9 +18,11 @@
 //!
 //! ## Fragmentation
 //!
-//! Packets larger than (MTU - 3) use a 5-byte header
-//! `[type:1][seq:2-BE][total:2-BE]`. Types: LONE / START / CONTINUE / END.
-//! Reassembly timeout 30s.
+//! Packets larger than (MTU - 3), and small packets whose first byte would
+//! collide with START / CONTINUE / END frame tags, use a 5-byte header
+//! `[type:1][seq:2-BE][total:2-BE]`. Reassembly timeout 30s. Small ambiguous
+//! packets are encoded as a two-frame START/END sequence instead of LONE so
+//! older reassemblers can still decode them.
 //!
 //! Keepalive: 15s interval, 1-byte ping; 3 misses → disconnect. Cap 7
 //! simultaneous peers.
@@ -262,12 +264,24 @@ async fn scan_sleep(
 pub const TARGET_MTU: u16 = 517;
 
 #[repr(u8)]
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FragmentType {
     Lone = 0x00,
     Start = 0x01,
     Continue = 0x02,
     End = 0x03,
+}
+
+impl FragmentType {
+    fn from_byte(byte: u8) -> Option<Self> {
+        match byte {
+            0x00 => Some(Self::Lone),
+            0x01 => Some(Self::Start),
+            0x02 => Some(Self::Continue),
+            0x03 => Some(Self::End),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -431,20 +445,92 @@ impl BlePeerConfig {
     }
 }
 
+const FRAGMENT_HEADER_LEN: usize = 5;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FragmentHeader {
+    kind: FragmentType,
+    seq: u16,
+    total: u16,
+}
+
+type FragmentReassembly = HashMap<u16, (Vec<Option<Vec<u8>>>, Instant)>;
+
+fn raw_packet_needs_fragment_envelope(data: &[u8]) -> bool {
+    matches!(
+        data.first().copied(),
+        Some(x)
+            if x == FragmentType::Start as u8
+                || x == FragmentType::Continue as u8
+                || x == FragmentType::End as u8
+    )
+}
+
+fn make_fragment(kind: FragmentType, seq: u16, total: u16, payload: &[u8]) -> Vec<u8> {
+    let mut frag = Vec::with_capacity(FRAGMENT_HEADER_LEN + payload.len());
+    frag.push(kind as u8);
+    frag.extend_from_slice(&seq.to_be_bytes());
+    frag.extend_from_slice(&total.to_be_bytes());
+    frag.extend_from_slice(payload);
+    frag
+}
+
+fn parse_fragment_header(data: &[u8]) -> Option<FragmentHeader> {
+    if data.len() < FRAGMENT_HEADER_LEN {
+        return None;
+    }
+
+    let kind = FragmentType::from_byte(data[0])?;
+    if kind == FragmentType::Lone {
+        // Reticulum DATA packets commonly start with 0x00. This transport no
+        // longer emits explicit LONE frames, so preserve 0x00 as legacy raw
+        // packet data and only parse START/CONTINUE/END envelopes.
+        return None;
+    }
+
+    let seq = u16::from_be_bytes([data[1], data[2]]);
+    let total = u16::from_be_bytes([data[3], data[4]]);
+    if total == 0 || seq >= total {
+        return None;
+    }
+
+    let valid = match kind {
+        FragmentType::Lone => false,
+        FragmentType::Start => seq == 0 && total >= 2,
+        FragmentType::Continue => total >= 3 && seq > 0 && seq < total - 1,
+        FragmentType::End => total >= 2 && seq == total - 1,
+    };
+    valid.then_some(FragmentHeader { kind, seq, total })
+}
+
 pub fn fragment_packet(data: &[u8], mtu: usize) -> Vec<Vec<u8>> {
-    let payload_mtu = mtu.saturating_sub(5); // 5-byte header
-    if payload_mtu == 0 || data.len() <= mtu.saturating_sub(3) {
+    let payload_mtu = mtu.saturating_sub(FRAGMENT_HEADER_LEN);
+    if payload_mtu == 0 {
+        return vec![data.to_vec()];
+    }
+
+    // Raw packets beginning with 0x01/0x02/0x03 collide with START/CONTINUE/END
+    // frame tags. Direct LXMF LinkRequests are Header1 packets whose first byte
+    // is 0x02, so they must be enveloped even when they fit in a single ATT
+    // write. Use a two-frame START/END sequence instead of a LONE frame so
+    // peers with the older reassembler can still decode the packet.
+    if data.len() <= mtu.saturating_sub(3) && !raw_packet_needs_fragment_envelope(data) {
         return vec![data.to_vec()];
     }
 
     let chunks: Vec<&[u8]> = data.chunks(payload_mtu).collect();
+    if chunks.len() == 1 {
+        return vec![
+            make_fragment(FragmentType::Start, 0, 2, chunks[0]),
+            make_fragment(FragmentType::End, 1, 2, &[]),
+        ];
+    }
+
     let total = chunks.len() as u16;
     let mut fragments = Vec::with_capacity(chunks.len());
 
     for (i, chunk) in chunks.iter().enumerate() {
-        let ftype = if chunks.len() == 1 {
-            FragmentType::Lone
-        } else if i == 0 {
+        let ftype = if i == 0 {
             FragmentType::Start
         } else if i == chunks.len() - 1 {
             FragmentType::End
@@ -453,12 +539,7 @@ pub fn fragment_packet(data: &[u8], mtu: usize) -> Vec<Vec<u8>> {
         };
 
         let seq = i as u16;
-        let mut frag = Vec::with_capacity(5 + chunk.len());
-        frag.push(ftype as u8);
-        frag.extend_from_slice(&seq.to_be_bytes());
-        frag.extend_from_slice(&total.to_be_bytes());
-        frag.extend_from_slice(chunk);
-        fragments.push(frag);
+        fragments.push(make_fragment(ftype, seq, total, chunk));
     }
 
     fragments
@@ -469,14 +550,77 @@ pub fn reassemble_fragments(fragments: &[Vec<u8>]) -> Option<Vec<u8>> {
         return None;
     }
 
-    let mut result = Vec::new();
+    let mut total: Option<u16> = None;
+    let mut parts: Vec<Option<&[u8]>> = Vec::new();
     for frag in fragments {
-        if frag.len() < 5 {
+        let header = parse_fragment_header(frag)?;
+        if total.is_some_and(|expected| expected != header.total) {
             return None;
         }
-        result.extend_from_slice(&frag[5..]);
+        if total.is_none() {
+            total = Some(header.total);
+            parts.resize(header.total as usize, None);
+        }
+        let slot = parts.get_mut(header.seq as usize)?;
+        if slot.is_some() {
+            return None;
+        }
+        *slot = Some(&frag[FRAGMENT_HEADER_LEN..]);
+    }
+
+    let mut result = Vec::new();
+    for part in parts {
+        result.extend_from_slice(part?);
     }
     Some(result)
+}
+
+fn consume_ble_frame(data: Vec<u8>, reassembly: &mut FragmentReassembly) -> Option<Vec<u8>> {
+    let Some(header) = parse_fragment_header(&data) else {
+        return Some(data);
+    };
+
+    if header.kind != FragmentType::Start && !reassembly.contains_key(&header.total) {
+        // CONTINUE/END cannot begin a real fragment set on an ordered BLE
+        // characteristic. Treat it as a legacy raw Reticulum packet instead;
+        // this lets updated receivers accept old raw Header1 LinkRequest
+        // packets that begin with 0x02 when no matching START was observed.
+        return Some(data);
+    }
+
+    if header.kind == FragmentType::Start {
+        reassembly.insert(
+            header.total,
+            (vec![None; header.total as usize], Instant::now()),
+        );
+    }
+
+    let entry = reassembly
+        .entry(header.total)
+        .or_insert_with(|| (vec![None; header.total as usize], Instant::now()));
+    if entry.0.len() != header.total as usize {
+        entry.0 = vec![None; header.total as usize];
+        entry.1 = Instant::now();
+    }
+    entry.0[header.seq as usize] = Some(data[FRAGMENT_HEADER_LEN..].to_vec());
+
+    if header.kind != FragmentType::End {
+        return None;
+    }
+
+    if entry.0.iter().any(|part| part.is_none()) {
+        return None;
+    }
+    let (parts, _) = reassembly.remove(&header.total)?;
+    let mut result = Vec::new();
+    for part in parts {
+        result.extend_from_slice(&part?);
+    }
+    Some(result)
+}
+
+fn prune_reassembly(reassembly: &mut FragmentReassembly) {
+    reassembly.retain(|_, (_, started)| started.elapsed() < FRAGMENT_TIMEOUT);
 }
 
 /// 60s positive-ID cache for the btleplug scan path. WinRT's advertisement
@@ -4339,8 +4483,8 @@ async fn peer_read_loop(conn: MeshPeerConnection, ctx: PeerReadLoopCtx) {
         }
     };
 
-    // Fragment reassembly buffer: maps (total_count) → accumulated fragments
-    let mut reassembly: HashMap<u16, (Vec<Vec<u8>>, Instant)> = HashMap::new();
+    // Fragment reassembly buffer: maps total_count to per-sequence payload slots.
+    let mut reassembly: FragmentReassembly = HashMap::new();
     let mut missed_keepalives: u32 = 0;
 
     loop {
@@ -4409,33 +4553,7 @@ async fn peer_read_loop(conn: MeshPeerConnection, ctx: PeerReadLoopCtx) {
                     continue;
                 }
 
-                // Check if this is a fragmented packet (has 5-byte header)
-                let first_byte = data[0];
-                let complete_packet = if first_byte == FragmentType::Lone as u8
-                    || (first_byte > FragmentType::End as u8)
-                {
-                    // LONE or no header — complete packet
-                    Some(data)
-                } else if data.len() >= 5 {
-                    let total = u16::from_be_bytes([data[3], data[4]]);
-                    let entry = reassembly
-                        .entry(total)
-                        .or_insert_with(|| (Vec::new(), Instant::now()));
-                    entry.0.push(data);
-
-                    if first_byte == FragmentType::End as u8 {
-                        // All fragments received — reassemble. Invariant: the
-                        // entry was just inserted via `or_insert_with` above.
-                        let (frags, _) = reassembly
-                            .remove(&total)
-                            .expect("reassembly entry must exist: inserted above");
-                        reassemble_fragments(&frags)
-                    } else {
-                        None
-                    }
-                } else {
-                    Some(data) // Short data without valid header — treat as complete
-                };
+                let complete_packet = consume_ble_frame(data, &mut reassembly);
 
                 // Forward complete packet to transport
                 if let Some(raw) = complete_packet {
@@ -4458,7 +4576,7 @@ async fn peer_read_loop(conn: MeshPeerConnection, ctx: PeerReadLoopCtx) {
                 }
 
                 // Clean up timed-out reassembly buffers
-                reassembly.retain(|_, (_, started)| started.elapsed() < FRAGMENT_TIMEOUT);
+                prune_reassembly(&mut reassembly);
             }
             Some(_) => {} // Notification from other characteristic — ignore
             None => {
@@ -4656,7 +4774,7 @@ pub async fn spawn_ble_peer_interface(
                 // (BluetoothDevice MAC on Android; CBCentral.identifier UUID
                 // string on Apple). Two peers writing fragments concurrently
                 // can no longer corrupt each other's reassembly buffers.
-                type PeerReassembly = HashMap<u16, (Vec<Vec<u8>>, Instant)>;
+                type PeerReassembly = FragmentReassembly;
                 let mut reassembly: HashMap<String, PeerReassembly> = HashMap::new();
                 // Identity is learned from the first signed Reticulum announce.
                 // Emit once per peer address so callers can dedupe
@@ -4678,29 +4796,8 @@ pub async fn spawn_ble_peer_interface(
                     if data.is_empty() || (data.len() == 1 && data[0] == 0x00) {
                         continue; // Empty or keepalive
                     }
-                    let first = data[0];
                     let per_peer = reassembly.entry(peer.clone()).or_default();
-                    let complete =
-                        if first == FragmentType::Lone as u8 || first > FragmentType::End as u8 {
-                            Some(data)
-                        } else if data.len() >= 5 {
-                            let total = u16::from_be_bytes([data[3], data[4]]);
-                            let entry = per_peer
-                                .entry(total)
-                                .or_insert_with(|| (Vec::new(), Instant::now()));
-                            entry.0.push(data);
-                            if first == FragmentType::End as u8 {
-                                // Invariant: `or_insert_with` just inserted `total`.
-                                let (frags, _) = per_peer
-                                    .remove(&total)
-                                    .expect("per-peer reassembly entry must exist: inserted above");
-                                reassemble_fragments(&frags)
-                            } else {
-                                None
-                            }
-                        } else {
-                            Some(data)
-                        };
+                    let complete = consume_ble_frame(data, per_peer);
 
                     if let Some(raw) = complete {
                         rxb.fetch_add(raw.len() as u64, Ordering::Relaxed);
@@ -4762,7 +4859,7 @@ pub async fn spawn_ble_peer_interface(
 
                     // Drop expired reassembly buffers (per peer, then per fragment-set).
                     for buf in reassembly.values_mut() {
-                        buf.retain(|_, (_, t)| t.elapsed() < FRAGMENT_TIMEOUT);
+                        prune_reassembly(buf);
                     }
                     reassembly.retain(|_, m| !m.is_empty());
                 }
@@ -5747,10 +5844,54 @@ mod tests {
 
     #[test]
     fn test_fragmentation_lone() {
-        let data = vec![1, 2, 3, 4, 5];
+        let data = vec![0x04, 2, 3, 4, 5];
         let frags = fragment_packet(&data, 100);
         assert_eq!(frags.len(), 1);
         assert_eq!(frags[0], data);
+    }
+
+    #[test]
+    fn test_fragmentation_envelopes_ambiguous_small_packets() {
+        for first in [
+            FragmentType::Start as u8,
+            FragmentType::Continue as u8,
+            FragmentType::End as u8,
+        ] {
+            let mut data = vec![first];
+            data.extend(1u8..80u8);
+
+            let frags = fragment_packet(&data, 100);
+            assert_eq!(frags.len(), 2);
+            assert_eq!(frags[0][0], FragmentType::Start as u8);
+            assert_eq!(frags[1][0], FragmentType::End as u8);
+            assert_eq!(reassemble_fragments(&frags).unwrap(), data);
+        }
+    }
+
+    #[test]
+    fn test_direct_link_request_header_is_not_sent_raw() {
+        let header = rns_wire::header::PacketHeader {
+            flags: rns_wire::flags::PacketFlags {
+                header_type: rns_wire::flags::HeaderType::Header1,
+                context_flag: false,
+                transport_type: rns_wire::flags::TransportType::Broadcast,
+                destination_type: rns_wire::flags::DestinationType::Single,
+                packet_type: rns_wire::flags::PacketType::LinkRequest,
+            },
+            hops: 0,
+            transport_id: None,
+            destination_hash: [0xAA; 16],
+            context: rns_wire::context::PacketContext::None,
+        };
+        let mut raw = header.pack();
+        raw.extend_from_slice(&[0x55; 64]);
+        assert_eq!(raw[0], FragmentType::Continue as u8);
+
+        let frags = fragment_packet(&raw, 500);
+        assert_eq!(frags.len(), 2);
+        assert_eq!(frags[0][0], FragmentType::Start as u8);
+        assert_eq!(frags[1][0], FragmentType::End as u8);
+        assert_eq!(reassemble_fragments(&frags).unwrap(), raw);
     }
 
     #[test]
@@ -5819,7 +5960,7 @@ mod tests {
 
     #[test]
     fn test_fragmentation_mtu_too_small() {
-        // MTU <= 5 means payload_mtu = 0, should produce LONE frame
+        // MTU <= 5 means payload_mtu = 0, so we cannot add an envelope.
         let data = vec![1, 2, 3];
         let frags = fragment_packet(&data, 5);
         assert_eq!(frags.len(), 1);
@@ -5879,10 +6020,80 @@ mod tests {
 
     #[test]
     fn test_reassemble_header_only() {
-        // Fragment with only a 5-byte header (no payload)
-        let frag = vec![FragmentType::Start as u8, 0, 0, 0, 1];
-        let result = reassemble_fragments(&[frag]);
+        // A two-frame empty payload is valid; START(total=1) is not.
+        let start = vec![FragmentType::Start as u8, 0, 0, 0, 2];
+        let end = vec![FragmentType::End as u8, 0, 1, 0, 2];
+        let result = reassemble_fragments(&[start, end]);
         assert_eq!(result, Some(vec![]));
+    }
+
+    #[test]
+    fn test_reassemble_rejects_invalid_start_total() {
+        let frag = vec![FragmentType::Start as u8, 0, 0, 0, 1];
+        assert!(reassemble_fragments(&[frag]).is_none());
+    }
+
+    #[test]
+    fn test_consume_ble_frame_preserves_legacy_raw_data_zero() {
+        let raw = vec![0x00, 0x00, 0x00, 0x00, 0x01, 0xAA, 0xBB];
+        let mut reassembly = FragmentReassembly::new();
+        assert_eq!(consume_ble_frame(raw.clone(), &mut reassembly), Some(raw));
+        assert!(reassembly.is_empty());
+    }
+
+    #[test]
+    fn test_consume_ble_frame_preserves_legacy_raw_link_request_without_start() {
+        let header = rns_wire::header::PacketHeader {
+            flags: rns_wire::flags::PacketFlags {
+                header_type: rns_wire::flags::HeaderType::Header1,
+                context_flag: false,
+                transport_type: rns_wire::flags::TransportType::Broadcast,
+                destination_type: rns_wire::flags::DestinationType::Single,
+                packet_type: rns_wire::flags::PacketType::LinkRequest,
+            },
+            hops: 0,
+            transport_id: None,
+            destination_hash: [0xAA; 16],
+            context: rns_wire::context::PacketContext::None,
+        };
+        let mut raw = header.pack();
+        raw.extend_from_slice(&[0x55; 64]);
+        assert_eq!(raw[0], FragmentType::Continue as u8);
+
+        let mut reassembly = FragmentReassembly::new();
+        assert_eq!(consume_ble_frame(raw.clone(), &mut reassembly), Some(raw));
+        assert!(reassembly.is_empty());
+    }
+
+    #[test]
+    fn test_consume_ble_frame_decodes_enveloped_link_request() {
+        let raw = {
+            let header = rns_wire::header::PacketHeader {
+                flags: rns_wire::flags::PacketFlags {
+                    header_type: rns_wire::flags::HeaderType::Header1,
+                    context_flag: false,
+                    transport_type: rns_wire::flags::TransportType::Broadcast,
+                    destination_type: rns_wire::flags::DestinationType::Single,
+                    packet_type: rns_wire::flags::PacketType::LinkRequest,
+                },
+                hops: 0,
+                transport_id: None,
+                destination_hash: [0x11; 16],
+                context: rns_wire::context::PacketContext::None,
+            };
+            let mut raw = header.pack();
+            raw.extend_from_slice(&[0x22; 64]);
+            raw
+        };
+
+        let frags = fragment_packet(&raw, 500);
+        let mut reassembly = FragmentReassembly::new();
+        assert_eq!(consume_ble_frame(frags[0].clone(), &mut reassembly), None);
+        assert_eq!(
+            consume_ble_frame(frags[1].clone(), &mut reassembly),
+            Some(raw)
+        );
+        assert!(reassembly.is_empty());
     }
 
     // ── Service UUIDs ──
