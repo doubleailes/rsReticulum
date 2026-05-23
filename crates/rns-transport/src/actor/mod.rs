@@ -1094,9 +1094,7 @@ impl TransportActor {
             .collect();
         for id in ids {
             self.send_to_interface(id, raw);
-            if let Some(entry) = self.interfaces.get_mut(&id) {
-                entry.ingress.sent_announce();
-            }
+            self.record_sent_announce(id);
         }
     }
 
@@ -1226,6 +1224,51 @@ impl TransportActor {
             }
         }
         self.flush_announce_queues();
+    }
+
+    /// Record an inbound announce on `iface_id` *and* every parent in the
+    /// spawn chain. Mirrors Python `Interface.received_announce(from_spawned=True)`
+    /// recursion so a parent that aggregates many spawned children (Backbone,
+    /// TCP accept loop, I2P, Local) sees the aggregate frequency.
+    pub(crate) fn record_received_announce(&mut self, iface_id: InterfaceId) {
+        self.walk_parents(iface_id, |entry| entry.ingress.received_announce());
+    }
+
+    pub(crate) fn record_sent_announce(&mut self, iface_id: InterfaceId) {
+        self.walk_parents(iface_id, |entry| entry.ingress.sent_announce());
+    }
+
+    pub(crate) fn record_received_path_request(&mut self, iface_id: InterfaceId) {
+        self.walk_parents(iface_id, |entry| entry.ingress.received_path_request());
+    }
+
+    pub(crate) fn record_sent_path_request(&mut self, iface_id: InterfaceId) {
+        self.walk_parents(iface_id, |entry| entry.ingress.sent_path_request());
+    }
+
+    /// Apply `f` to the entry for `iface_id` and to each ancestor reachable
+    /// via `parent_id`. A depth bound + visited set guard against pathological
+    /// cycles introduced by buggy interface registration.
+    fn walk_parents<F: FnMut(&mut crate::messages::InterfaceEntry)>(
+        &mut self,
+        iface_id: InterfaceId,
+        mut f: F,
+    ) {
+        let mut current = Some(iface_id);
+        let mut seen = std::collections::HashSet::new();
+        // Bound on chain depth; deeper than this points at misconfiguration.
+        for _ in 0..8 {
+            let Some(id) = current else { break };
+            if !seen.insert(id) {
+                break;
+            }
+            let Some(entry) = self.interfaces.get_mut(&id) else {
+                break;
+            };
+            let parent = entry.parent_id;
+            f(entry);
+            current = parent;
+        }
     }
 
     /// Test-only helper: drain every interface's announce queue synchronously,
@@ -1521,6 +1564,7 @@ mod tests {
         let (tx, rx) = mpsc::channel(64);
         let entry = InterfaceEntry {
             name: name.to_string(),
+            parent_id: None,
             mode: InterfaceMode::Gateway,
             role: InterfaceRole::Normal,
             direction: InterfaceDirection::bidirectional(),
@@ -1588,6 +1632,67 @@ mod tests {
         actor.handle_message(TransportMessage::RegisterInterface { id: 1, entry });
         assert!(actor.interfaces.contains_key(&1));
         assert_eq!(actor.interfaces.get(&1).unwrap().name, "test_iface");
+    }
+
+    /// Mirrors Python `received_announce(from_spawned=True)` — when a child
+    /// (e.g. TCP accept peer, Backbone peer) records traffic, the parent's
+    /// frequency deque must see it too so a spawning parent can detect
+    /// aggregate bursts that no single child triggers on its own.
+    #[test]
+    fn ingress_events_propagate_from_child_to_parent() {
+        let (mut actor, _tx) = TransportActor::new();
+        let (parent_entry, _prx) = make_test_interface("parent_iface");
+        let (mut child_entry, _crx) = make_test_interface("child_iface");
+        child_entry.parent_id = Some(10);
+        actor.interfaces.insert(10, parent_entry);
+        actor.interfaces.insert(20, child_entry);
+
+        for _ in 0..5 {
+            actor.record_received_announce(20);
+            actor.record_sent_announce(20);
+            actor.record_received_path_request(20);
+            actor.record_sent_path_request(20);
+        }
+
+        let parent = actor.interfaces.get(&10).unwrap();
+        // Each event is recorded on both child and parent — five iterations.
+        assert!(
+            parent.ingress.incoming_announce_frequency() > 0.0,
+            "parent must observe announce traffic from its spawned child"
+        );
+        assert!(parent.ingress.outgoing_announce_frequency() > 0.0);
+        assert!(parent.ingress.incoming_pr_frequency() > 0.0);
+        assert!(parent.ingress.outgoing_pr_frequency() > 0.0);
+
+        let child = actor.interfaces.get(&20).unwrap();
+        assert!(child.ingress.incoming_announce_frequency() > 0.0);
+    }
+
+    /// A misconfigured spawn chain that loops on itself must not infinitely
+    /// recurse — `walk_parents` caps depth and dedupes via a visited set.
+    #[test]
+    fn ingress_propagation_terminates_on_cyclic_parent_chain() {
+        let (mut actor, _tx) = TransportActor::new();
+        let (mut a, _ra) = make_test_interface("a");
+        let (mut b, _rb) = make_test_interface("b");
+        a.parent_id = Some(2);
+        b.parent_id = Some(1);
+        actor.interfaces.insert(1, a);
+        actor.interfaces.insert(2, b);
+
+        // Would hang without the cycle guard.
+        actor.record_received_announce(1);
+        // Both interfaces saw the event exactly once.
+        assert_eq!(
+            actor
+                .interfaces
+                .get(&1)
+                .unwrap()
+                .ingress
+                .incoming_announce_frequency(),
+            0.0,
+            "single sample yields zero frequency under deque min-sample"
+        );
     }
 
     #[test]

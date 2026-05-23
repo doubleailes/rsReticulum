@@ -1678,6 +1678,7 @@ async fn register_interface_handle_with_role_and_overrides(
         tx_drops: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
         ingress,
         announce_queue: Vec::new(),
+        parent_id: handle.parent_id,
     };
     if let Err(e) = transport_tx
         .send(TransportMessage::RegisterInterface { id, entry })
@@ -1742,6 +1743,7 @@ async fn register_interface_with_post_init(
         tx_drops: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
         ingress,
         announce_queue: Vec::new(),
+        parent_id: handle.parent_id,
     };
     if let Err(e) = transport_tx
         .send(TransportMessage::RegisterInterface { id, entry })
