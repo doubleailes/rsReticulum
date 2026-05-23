@@ -6180,6 +6180,34 @@ mod tests {
         assert_eq!(&raw[offset..offset + 16], &requested);
     }
 
+    /// HopsTo returns PATHFINDER_M sentinel when the destination is unknown,
+    /// matching Python `Transport.hops_to()`.
+    #[test]
+    fn hops_to_query_returns_pathfinder_m_for_unknown_destination() {
+        let (mut actor, _tx) = TransportActor::new();
+        match actor.handle_query(TransportQuery::HopsTo { dest: [0xAA; 16] }) {
+            TransportQueryResponse::IntResult(n) => {
+                assert_eq!(n as u8, crate::constants::PATHFINDER_M);
+            }
+            other => panic!("expected IntResult, got {:?}", other),
+        }
+    }
+
+    /// HopsTo reads the cached hop count after a path is installed.
+    #[test]
+    fn hops_to_query_returns_cached_hops_for_known_destination() {
+        let (mut actor, _tx) = TransportActor::new();
+        let dest = [0xBB; 16];
+        actor.path_table.insert(
+            dest,
+            crate::path_table::PathEntry::new(Some([0xCC; 16]), 4, 1, InterfaceMode::Gateway),
+        );
+        match actor.handle_query(TransportQuery::HopsTo { dest }) {
+            TransportQueryResponse::IntResult(n) => assert_eq!(n, 4),
+            other => panic!("expected IntResult, got {:?}", other),
+        }
+    }
+
     #[test]
     fn await_path_requests_unknown_path_before_waiting() {
         let (mut actor, _tx) = TransportActor::new();

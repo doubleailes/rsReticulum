@@ -137,6 +137,60 @@ impl ReticulumHandle {
         await_path(&self.transport_tx, destination_hash, timeout).await
     }
 
+    /// Fire-and-forget path request. The transport broadcasts a
+    /// `CACHE_REQUEST` packet on every outbound interface; peers that know a
+    /// path respond by re-announcing. Use [`Self::await_path`] when you need
+    /// to block until the path materializes. Returns `false` if the transport
+    /// actor channel is closed (shutting down).
+    /// Python: `Transport.request_path` (RNS/Transport.py:2769).
+    pub async fn request_path(&self, destination_hash: [u8; 16]) -> bool {
+        self.transport_tx
+            .send(TransportMessage::RequestPath { destination_hash })
+            .await
+            .is_ok()
+    }
+
+    /// Whether the transport currently knows a live path to `destination_hash`.
+    /// Python: `Transport.has_path` (RNS/Transport.py:2632).
+    pub async fn has_path(&self, destination_hash: [u8; 16]) -> bool {
+        matches!(
+            self.query_transport(TransportQuery::GetNextHop {
+                dest: destination_hash
+            })
+            .await,
+            Some(TransportQueryResponse::HashResult(Some(_)))
+        )
+    }
+
+    /// Next-hop destination hash on the route to `destination_hash`, or
+    /// `None` if no live path is cached.
+    /// Python: `Transport.next_hop` (RNS/Transport.py:2651).
+    pub async fn next_hop(&self, destination_hash: [u8; 16]) -> Option<[u8; 16]> {
+        match self
+            .query_transport(TransportQuery::GetNextHop {
+                dest: destination_hash,
+            })
+            .await
+        {
+            Some(TransportQueryResponse::HashResult(v)) => v,
+            _ => None,
+        }
+    }
+
+    /// Hops to `destination_hash`, or `PATHFINDER_M` (128) when unknown.
+    /// Python: `Transport.hops_to` (RNS/Transport.py:2641).
+    pub async fn hops_to(&self, destination_hash: [u8; 16]) -> u8 {
+        match self
+            .query_transport(TransportQuery::HopsTo {
+                dest: destination_hash,
+            })
+            .await
+        {
+            Some(TransportQueryResponse::IntResult(n)) => n.clamp(0, u8::MAX as i64) as u8,
+            _ => rns_transport::constants::PATHFINDER_M,
+        }
+    }
+
     /// Query this process' transport actor directly.
     pub async fn query_transport(&self, query: TransportQuery) -> Option<TransportQueryResponse> {
         let (tx, rx) = tokio::sync::oneshot::channel();

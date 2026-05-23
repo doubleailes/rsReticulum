@@ -163,6 +163,14 @@ impl TransportActor {
                 let next_hop = self.path_table.get_live(&dest).and_then(|e| e.next_hop);
                 TransportQueryResponse::HashResult(next_hop)
             }
+            TransportQuery::HopsTo { dest } => {
+                // PATHFINDER_M is the upstream sentinel for "unknown distance".
+                let hops = self
+                    .path_table
+                    .hops_to(&dest)
+                    .unwrap_or(crate::constants::PATHFINDER_M);
+                TransportQueryResponse::IntResult(hops as i64)
+            }
             TransportQuery::GetNextHopIfName { dest } => {
                 let name = self
                     .path_table
