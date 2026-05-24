@@ -75,13 +75,52 @@ pub async fn spawn_probe_responder(
         .map_err(|_| ProbeError::TransportClosed)?;
 
     let identity = Arc::new(identity);
+    let mut destination = dest;
     // Implicit proof is Python's default (`use_implicit_proof = Yes`).
     let implicit = true;
 
     tokio::spawn(async move {
         while let Some(event) = event_rx.recv().await {
-            let DestinationEvent::InboundPacket { raw, .. } = event else {
-                continue;
+            let (raw, interface_id) = match event {
+                DestinationEvent::InboundPacket { raw, interface_id } => (raw, interface_id),
+                DestinationEvent::AnnounceRequested(request) => {
+                    let raw = match destination.announce_packet(
+                        identity.as_ref(),
+                        None,
+                        None,
+                        request.path_response,
+                        request.tag.as_deref(),
+                        unix_now(),
+                    ) {
+                        Ok(raw) => raw,
+                        Err(e) => {
+                            tracing::warn!(
+                                error = %e,
+                                path_response = request.path_response,
+                                "probe responder: failed to build requested announce"
+                            );
+                            continue;
+                        }
+                    };
+                    let outbound = OutboundRequest {
+                        raw: Bytes::from(raw),
+                        destination_hash: dest_hash,
+                    };
+                    let message = if let Some(interface_id) = request.attached_interface {
+                        TransportMessage::OutboundAttached {
+                            request: outbound,
+                            interface_id,
+                        }
+                    } else {
+                        TransportMessage::Outbound(outbound)
+                    };
+                    if transport_tx.send(message).await.is_err() {
+                        tracing::debug!("probe responder: transport closed, exiting");
+                        break;
+                    }
+                    continue;
+                }
+                _ => continue,
             };
             let (header, _) = match PacketHeader::unpack(&raw) {
                 Ok(h) => h,
@@ -122,10 +161,13 @@ pub async fn spawn_probe_responder(
             proof_raw.extend_from_slice(&proof_payload);
 
             if transport_tx
-                .send(TransportMessage::Outbound(OutboundRequest {
-                    raw: Bytes::from(proof_raw),
-                    destination_hash: trunc_hash,
-                }))
+                .send(TransportMessage::OutboundAttached {
+                    request: OutboundRequest {
+                        raw: Bytes::from(proof_raw),
+                        destination_hash: trunc_hash,
+                    },
+                    interface_id,
+                })
                 .await
                 .is_err()
             {
@@ -413,6 +455,13 @@ fn find_public_key(announces: &[AnnounceRpcEntry], dest_hash: &[u8; 16]) -> Opti
         .and_then(|a| a.public_key)
 }
 
+fn unix_now() -> f64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs_f64()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -528,15 +577,20 @@ mod tests {
             .await
             .expect("timed out waiting for proof")
             .expect("channel closed");
+        let (request, interface_id) = match outbound {
+            TransportMessage::OutboundAttached {
+                request,
+                interface_id,
+            } => (request, interface_id),
+            other => panic!("expected OutboundAttached, got {other:?}"),
+        };
         let OutboundRequest {
             raw: proof_raw,
             destination_hash,
-        } = match outbound {
-            TransportMessage::Outbound(r) => r,
-            other => panic!("expected Outbound, got {other:?}"),
-        };
+        } = request;
 
         assert_eq!(destination_hash, expected_trunc);
+        assert_eq!(interface_id, 0);
 
         let (proof_header, data_offset) = PacketHeader::unpack(&proof_raw).unwrap();
         assert_eq!(proof_header.flags.packet_type, PacketType::Proof);
@@ -554,6 +608,59 @@ mod tests {
             remote.verify(&expected_full, &sig),
             "proof signature must verify over full packet hash"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn responder_sends_attached_path_response_announce() {
+        let (tx, mut rx) = mpsc::channel::<TransportMessage>(16);
+
+        let identity = Identity::new();
+        let spawn_tx = tx.clone();
+        let spawn_handle = tokio::spawn(async move {
+            spawn_probe_responder(spawn_tx, identity, default_probe_app_name()).await
+        });
+
+        let first = rx.recv().await.expect("RegisterDestination");
+        let delivery_tx = match first {
+            TransportMessage::RegisterDestination {
+                delivery_tx: Some(dt),
+                ..
+            } => dt,
+            other => panic!("expected RegisterDestination, got {other:?}"),
+        };
+        let dest_hash = spawn_handle.await.unwrap().unwrap();
+
+        delivery_tx
+            .send(DestinationEvent::AnnounceRequested(
+                rns_transport::link_messages::AnnounceRequest {
+                    app_name: default_probe_app_name().to_string(),
+                    path_response: true,
+                    tag: Some(vec![0xA5; 16]),
+                    attached_interface: Some(7),
+                },
+            ))
+            .await
+            .unwrap();
+
+        let outbound = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("timed out waiting for path response")
+            .expect("channel closed");
+        let (request, interface_id) = match outbound {
+            TransportMessage::OutboundAttached {
+                request,
+                interface_id,
+            } => (request, interface_id),
+            other => panic!("expected OutboundAttached, got {other:?}"),
+        };
+
+        assert_eq!(interface_id, 7);
+        assert_eq!(request.destination_hash, dest_hash);
+        let (header, _offset) = PacketHeader::unpack(&request.raw).unwrap();
+        assert_eq!(header.flags.packet_type, PacketType::Announce);
+        assert_eq!(header.flags.destination_type, DestinationType::Single);
+        assert_eq!(header.destination_hash, dest_hash);
+        assert_eq!(header.context, PacketContext::PathResponse);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -695,6 +695,9 @@ async fn run_listen(args: Args) -> ! {
                     }
                 }
             }
+            _ = handle.shutdown.wait() => {
+                break;
+            }
         }
     }
 
@@ -702,6 +705,7 @@ async fn run_listen(args: Args) -> ! {
         task.abort();
         let _ = task.await;
     }
+    listener.shutdown().await;
 
     process::exit(0);
 }

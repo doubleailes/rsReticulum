@@ -32,6 +32,7 @@ use rns_transport::messages::{
     AnnounceRpcEntry, OutboundRequest, TransportMessage, TransportQuery, TransportQueryResponse,
 };
 
+use crate::lifecycle::ShutdownSignal;
 use crate::link_manager::{
     ChannelSendError, LinkChannelMessage, LinkManager, LinkManagerCommand, register_destination,
 };
@@ -132,6 +133,22 @@ pub struct RnshListenerConfig {
 pub async fn run_rnsh_listener(
     transport_tx: mpsc::Sender<TransportMessage>,
     cfg: RnshListenerConfig,
+) -> Result<(), RnshError> {
+    run_rnsh_listener_inner(transport_tx, cfg, None).await
+}
+
+pub async fn run_rnsh_listener_with_shutdown(
+    transport_tx: mpsc::Sender<TransportMessage>,
+    cfg: RnshListenerConfig,
+    shutdown: ShutdownSignal,
+) -> Result<(), RnshError> {
+    run_rnsh_listener_inner(transport_tx, cfg, Some(shutdown)).await
+}
+
+async fn run_rnsh_listener_inner(
+    transport_tx: mpsc::Sender<TransportMessage>,
+    cfg: RnshListenerConfig,
+    shutdown: Option<ShutdownSignal>,
 ) -> Result<(), RnshError> {
     let signing_key = cfg
         .identity
@@ -236,6 +253,15 @@ pub async fn run_rnsh_listener(
                 }
             } => {
                 send_announce(&transport_tx, &cfg.identity, RNSH_APP_NAME).await?;
+            }
+            _ = async {
+                if let Some(shutdown) = shutdown.as_ref() {
+                    shutdown.wait().await;
+                } else {
+                    std::future::pending::<()>().await;
+                }
+            } => {
+                break;
             }
         }
     }

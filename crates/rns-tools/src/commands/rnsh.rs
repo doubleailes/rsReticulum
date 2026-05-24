@@ -19,7 +19,7 @@ use rns_runtime::lifecycle::{ShutdownSignal, install_signal_handlers};
 use rns_runtime::platform::{StoragePaths, resolve_config_dir};
 use rns_runtime::rnsh::{
     RnshClientConfig, RnshError, RnshListenerConfig, RnshWindowSize, rnsh_client_execute,
-    run_rnsh_listener,
+    run_rnsh_listener_with_shutdown,
 };
 use tokio::sync::mpsc;
 
@@ -160,7 +160,9 @@ async fn run_listener(args: Args) -> ExitCode {
         announce_period: args.announce,
     };
 
-    match run_rnsh_listener(handle.transport_tx.clone(), cfg).await {
+    match run_rnsh_listener_with_shutdown(handle.transport_tx.clone(), cfg, handle.shutdown.clone())
+        .await
+    {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("rnsh-rs: {e}");

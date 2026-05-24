@@ -244,6 +244,38 @@ async fn query_transport(
         .and_then(|r| r.ok())
 }
 
+async fn request_path(
+    transport_tx: &mpsc::Sender<TransportMessage>,
+    destination_hash: [u8; 16],
+    timeout_secs: Option<f64>,
+) -> bool {
+    let wait = std::time::Duration::from_secs_f64(timeout_secs.unwrap_or(5.0).max(0.1));
+    if transport_tx
+        .send(TransportMessage::RequestPath { destination_hash })
+        .await
+        .is_err()
+    {
+        return false;
+    }
+
+    let (reply, rx) = tokio::sync::oneshot::channel();
+    if transport_tx
+        .send(TransportMessage::AwaitPath {
+            dest: destination_hash,
+            reply,
+        })
+        .await
+        .is_err()
+    {
+        return false;
+    }
+
+    match tokio::time::timeout(wait, rx).await {
+        Ok(Ok(found)) => found,
+        _ => false,
+    }
+}
+
 async fn process_rpc_request(
     request: RpcRequest,
     transport_tx: &mpsc::Sender<TransportMessage>,
@@ -374,6 +406,15 @@ async fn process_rpc_request(
                 None => RpcResponse::HashResult(None),
             }
         }
+        RpcRequest::RequestPath {
+            destination_hash,
+            timeout_secs,
+        } => match hash_to_array(&destination_hash) {
+            Some(dest) => {
+                RpcResponse::BoolResult(request_path(transport_tx, dest, timeout_secs).await)
+            }
+            None => RpcResponse::BoolResult(false),
+        },
         RpcRequest::DropPath { destination_hash } => {
             let dest = hash_to_array(&destination_hash);
             if let Some(d) = dest {
@@ -857,6 +898,10 @@ listener.close()
             RpcRequest::GetNextHop {
                 destination_hash: vec![0; 16],
             },
+            RpcRequest::RequestPath {
+                destination_hash: vec![0; 16],
+                timeout_secs: Some(0.01),
+            },
             RpcRequest::GetFirstHopTimeout {
                 destination_hash: vec![0; 16],
             },
@@ -908,6 +953,44 @@ listener.close()
         }
 
         let _ = tx.send(TransportMessage::Shutdown).await;
+    }
+
+    #[tokio::test]
+    async fn request_path_rpc_sends_transport_request_and_awaits_result() {
+        let (tx, mut rx) = mpsc::channel(4);
+        let dest = [0x42; 16];
+        let handle = tokio::spawn(async move {
+            process_rpc_request(
+                RpcRequest::RequestPath {
+                    destination_hash: dest.to_vec(),
+                    timeout_secs: Some(1.0),
+                },
+                &tx,
+            )
+            .await
+        });
+
+        match rx.recv().await.expect("RequestPath message") {
+            TransportMessage::RequestPath { destination_hash } => {
+                assert_eq!(destination_hash, dest)
+            }
+            other => panic!("expected RequestPath, got {other:?}"),
+        }
+        match rx.recv().await.expect("AwaitPath message") {
+            TransportMessage::AwaitPath {
+                dest: awaited,
+                reply,
+            } => {
+                assert_eq!(awaited, dest);
+                reply.send(true).unwrap();
+            }
+            other => panic!("expected AwaitPath, got {other:?}"),
+        }
+
+        assert!(matches!(
+            handle.await.unwrap(),
+            RpcResponse::BoolResult(true)
+        ));
     }
 
     fn portpicker_ephemeral() -> u16 {

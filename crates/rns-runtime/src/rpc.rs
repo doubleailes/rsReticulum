@@ -45,6 +45,10 @@ pub enum RpcRequest {
     GetNextHop {
         destination_hash: Vec<u8>,
     },
+    RequestPath {
+        destination_hash: Vec<u8>,
+        timeout_secs: Option<f64>,
+    },
     GetFirstHopTimeout {
         destination_hash: Vec<u8>,
     },
@@ -243,6 +247,17 @@ fn request_to_py_value(req: &RpcRequest) -> PyValue {
             ("get", PyValue::String("next_hop".to_string())),
             ("destination_hash", PyValue::Bytes(destination_hash.clone())),
         ]),
+        RpcRequest::RequestPath {
+            destination_hash,
+            timeout_secs,
+        } => py_dict(vec![
+            ("request", PyValue::String("path".to_string())),
+            ("destination_hash", PyValue::Bytes(destination_hash.clone())),
+            (
+                "timeout",
+                timeout_secs.map(PyValue::Float).unwrap_or(PyValue::None),
+            ),
+        ]),
         RpcRequest::GetFirstHopTimeout { destination_hash } => py_dict(vec![
             ("get", PyValue::String("first_hop_timeout".to_string())),
             ("destination_hash", PyValue::Bytes(destination_hash.clone())),
@@ -376,6 +391,18 @@ fn py_value_to_request(value: &PyValue) -> Result<RpcRequest, RpcError> {
             "announce_queues" => Ok(RpcRequest::DropAnnounceQueues),
             other => Err(RpcError::Deserialize(format!(
                 "unknown Python RPC drop path: {other}"
+            ))),
+        };
+    }
+
+    if let Some(PyValue::String(path)) = dict_get(entries, "request") {
+        return match path.as_str() {
+            "path" => Ok(RpcRequest::RequestPath {
+                destination_hash: dict_bytes(entries, "destination_hash")?,
+                timeout_secs: dict_get(entries, "timeout").and_then(py_f64),
+            }),
+            other => Err(RpcError::Deserialize(format!(
+                "unknown Python RPC request path: {other}"
             ))),
         };
     }
@@ -612,6 +639,11 @@ fn py_value_to_response_for_request(
             Ok(RpcResponse::StringResult(py_optional_string(value)?))
         }
         RpcRequest::GetNextHop { .. } => Ok(RpcResponse::HashResult(py_optional_bytes(value)?)),
+        RpcRequest::RequestPath { .. } => Ok(RpcResponse::BoolResult(match value {
+            PyValue::Bool(v) => *v,
+            PyValue::None => false,
+            _ => py_required_int(value)? != 0,
+        })),
         RpcRequest::GetFirstHopTimeout { .. }
         | RpcRequest::GetPacketRssi { .. }
         | RpcRequest::GetPacketSnr { .. }
@@ -1835,6 +1867,10 @@ mod tests {
             RpcRequest::GetRateTable,
             RpcRequest::GetNextHopIfName {
                 destination_hash: vec![0; 16],
+            },
+            RpcRequest::RequestPath {
+                destination_hash: vec![0; 16],
+                timeout_secs: Some(0.01),
             },
             RpcRequest::GetLinkCount,
             RpcRequest::DropPath {

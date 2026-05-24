@@ -270,12 +270,20 @@ struct ClientCtx {
 }
 
 async fn request(ctx: &ClientCtx, req: &RpcRequest) -> Result<RpcResponse, LocalRpcFailure> {
+    request_with_timeout(ctx, req, ctx.timeout).await
+}
+
+async fn request_with_timeout(
+    ctx: &ClientCtx,
+    req: &RpcRequest,
+    timeout: std::time::Duration,
+) -> Result<RpcResponse, LocalRpcFailure> {
     let result = match &ctx.endpoint {
         SharedInstanceRpcEndpoint::Tcp(port) => {
-            rpc::connect_and_request(*port, &ctx.rpc_key, req, ctx.timeout).await
+            rpc::connect_and_request(*port, &ctx.rpc_key, req, timeout).await
         }
         SharedInstanceRpcEndpoint::Unix(socket_path) => {
-            rpc::connect_unix_and_request(socket_path, &ctx.rpc_key, req, ctx.timeout).await
+            rpc::connect_unix_and_request(socket_path, &ctx.rpc_key, req, timeout).await
         }
     };
     result.map_err(|source| LocalRpcFailure {
@@ -754,12 +762,72 @@ async fn query_path(ctx: &ClientCtx, dest_hex: &str) -> ExitCode {
         _ => None,
     };
 
-    let path_entry = match request(ctx, &RpcRequest::GetPathTable { max_hops: None }).await {
+    let mut path_entry = match request(ctx, &RpcRequest::GetPathTable { max_hops: None }).await {
         Ok(RpcResponse::PathTable(entries)) => entries
             .into_iter()
             .find(|entry| entry.hash.as_slice() == dest),
         _ => None,
     };
+
+    let mut next_hop = next_hop;
+    let mut iface = iface;
+    if next_hop.is_none() && path_entry.is_none() {
+        let timeout_secs = ctx.timeout.as_secs_f64().max(0.1);
+        let req = RpcRequest::RequestPath {
+            destination_hash: dest.to_vec(),
+            timeout_secs: Some(timeout_secs),
+        };
+        let rpc_timeout = ctx.timeout + std::time::Duration::from_secs(1);
+        let found = match request_with_timeout(ctx, &req, rpc_timeout).await {
+            Ok(RpcResponse::BoolResult(found)) => found,
+            Ok(other) => {
+                eprintln!("rnpath-rs: unexpected response: {other:?}");
+                return ExitCode::from(1);
+            }
+            Err(e) => {
+                eprintln!("rnpath-rs: {e}");
+                return ExitCode::from(1);
+            }
+        };
+
+        if found {
+            next_hop = match request(
+                ctx,
+                &RpcRequest::GetNextHop {
+                    destination_hash: dest.to_vec(),
+                },
+            )
+            .await
+            {
+                Ok(RpcResponse::HashResult(h)) => h,
+                Ok(other) => {
+                    eprintln!("rnpath-rs: unexpected response: {other:?}");
+                    return ExitCode::from(1);
+                }
+                Err(e) => {
+                    eprintln!("rnpath-rs: {e}");
+                    return ExitCode::from(1);
+                }
+            };
+            iface = match request(
+                ctx,
+                &RpcRequest::GetNextHopIfName {
+                    destination_hash: dest.to_vec(),
+                },
+            )
+            .await
+            {
+                Ok(RpcResponse::StringResult(s)) => s,
+                _ => None,
+            };
+            path_entry = match request(ctx, &RpcRequest::GetPathTable { max_hops: None }).await {
+                Ok(RpcResponse::PathTable(entries)) => entries
+                    .into_iter()
+                    .find(|entry| entry.hash.as_slice() == dest),
+                _ => None,
+            };
+        }
+    }
 
     println!("Destination: {}", hex::encode(dest));
     match next_hop.as_ref() {
@@ -775,9 +843,7 @@ async fn query_path(ctx: &ClientCtx, dest_hex: &str) -> ExitCode {
     }
 
     if next_hop.is_none() && path_entry.is_none() {
-        println!(
-            "  Note     : no cached local path was found; active path requests are not implemented in rnpath yet"
-        );
+        println!("  Note     : path request timed out or no path was found");
         ExitCode::from(1)
     } else {
         ExitCode::SUCCESS
