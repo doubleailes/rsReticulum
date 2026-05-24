@@ -48,6 +48,10 @@ const MAX_RECONNECT_TRIES: Option<usize> = None;
 const SCAN_TIMEOUT: u64 = 3;
 /// Bounds disable-while-offline teardown latency to ~1s.
 const RUNNING_POLL: Duration = Duration::from_secs(1);
+#[cfg(target_os = "linux")]
+const RNODE_POST_BOND_SETTLE: Duration = Duration::from_millis(2600);
+const RNODE_NATIVE_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(6);
+const RNODE_NATIVE_HANDSHAKE_PROBE: Duration = Duration::from_millis(650);
 
 /// `stop_ble_rnode_interface` flips false; the read_task removes the entry
 /// on its way out.
@@ -116,38 +120,77 @@ async fn wait_or_shutdown(total: Duration, flag: &AtomicBool) -> bool {
     !flag.load(Ordering::SeqCst)
 }
 
-/// RNode can pack multiple frames in one read, so use the raw deframer for
-/// full-command extended KISS framing.
-async fn wait_for_rnode_handshake(
+fn is_rnode_handshake_frame(cmd: u8, frame: &[u8]) -> bool {
+    (cmd == rnode::CMD_DETECT && frame.first().copied() == Some(rnode::DETECT_RESP))
+        || (cmd == rnode::CMD_FW_VERSION && !frame.is_empty())
+}
+
+fn is_pairing_transition_error(error: &InterfaceError) -> bool {
+    matches!(
+        error,
+        InterfaceError::SendFailed(message) if message.starts_with("BLE pairing in progress:")
+    )
+}
+
+/// Android's native bridge can come up immediately after SMP completes, while
+/// rsCardputer's RNode BLE stack is still settling. Probe detect a few times
+/// inside one connection attempt so a single dropped early frame does not cost
+/// a full reconnect backoff.
+async fn probe_native_rnode_handshake(
     tcp_read: &mut tokio::net::tcp::OwnedReadHalf,
+    tcp_write: &mut tokio::net::tcp::OwnedWriteHalf,
     timeout: Duration,
+    probe_interval: Duration,
     running_task: &AtomicBool,
 ) -> bool {
-    use tokio::io::AsyncReadExt;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let detect_seq = rnode::build_detect_sequence();
     let mut deframer = kiss::RawKissDeframer::new();
     let mut buf = [0u8; 1024];
     let deadline = std::time::Instant::now() + timeout;
+    let mut next_probe = std::time::Instant::now();
+
     while std::time::Instant::now() < deadline {
         if !running_task.load(Ordering::SeqCst) {
             return false;
         }
-        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-        let read = tokio::time::timeout(remaining.min(RUNNING_POLL), tcp_read.read(&mut buf)).await;
+
+        let now = std::time::Instant::now();
+        if now >= next_probe {
+            if let Err(e) = tcp_write.write_all(&detect_seq).await {
+                tracing::warn!(error = %e, "BLE RNode native detect probe write failed");
+                return false;
+            }
+            let _ = tcp_write.flush().await;
+            next_probe = std::time::Instant::now() + probe_interval;
+        }
+
+        let now = std::time::Instant::now();
+        let read_budget = next_probe
+            .min(deadline)
+            .saturating_duration_since(now)
+            .min(RUNNING_POLL);
+        if read_budget.is_zero() {
+            tokio::task::yield_now().await;
+            continue;
+        }
+
+        let read = tokio::time::timeout(read_budget, tcp_read.read(&mut buf)).await;
         let n = match read {
             Ok(Ok(0)) => return false,
             Ok(Ok(n)) => n,
             Ok(Err(_)) => return false,
             Err(_) => continue,
         };
+
         for (cmd, frame) in deframer.feed(&buf[..n]) {
-            if cmd == rnode::CMD_DETECT && frame.first().copied() == Some(rnode::DETECT_RESP) {
-                return true;
-            }
-            if cmd == rnode::CMD_FW_VERSION && !frame.is_empty() {
+            if is_rnode_handshake_frame(cmd, &frame) {
                 return true;
             }
         }
     }
+
     false
 }
 
@@ -596,6 +639,18 @@ async fn connect_rnode(
     let peripheral = resolve_ble_target(adapter, ble_uri).await?;
     ble_diag(format!("[ble] resolved peripheral id={}", peripheral.id()));
 
+    #[cfg(target_os = "linux")]
+    {
+        // BlueZ needs explicit pairing before we open a btleplug GATT
+        // connection. If this creates a fresh bond, RNode intentionally
+        // disconnects shortly afterwards; wait through that before connect().
+        let bluer_addr = parse_linux_ble_address(&peripheral.address().to_string())?;
+        if linux_trigger_pairing(bluer_addr).await? {
+            ble_diag("[pair][linux] fresh bond complete — waiting for RNode post-pair disconnect");
+            tokio::time::sleep(RNODE_POST_BOND_SETTLE).await;
+        }
+    }
+
     let mut last_err = String::new();
     for attempt in 1..=3 {
         match peripheral.connect().await {
@@ -661,18 +716,10 @@ async fn connect_rnode(
     // SMP must run BEFORE subscribe on desktop / Apple platforms — reading
     // the encrypted TX char kicks off SMP and drops L2CAP, which kills any
     // pending subscribe. iOS/macOS share CoreBluetooth; Windows uses WinRT
-    // GATT (auto-prompt on encrypted-char reads). Same trigger shape works
-    // for all three. Linux uses bluer's explicit `Device::pair()` instead —
-    // BlueZ does not auto-prompt SMP from an encrypted-char read.
+    // GATT (auto-prompt on encrypted-char reads). Linux used explicit BlueZ
+    // pairing before `connect()`, above.
     #[cfg(any(target_os = "ios", target_os = "macos", target_os = "windows"))]
     desktop_trigger_pairing(&peripheral, &tx_char).await?;
-    #[cfg(target_os = "linux")]
-    {
-        // peripheral.address() returns a BDAddr → MAC string; the helper
-        // also accepts BlueZ D-Bus paths for callers that pass `id()`.
-        let bluer_addr = parse_linux_ble_address(&peripheral.address().to_string())?;
-        linux_trigger_pairing(bluer_addr).await?;
-    }
 
     ble_diag("[ble] subscribe TX start");
     peripheral.subscribe(&tx_char).await.map_err(|e| {
@@ -900,7 +947,7 @@ fn parse_linux_ble_address(addr: &str) -> Result<bluer::Address, InterfaceError>
 /// daemon stops retrying SMP instead of re-invoking `request_passkey`
 /// every ~60s.
 #[cfg(target_os = "linux")]
-async fn linux_trigger_pairing(bluer_addr: bluer::Address) -> Result<(), InterfaceError> {
+async fn linux_trigger_pairing(bluer_addr: bluer::Address) -> Result<bool, InterfaceError> {
     let overall_start = std::time::Instant::now();
 
     // Reuse the cached session so the second-and-subsequent attempts skip
@@ -931,7 +978,7 @@ async fn linux_trigger_pairing(bluer_addr: bluer::Address) -> Result<(), Interfa
             "[pair][linux] already bonded with {bluer_addr} (is_paired check {:.2}s)",
             t_paired.elapsed().as_secs_f32()
         ));
-        return Ok(());
+        return Ok(false);
     }
     ble_diag(format!(
         "[pair][linux] is_paired=false in {:.2}s",
@@ -1053,7 +1100,7 @@ async fn linux_trigger_pairing(bluer_addr: bluer::Address) -> Result<(), Interfa
         }
     }
     let _ = linux_pairing_finished_sender().send(LinuxPairingFinished { attempt_id, status });
-    outcome
+    outcome.map(|()| true)
 }
 
 /// WithoutResponse is fire-and-forget at the ATT layer; the radio still
@@ -1166,9 +1213,11 @@ pub async fn spawn_ble_rnode_interface(
             let conn = match connect_rnode(&adapter, &ble_uri).await {
                 Ok(c) => c,
                 Err(e) => {
+                    let pairing_transition = is_pairing_transition_error(&e);
+                    let retry_wait = if pairing_transition { 1 } else { backoff };
                     tracing::warn!(name = %log_name, error = %e, "BLE RNode connect failed");
                     ble_diag(format!(
-                        "[ble] connect_rnode err: {e} — retrying in {backoff}s (attempt {})",
+                        "[ble] connect_rnode err: {e} — retrying in {retry_wait}s (attempt {})",
                         tries + 1
                     ));
                     if reconnect_try_exhausted(&mut tries) {
@@ -1176,10 +1225,14 @@ pub async fn spawn_ble_rnode_interface(
                         ble_diag("[ble] max reconnect tries reached — giving up");
                         return;
                     }
-                    if wait_or_shutdown(Duration::from_secs(backoff), &running_task).await {
+                    if wait_or_shutdown(Duration::from_secs(retry_wait), &running_task).await {
                         return;
                     }
-                    backoff = (backoff * 2).min(RECONNECT_WAIT_MAX);
+                    if pairing_transition {
+                        backoff = RECONNECT_WAIT;
+                    } else {
+                        backoff = (backoff * 2).min(RECONNECT_WAIT_MAX);
+                    }
                     continue;
                 }
             };
@@ -1489,22 +1542,17 @@ pub async fn spawn_ble_rnode_interface_native(
 
             let (mut tcp_read, mut tcp_write) = stream.into_split();
 
-            let detect_seq = rnode::build_detect_sequence();
-            if let Err(e) = tcp_write.write_all(&detect_seq).await {
-                tracing::warn!(error = %e, "BLE RNode native detect write failed");
-                if wait_or_shutdown(Duration::from_secs(backoff), &running_task).await {
-                    return;
-                }
-                backoff = (backoff * 2).min(RECONNECT_WAIT_MAX);
-                continue;
-            }
-
             // Without gating on DETECT_RESP + firmware version we'd flag
             // "online" while the radio is asleep or the BLE-NUS bridge
             // dropped a frame.
-            let detected =
-                wait_for_rnode_handshake(&mut tcp_read, Duration::from_secs(5), &running_task)
-                    .await;
+            let detected = probe_native_rnode_handshake(
+                &mut tcp_read,
+                &mut tcp_write,
+                RNODE_NATIVE_HANDSHAKE_TIMEOUT,
+                RNODE_NATIVE_HANDSHAKE_PROBE,
+                &running_task,
+            )
+            .await;
             if !detected {
                 tracing::warn!(
                     name = %log_name,
