@@ -1145,7 +1145,7 @@ mod tests {
     #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
     #[test]
     fn test_stop_rnode_interface_signals_registered_driver() {
-        let id = 0xBAD5_700;
+        let id = 0x0BAD_5700;
         let (stop_tx, mut stop_rx) = mpsc::channel::<()>(1);
         let guard = register_rnode_stop(id, stop_tx);
 
